@@ -1332,7 +1332,12 @@ async function initializeApplication(
                         turn,
                         provenance.signal,
                       );
-                      await ledger.action(provenance.turnId, action, { kind: 'approved' });
+                      await ledger.action(
+                        provenance.turnId,
+                        action,
+                        { kind: 'approved' },
+                        ready.connectionId,
+                      );
                       return privateEmailResult(
                         (
                           await saveIntegrationFiles(result, async (file) => {
@@ -2196,6 +2201,7 @@ async function initializeApplication(
               turn.turnId,
               action,
               verdict.confirm ? { kind: 'approved' } : verdict.basis,
+              prepared.connectionId,
             );
             return result;
           },

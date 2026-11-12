@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import {
   CalendarClock,
+  Download,
   LoaderCircle,
   MessageCircle,
   ScanSearch,
@@ -24,6 +25,7 @@ import type {
 } from '../../shared/contracts';
 import { usePageData } from '../hooks/use-page-data';
 import { api, errorMessage } from '../lib/api';
+import { exportFile } from '../lib/export-file';
 import { navigate } from '../lib/navigation';
 import {
   dayKey,
@@ -703,13 +705,37 @@ export function Usage({ hidden = false }: { hidden?: boolean }) {
       .find((row) => row.dataset.vaultActivity === id)
       ?.focus();
   }, [ready, hidden]);
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState('');
   const error = trust.error || vault.error || models.error;
   const itemsError = entries.error || sessions.error;
   return (
     <div className="content-page secondary-page" hidden={hidden}>
       <header className="page-heading secondary-heading">
         <PageTitle path="/usage" />
+        <div className="secondary-heading-actions">
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={exporting}
+            onClick={() => {
+              setExporting(true);
+              setExportError('');
+              exportFile(
+                '/api/trust/history',
+                'nod-action-history.json',
+                'Your action history could not be exported. Try again.',
+              )
+                .catch((cause) => setExportError(errorMessage(cause)))
+                .finally(() => setExporting(false));
+            }}
+          >
+            <Download size={16} aria-hidden="true" />
+            Export history
+          </Button>
+        </div>
       </header>
+      {exportError && <Notice>{exportError}</Notice>}
       {itemsError && <Notice>{itemsError}</Notice>}
       {trust.data && vault.data && models.data ? (
         <div className="usage">

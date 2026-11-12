@@ -14,6 +14,11 @@ import { becauseOf, type TrustBasis } from './trust-basis.ts';
 import { actionTitle } from './action-presentation.ts';
 import { formattingLocale, localeRegion, timeZoneRegion } from '../shared/date-locale.ts';
 import type { UsageReport } from './usage-report.ts';
+import {
+  actionHistoryEvent,
+  actionHistoryFileName,
+  type ActionHistoryRow,
+} from './action-history.ts';
 import { afterCommit, transaction } from './transaction.ts';
 import { analyticsModel, snapshotAnalytics, type CaptureAnalytics } from './analytics.ts';
 import { captureSettingChanges, type SettingActor } from './analytics-settings.ts';
@@ -144,6 +149,7 @@ export function createLedger({
       action text NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
     );
     ALTER TABLE app_actions ADD COLUMN IF NOT EXISTS basis jsonb;
+    ALTER TABLE app_actions ADD COLUMN IF NOT EXISTS connection_id uuid;
     CREATE INDEX IF NOT EXISTS app_actions_owner_time ON app_actions(owner_id,created_at);
     CREATE INDEX IF NOT EXISTS app_actions_turn ON app_actions(turn_id);
     CREATE TABLE IF NOT EXISTS spending_limits (
@@ -328,12 +334,38 @@ export function createLedger({
     };
   }
 
-  function action(turnId: string, name: string, basis: TrustBasis) {
+  function action(turnId: string, name: string, basis: TrustBasis, connectionId?: unknown) {
     return save(
-      `INSERT INTO app_actions(owner_id,turn_id,action,basis)
-       SELECT $1,id,$3,$4 FROM turns WHERE id=$2 AND owner_id=$1`,
-      [ownerId, turnId, name.slice(0, 200), JSON.stringify(basis)],
+      `INSERT INTO app_actions(owner_id,turn_id,action,basis,connection_id)
+       SELECT $1,id,$3,$4,$5 FROM turns WHERE id=$2 AND owner_id=$1`,
+      [
+        ownerId,
+        turnId,
+        name.slice(0, 200),
+        JSON.stringify(basis),
+        z.uuid().safeParse(connectionId).success ? connectionId : null,
+      ],
     );
+  }
+
+  async function history() {
+    const work = `u.source,u.proactive,(SELECT t.id FROM tasks t WHERE t.owner_id=$1 AND t.session_id=u.session_id LIMIT 1) AS task`;
+    const { rows } = await pool.query<ActionHistoryRow>(
+      `SELECT 'proposal' AS type,a.created_at AS at,a.action,a.args->>'connectionId' AS account,${work},
+         a.id AS approval,NULL::jsonb AS basis,a.status
+       FROM approvals a JOIN turns u ON u.id=a.turn_id AND u.owner_id=a.owner_id
+       WHERE a.owner_id=$1
+       UNION ALL
+       SELECT 'ran',r.created_at,r.action,r.connection_id::text,${work},
+         (SELECT p.id FROM approvals p WHERE p.owner_id=$1 AND p.execution_turn_id=r.turn_id
+           AND p.action=r.action AND r.basis->>'kind'='approved' ORDER BY p.created_at LIMIT 1),
+         jsonb_build_object('kind',r.basis->>'kind'),NULL
+       FROM app_actions r JOIN turns u ON u.id=r.turn_id AND u.owner_id=r.owner_id
+       WHERE r.owner_id=$1
+       ORDER BY at,type`,
+      [ownerId],
+    );
+    return rows.map(actionHistoryEvent);
   }
 
   function speech(base: SpeechProvider): SpeechProvider {
@@ -687,6 +719,17 @@ export function createLedger({
         query.at && query.id ? { at: query.at, id: query.id } : undefined,
         query.session,
       );
+    });
+    app.get('/api/trust/history', async (_request, reply) => {
+      const exported = new Date();
+      return reply
+        .header('Content-Type', 'application/json; charset=utf-8')
+        .header('Cache-Control', 'private, no-store')
+        .header('X-Content-Type-Options', 'nosniff')
+        .header('Content-Disposition', `attachment; filename="${actionHistoryFileName(exported)}"`)
+        .send(
+          JSON.stringify({ exported: exported.toISOString(), events: await history() }, null, 2),
+        );
     });
     app.put('/api/trust/limit', (request) => setLimits(request.body));
   }
