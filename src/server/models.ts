@@ -12,6 +12,8 @@ import { ModelAuthError, ModelWorkspaceSelectionError } from '../ports/models.ts
 import { ModelRequestError } from '../ports/agent.ts';
 import type { CredentialKeyStore } from '../ports/key-store.ts';
 import type {
+  DataClass,
+  InferenceRoutes,
   ModelMethod,
   ModelChoice,
   ModelProvider,
@@ -20,6 +22,7 @@ import type {
 } from '../shared/models.ts';
 import {
   apiKeyConnectionProviders,
+  dataClasses,
   modelProviderInfo,
   azureDeploymentPattern,
   bedrockRegionPattern,
@@ -64,6 +67,13 @@ export const modelSelectionInput = z
     effort: z.enum(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']),
   })
   .strict();
+const inferenceRoutesInput = z
+  .object({
+    routes: z.partialRecord(z.enum(dataClasses), z.array(z.uuid()).max(80)),
+    fallback: z.boolean(),
+  })
+  .strict()
+  .nullable();
 class ConnectionError extends ModelRequestError {}
 
 function modelPricing(model: ModelDefinition): ModelChoice['pricing'] {
@@ -265,6 +275,7 @@ export function createModelService(options: {
     model?: string;
     credentials: Partial<Record<ModelProvider, ModelCredential>>;
   };
+  dataClasses?(): readonly DataClass[];
   changed?(): void;
 }) {
   const { backend } = options;
@@ -298,6 +309,7 @@ export function createModelService(options: {
   }
   let rows: (ModelRecord & { keyEnding?: string })[] = [];
   let selection: ModelSelection | null = null;
+  let inferenceRoutes: InferenceRoutes | null = null;
   let starting: Promise<unknown> = Promise.resolve();
   const pendingControllers = new Set<AbortController>();
   let closed = false;
@@ -361,6 +373,7 @@ export function createModelService(options: {
         : row;
     });
     selection = state.selection;
+    inferenceRoutes = state.routes;
     options.changed?.();
   }
   function credential(row: ModelRecord | undefined) {
@@ -369,12 +382,37 @@ export function createModelService(options: {
     if (value) remember(value);
     return value;
   }
+  function inputClasses(): DataClass[] {
+    const classes = [...new Set(options.dataClasses?.() ?? [])];
+    return classes.length ? classes : ['unknown'];
+  }
+  function routeAllows(row: Pick<ModelRecord, 'id'>) {
+    const policy = inferenceRoutes;
+    return (
+      !policy ||
+      ((policy.fallback || row.id === selection?.connectionId) &&
+        inputClasses().every((dataClass) => policy.routes[dataClass]?.includes(row.id)))
+    );
+  }
+  function checkRoute(row: Pick<ModelRecord, 'id' | 'provider' | 'method'>) {
+    if (routeAllows(row)) return;
+    const name = `the ${modelSource(row)} connection`;
+    throw new ConnectionError(
+      !inferenceRoutes?.fallback && row.id !== selection?.connectionId
+        ? `Your inference routes keep every request on your selected connection, so Nod did not send this request to ${name}.`
+        : `Your inference routes don't allow ${inputClasses().join(' and ')} data on ${name}, so Nod did not send this request. Choose a model on a connection the routes allow for this data.`,
+    );
+  }
   function requestAccess(row: ModelRecord): Pick<ModelAccess, 'read' | 'prepareRequest'> {
-    if (row.provider !== 'google') return { read: () => read(row.id) };
+    const routedRead = async () => {
+      checkRoute(row);
+      return read(row.id);
+    };
+    if (row.provider !== 'google') return { read: routedRead };
     const tag = (value: ModelCredential | undefined) =>
       value && createHash('sha256').update(JSON.stringify(value)).digest('hex');
     return {
-      read: () => read(row.id),
+      read: routedRead,
       async prepareRequest(modelId, automatic) {
         const credentialTag = tag(await read(row.id));
         const pause = rows.find((item) => item.id === row.id)?.requestPauses?.[modelId];
@@ -421,7 +459,8 @@ export function createModelService(options: {
       (row) =>
         row.provider === provider &&
         (row.method === 'api_key' || (provider === 'openrouter' && row.method === 'oauth')) &&
-        row.status === 'connected',
+        row.status === 'connected' &&
+        routeAllows(row),
     );
     return (
       candidates.find((row) => row.id === selection?.connectionId) ??
@@ -429,7 +468,7 @@ export function createModelService(options: {
     );
   }
   function imageModel() {
-    const connected = rows.filter((row) => row.status === 'connected');
+    const connected = rows.filter((row) => row.status === 'connected' && routeAllows(row));
     const selected = connected.find((row) => row.id === selection?.connectionId);
     for (const row of [
       ...(selected ? [selected] : []),
@@ -461,7 +500,7 @@ export function createModelService(options: {
       ...(otherConnections ? rows.filter((row) => row !== current) : []),
     ];
     for (const row of candidates) {
-      if (!row || row.status !== 'connected') continue;
+      if (!row || row.status !== 'connected' || !routeAllows(row)) continue;
       const definition = row.models.find(
         (model) => model.choice.id === memoryModels[row.provider] && !model.choice.audio,
       );
@@ -1059,6 +1098,33 @@ export function createModelService(options: {
         });
       await reload();
     },
+    get routes() {
+      return inferenceRoutes;
+    },
+    async setRoutes(input: unknown) {
+      const parsed = inferenceRoutesInput.safeParse(input);
+      if (!parsed.success)
+        throw new ConnectionError(
+          `The inference routes are invalid: ${z.prettifyError(parsed.error)}`,
+        );
+      const value = parsed.data;
+      await store.change((state) => {
+        const missing = Object.values(value?.routes ?? {})
+          .flat()
+          .find((id) => !state.connections.some((row) => row.id === id));
+        if (missing)
+          throw new ConnectionError(
+            `The inference routes name a model connection that doesn't exist (${missing}).`,
+          );
+        state.routes = value && {
+          routes: Object.fromEntries(
+            Object.entries(value.routes).map(([dataClass, ids]) => [dataClass, [...new Set(ids)]]),
+          ),
+          fallback: value.fallback,
+        };
+      });
+      await reload();
+    },
     async remove(id: string) {
       const capture = snapshotAnalytics(analytics);
       for (const [state, attempt] of attempts) if (attempt.connectionId === id) await cancel(state);
@@ -1152,6 +1218,7 @@ export function createModelService(options: {
       if (!row || !selected)
         throw new ConnectionError('Open Settings > Models. Connect a service and choose a model.');
       if (row.status !== 'connected') throw attention(row);
+      checkRoute(row);
       const definition =
         (auxiliary
           ? row.models.find((model) => model.choice.id === memoryModels[row.provider])
@@ -1224,6 +1291,11 @@ export function createModelService(options: {
             .parse(request.body);
           await service.addEndpoint(input.url, input.key || undefined);
           return service.view();
+        });
+        routes.get('/api/models/routes', async () => ({ routes: service.routes }));
+        routes.put('/api/models/routes', async (request) => {
+          await service.setRoutes(request.body);
+          return { routes: service.routes };
         });
         routes.put('/api/models/selection', async (request) => {
           await service.select(modelSelectionInput.parse(request.body));
