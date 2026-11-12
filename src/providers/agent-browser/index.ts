@@ -2072,7 +2072,28 @@ export function createAgentBrowserComputer(options: {
     });
   }
 
-  async function* view(id: string, signal: AbortSignal): AsyncGenerator<Buffer> {
+  async function sealedDocumentOpen(state: BrowserState, signal?: AbortSignal) {
+    const sealed = state.sealedDocument;
+    if (!sealed) return false;
+    signal?.throwIfAborted();
+    const devtools = await inspector(state).catch(() => undefined);
+    if (!devtools) return true;
+    try {
+      const alive = await devtools.alive(sealed);
+      if (!alive && state.sealedDocument === sealed) delete state.sealedDocument;
+      return alive;
+    } catch {
+      return true;
+    } finally {
+      devtools.close();
+    }
+  }
+
+  async function* view(
+    id: string,
+    signal: AbortSignal,
+    options?: { watch?: boolean },
+  ): AsyncGenerator<Buffer> {
     const state = await recoverBrowser(id);
     if (!state?.started) throw new Error('Open a page in this task browser first.');
     if (state.recovered && state.saved.sensitive && !state.secrets.size)
@@ -2115,7 +2136,11 @@ export function createAgentBrowserComputer(options: {
           frame.metadata.deviceWidth / frame.metadata.pageScaleFactor,
           frame.metadata.deviceHeight / frame.metadata.pageScaleFactor,
         ];
-        if (!state.injecting && !(await privateDocumentOpen(state, signal)))
+        if (
+          !state.injecting &&
+          !(await privateDocumentOpen(state, signal)) &&
+          !(options?.watch && (await sealedDocumentOpen(state, signal)))
+        )
           yield Buffer.from(frame.data, 'base64');
         if (socket.readyState === WebSocket.OPEN)
           socket.send(JSON.stringify({ type: 'ack', seq: frame.seq }));
