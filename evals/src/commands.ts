@@ -22,6 +22,7 @@ import { defaultJudge, defaultModel, runSuite, slug, type RunOptions } from './r
 import { scenarios } from './scenarios/index.ts';
 import { loadEnvironment, parseModel } from './stack.ts';
 import { listRuns, loadRun, resultsRoot, saveRun } from './store.ts';
+import { capabilityMatrix, capabilityTable } from './model-capabilities.ts';
 import type { RunSummary } from './results.ts';
 
 const help = `Nod capability evals
@@ -51,6 +52,8 @@ const help = `Nod capability evals
     promote <label>...         give calibrated scenarios that passed all of at least 5 attempts a place in the
                                gate, and remove the ones that did not (writes evals/gate.json)
     runs                       list saved runs
+    capabilities [--json]      the model capability matrix: what each model's catalog entry declares, and the
+                               newest saved computer use, tool selection and coding scores for that model
     charts <label>... | --prefix <p> [--desktop]   render the comparison as sleek PNG images
     slack <label>... | --prefix <p>                 draft the Slack summary with the leaderboard
 
@@ -415,6 +418,11 @@ export async function main(args: Args) {
     case 'runs':
       console.log(runsTable(await listRuns(root)));
       return;
+    case 'capabilities': {
+      const rows = await capabilityMatrix(await listRuns(root));
+      console.log(has(args, 'json') ? JSON.stringify(rows, null, 2) : capabilityTable(rows));
+      return;
+    }
     case 'proactivity-report': {
       if (!first) throw new Error('Give a saved run label.');
       const run = await loadRun(root, first);

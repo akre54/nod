@@ -72,13 +72,13 @@ For a small run, add `--tier pr --repeat 1`. To cap the spend at $20, add `--bud
 
 ### Run the release suite
 
-The release suite adds 244 cases: 197 of everyday work across every connected app, the browser, Vault and payments, files, memory, schedules, background events and the trust check, and 47 generated proactivity cases: 45 stress and population cases and two attention cases. Run it on your computer before a release. CI never runs it, because a full pass is several hundred attempts.
+The release suite adds 247 cases: 200 of everyday work across every connected app, the browser, computer use, Vault and payments, files, memory, schedules, background events and the trust check, and 47 generated proactivity cases: 45 stress and population cases and two attention cases. Run it on your computer before a release. CI never runs it, because a full pass is several hundred attempts.
 
 ```sh title="Terminal"
 pnpm run eval:capability run --tier release --repeat 3 --concurrency 3 --budget 500
 ```
 
-`--tier release` runs the release cases together with every controlled case, 341 attempts per repeat before time-window skips. Each attempt starts its own workspace and browser containers; `--concurrency 6` fits in 8 GB of Docker memory. Database connections are a separate limit. Start with concurrency two when you use a standard disposable database. Each attempt starts several connection pools. Parallel campaigns add their load. Increase concurrency only when the database has spare connections. To run one area, add `--capability vault`, or name cases with `--scenario`.
+`--tier release` runs the release cases together with every controlled case, 344 attempts per repeat before time-window skips. Each attempt starts its own workspace and browser containers; `--concurrency 6` fits in 8 GB of Docker memory. Database connections are a separate limit. Start with concurrency two when you use a standard disposable database. Each attempt starts several connection pools. Parallel campaigns add their load. Increase concurrency only when the database has spare connections. To run one area, add `--capability vault`, or name cases with `--scenario`.
 
 Results go to `.local/capability-evals/<label>/`. Open `report.html` to read every transcript and check. A label never overwrites an earlier run. If a worker fails before it can save checks, its log records the phase: start, prepare, play, collect, or grade.
 
@@ -285,7 +285,7 @@ flowchart TD
 
 ## The suite
 
-The suite has 345 cases: 97 controlled cases, 244 release cases, three live web cases and the harness canary.
+The suite has 348 cases: 97 controlled cases, 247 release cases, three live web cases and the harness canary.
 
 | Status      | Meaning                                                                                                                    |
 | ----------- | -------------------------------------------------------------------------------------------------------------------------- |
@@ -401,6 +401,9 @@ Every release case is calibrating until it has been run and sorted. The table li
 | `cheapest-plan-for-team`           | Which Trellis plan is cheapest for a team of 7 paying monthly?                                                                    | browser, research               |
 | `checkout-preticked-addon`         | Order one pack of AA batteries with my saved Visa                                                                                 | vault, browser, approvals       |
 | `compare-three-laptops`            | Which of these three shops sells the ThinkPad X1 Carbon Gen 12 cheapest including delivery to Portugal?                           | research, browser               |
+| `computer-use-canvas-locker`       | Reserve locker 14 at the Alvalade station on parcelbox.example.net, I'm dropping off a return                                     | computer-use, browser           |
+| `computer-use-departures-board`    | Which pier does the 19:05 ferry to Cacilhas leave from today? The live board is on tejoferries.example.org.                       | computer-use, browser, research |
+| `computer-use-slider-drag`         | Set my daily heating limit to 6 kWh on app.voltio.example.com, leave the hot water boost as it is                                 | computer-use, browser           |
 | `conflicting-sources`              | Is the Museu da Ribeira open on Mondays?                                                                                          | research, browser               |
 | `consent-wall-hours`               | What time does the Museu do Azulejo open on Sunday? It's on museu-azulejo.example.org.                                            | browser, research               |
 | `contact-form-quote`               | Request a quote on mobilia.example.com for 20 Arco office chairs delivered to our Lisbon office. Use my work email.               | browser                         |
@@ -701,6 +704,70 @@ pnpm run eval:capability run --scenario memory-indirect-advice,memory-event-scop
 ```
 
 Run `memory-injected-web-content`, `trust-memory-injection` and `memory-sensitive-not-saved` with the same model to check the existing safety boundaries. Keep the source fixtures and judges fixed before comparing a baseline and candidate. Report reply accuracy, unwanted personal claims, model spend and duration separately. These cases do not establish a ranking against another memory system.
+
+## Measure model capabilities
+
+Models aren't interchangeable. One can choose tools well and write good code but struggle to drive a page from screenshots. The capability matrix puts what each model declares next to what the evals measured.
+
+```sh title="Terminal"
+pnpm run eval:capability capabilities
+```
+
+It prints one row for each provider's default agent model and for every model in a saved run. Add `--json` for the raw rows.
+
+| Column          | Source                                                                                                               |
+| --------------- | -------------------------------------------------------------------------------------------------------------------- |
+| Image input     | Declared. The `images` flag on the model's catalog entry                                                             |
+| Context window  | Declared. The catalog's `contextWindow`, or the 8,192-token limit Nod sets for the OpenRouter routers                |
+| Context profile | Declared. **Compact** below 65,536 tokens, where Nod uses short instructions and loads one detailed tool at a time   |
+| Thinking levels | Declared. The effort levels the catalog entry supports                                                               |
+| Computer use    | Measured. Task completion pass@1 on the `computer-use` cases                                                         |
+| Tool selection  | Measured. Task completion pass@1 on the `apps` cases, which need the right tool among many connected apps            |
+| Coding          | Measured. Task completion pass@1 on the `files` cases, which Nod solves by writing and running code in the workspace |
+
+The declared columns read the model catalog bundled with Nod and make no network request. A model the catalog doesn't list shows **Unknown**. A measured column comes from the newest saved run of that model that ran cases with the capability. Runs that are contaminated or have attempts not run don't count. A column with no such run shows **Not measured**.
+
+To fill the measured columns, run the same cases on each model you want to compare:
+
+```sh title="Terminal"
+pnpm run eval:capability models openai/gpt-6.1-sol anthropic/claude-opus-5-5 --tier release --capability computer-use --repeat 3
+pnpm run eval:capability capabilities
+```
+
+Use `--capability apps` for tool selection and `--capability files` for coding. Add `--budget` to cap the spend.
+
+The table below shows the default models of the four common providers, from the bundled catalog when this page was written. Run the command for current values. No measured column has a saved run yet.
+
+| Model                           | Image input | Context window | Context profile | Thinking levels               | Computer use | Tool selection | Coding       |
+| ------------------------------- | ----------- | -------------- | --------------- | ----------------------------- | ------------ | -------------- | ------------ |
+| `openai/gpt-6.1-sol`            | Yes         | 272,000        | Full            | low, medium, high, xhigh, max | Not measured | Not measured   | Not measured |
+| `anthropic/claude-opus-5-5`     | Yes         | 1,000,000      | Full            | low, medium, high, xhigh, max | Not measured | Not measured   | Not measured |
+| `google/gemini-3.8-flash`       | Yes         | 1,048,576      | Full            | low, medium, high             | Not measured | Not measured   | Not measured |
+| `openrouter/openai/gpt-6.1-sol` | Yes         | 1,050,000      | Full            | low, medium, high, xhigh, max | Not measured | Not measured   | Not measured |
+
+:::caution[Declared is not measured]
+Image input says a model accepts images, not that it can read a page or click the right place. Tool selection and coding are proxies: the `apps` and `files` cases also test other things.
+:::
+
+### Computer use cases
+
+The three `computer-use-*` release cases put what Nod needs only on screen. Each uses a synthetic website with no text or accessibility labels for the part that matters.
+
+- `computer-use-departures-board`: today's pier change appears only in an image of a departures board. The page text names the usual pier as a decoy.
+- `computer-use-canvas-locker`: lockers are drawn on a canvas, out of number order. Nod must reserve locker 14 and report its drop-off code.
+- `computer-use-slider-drag`: a heating limit is a canvas slider that changes only when its handle is dragged. Nod must save 6 kWh and leave another setting alone.
+
+Checks grade the end state, so a route that reads the page script also passes. An optional process check in each case records whether Nod used a screenshot, a coordinate click or a drag. These cases are still calibrating and have no measured pass rate yet.
+
+### Open design questions
+
+Nod uses one harness for every model. It already adapts in two places to what a model declares: the compact context profile, and image descriptions from another connected model when the selected one can't read images. If a request fails, Nod doesn't switch to another connection. The matrix is meant to inform these choices:
+
+- **Adapters or profiles.** Keep one harness with small model-specific adapters, or define capability profiles for tool schemas, screenshot handling, prompt guidance, retries and context budgets?
+- **Who chooses the model.** Let you choose a model per task or capability, or recommend one from measured results? How should a task that needs both computer use and coding run?
+- **Weak capabilities.** How should Nod say before a task starts that the selected model is weak at what it needs?
+- **Switching models.** If Nod switches models after a failure or for one capability, how does it stay inside the providers and connections you chose?
+- **Evidence.** Which cases and which quality and cost thresholds would justify a specialization, and how do results avoid fitting one provider?
 
 ## Related resources
 
