@@ -1057,6 +1057,7 @@ test(
       await t.test('a task command stream shows only its own owner’s commands', async (t) => {
         const turns: string[] = [];
         const tasksMade: string[] = [];
+        const callIds: string[] = [];
         const commandTask = async (owner: string, status: string, command: string) => {
           const id = randomUUID();
           const turnId = randomUUID();
@@ -1075,6 +1076,7 @@ test(
             ['tool_start', randomUUID(), { command }],
             ['tool_start', randomUUID(), { command: `${command} --second` }],
           ] as const;
+          callIds.push(...events.map(([, callId]) => callId));
           for (const [index, [type, callId, record]] of events.entries())
             await db.pool.query(
               "INSERT INTO turn_events(id,turn_id,type,summary,call_id,command,created_at) VALUES($1,$2,$3,'bash',$4,$5,now()+$6*interval '1 second')",
@@ -1113,7 +1115,10 @@ test(
             ['ls synthetic-own --second', 'running', null, ''],
           ],
         );
-        assert.equal((await read(ended)).body.commands[1].state, 'interrupted');
+        const stopped = await read(ended);
+        assert.equal(stopped.body.commands[1].state, 'interrupted');
+        for (const executionId of [...callIds, ...turns])
+          assert.equal(JSON.stringify([mine.body, stopped.body]).includes(executionId), false);
         const other = await read(foreign);
         assert.equal(other.status, 404);
         assert.equal(JSON.stringify(other.body).includes('cat x'), false);
