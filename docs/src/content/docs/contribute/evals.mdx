@@ -759,6 +759,16 @@ OpenAI, Anthropic and Google also document whether each model supports their own
 Image input says a model accepts images, not that it can read a page or click the right place. Tool selection and coding are proxies: the `apps` and `files` cases also test other things.
 :::
 
+### Public benchmarks
+
+These public leaderboards measure the same kinds of work. Each uses its own harness, step limits and effort settings, so their scores aren't comparable to Nod's measured columns. Use them to pick which models are worth running through Nod's cases.
+
+| Nod column     | Public benchmark                                                                                                       |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| Computer use   | [OSWorld 2.0](https://osworld-v2.xlang.ai/)                                                                            |
+| Coding         | [SWE-bench Verified](https://www.swebench.com/) and [Terminal-Bench](https://www.tbench.ai/)                           |
+| Tool selection | [τ²-bench](https://github.com/sierra-research/tau2-bench) and [BFCL](https://gorilla.cs.berkeley.edu/leaderboard.html) |
+
 ### Computer use cases
 
 The three `computer-use-*` release cases put what Nod needs only on screen. Each uses a synthetic website with no text or accessibility labels for the part that matters.
