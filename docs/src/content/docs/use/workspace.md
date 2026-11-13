@@ -62,7 +62,7 @@ Each row shows the command and its status. Select a row to open the command and 
 | **Failed**            | The command failed before Nod could record an exit code                     |
 | **Interrupted**       | The turn ended before Nod could record the command's result                 |
 
-Commands from a task's helpers have a **Helper** label. The task shows the latest 200 commands. Each output keeps at most the last 16,000 characters that Pi received. Output is saved when a command ends or fails. It does not stream while the command runs.
+Commands from a task's helpers have a **Helper** label. The task shows the latest 200 commands. Each output keeps at most the last 16,000 characters of the redacted command output. The exit code is saved when available. Output is saved when a command ends or fails. It does not stream while the command runs.
 
 The view is read-only. Commands run in Nod's isolated workspace. To stop a running command, stop the task.
 
