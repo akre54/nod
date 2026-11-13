@@ -212,7 +212,12 @@ export async function createAnalytics(options: {
         if (data.properties.provider)
           run.model ??= analyticsModel(data.properties.provider, data.properties.model);
       }
-      if (data.event === 'model_used' && data.properties.purpose === 'agent')
+      if (
+        data.event === 'model_used' &&
+        data.properties.purpose === 'agent' &&
+        (!data.properties.request_kind ||
+          ['chat', 'task', 'observer'].includes(data.properties.request_kind))
+      )
         run.model = analyticsModel(data.properties.provider, data.properties.model);
       if (data.event === 'turn_completed' && run.model) {
         const { provider: _, model: __, ...properties } = data.properties;
@@ -438,6 +443,7 @@ export const analyticsRoutes = new Map<
   ['POST /api/channel-settings/telegram/confirm', channel('update')],
   ['POST /api/channel-settings/telegram/user', channel('update')],
   ['POST /api/channel-settings/whatsapp/pairing', channel('connect_started')],
+  ['POST /api/channel-settings/:provider/reconnect', channel('connect_started')],
   ['DELETE /api/channel-settings/whatsapp/pairing', channel('disconnect')],
   ['DELETE /api/channel-settings/:provider', channel('disconnect')],
   ['POST /api/models/keys', settings('models', 'update')],

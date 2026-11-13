@@ -332,6 +332,7 @@ export interface Schedule {
   revision: number;
   nextRun: string | null;
   lastRun: ScheduleRun | null;
+  activeRun: { turnId: string; status: 'queued' | 'running' | 'waiting' } | null;
   baselineObservation: ScheduleObservation | null;
   watch: string[] | null;
   monthlyUsd: number | null;
@@ -391,6 +392,7 @@ export interface ChannelLinkStatus {
   expiresAt?: string;
   accountHandle?: string;
   accountName?: string;
+  error?: string;
 }
 export interface ChannelSetupSummary {
   provider: ChannelProvider;

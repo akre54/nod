@@ -332,6 +332,8 @@ export async function startStack(options: {
       { createDockerWorkspace },
       { createPublicLinkPreviewProvider },
       waitingTurnSql,
+      { createModelService },
+      { createPiModelBackend },
     ] = await Promise.all([
       load<typeof import('../../src/server/composition.ts')>('src/server/composition.ts'),
       load<typeof import('../../src/server/db.ts')>('src/server/db.ts'),
@@ -348,10 +350,27 @@ export async function startStack(options: {
         'src/providers/public-web/link-preview.ts',
       ),
       loadWaitingTurnSql(appSource),
+      load<typeof import('../../src/server/models.ts')>('src/server/models.ts'),
+      load<typeof import('../../src/providers/pi/models.ts')>('src/providers/pi/models.ts'),
     ]);
     databasePool = pool;
     const vaultKey = randomBytes(32);
     const sessionRoot = join(directory, '.local', 'sessions');
+    const models = createModelService({
+      database: pool,
+      ownerId: 'local-development',
+      keyStore: { id: 'isolated-memory', configured: true, getKey: async () => vaultKey },
+      backend: createPiModelBackend(),
+      origin: `http://localhost:${port}`,
+      bootstrap: {
+        provider: model.provider,
+        model: model.name,
+        credentials: {
+          [model.provider]: { type: 'api_key', key: model.apiKey },
+        },
+      },
+    });
+    await models.initialize();
     const computer = createContainerBrowserComputer({
       dataRoot: join(directory, '.local'),
       container: browserContainer,
@@ -361,12 +380,14 @@ export async function startStack(options: {
     application = await createApplication(
       {
         observations: options.observations,
+        models,
         observe: capture.observe,
         agent: capture.agent(
           createPiAgent({
             provider: model.provider,
             model: model.name,
             apiKey: model.apiKey,
+            resolve: () => models.resolve(),
             sessionRoot,
             ...(model.effort
               ? {
@@ -425,6 +446,8 @@ export async function startStack(options: {
                   'src/providers/decisions.ts',
                 )
               ).createDecisionModel({
+                reserve:
+                  'reserve' in models ? (maximumUsd) => models.reserve(maximumUsd) : undefined,
                 resolve: async () =>
                   typesafe
                     ? { provider: 'typesafe', key: typesafe }
@@ -435,11 +458,22 @@ export async function startStack(options: {
               }),
             }
           : {}),
-        memoryCurator: createPiMemoryCurator({ provider: model.provider, apiKey: model.apiKey }),
+        classificationCurator: createPiMemoryCurator({
+          provider: model.provider,
+          resolve: () => models.resolveClassification(),
+          configured: () => models.hasClassificationModel(),
+        }),
+        memoryCurator: createPiMemoryCurator({
+          provider: model.provider,
+          resolve: () => models.resolve(true),
+          configured: () => models.configured,
+        }),
         onboardingCurator: createPiMemoryCurator({
           provider: model.provider,
           apiKey: model.apiKey,
           model: model.name,
+          resolve: async () => ({ ...(await models.resolve()), effort: 'off' }),
+          configured: () => models.configured,
           lightest: true,
         }),
         linkPreviews: createPublicLinkPreviewProvider(),
@@ -447,6 +481,7 @@ export async function startStack(options: {
       },
       { heartbeat: false },
     );
+    application.app.addHook('onClose', () => models.close());
     await application.app.listen({ host: '127.0.0.1', port });
     const baseUrl = `http://localhost:${port}`;
     const cookie = `${accessCookie(port)}=${await accessKey(join(directory, '.local'))}`;
