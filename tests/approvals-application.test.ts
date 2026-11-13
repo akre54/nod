@@ -783,6 +783,28 @@ test(
           assert.equal((await approvalsFor(other))[0].status, 'expired');
           assert.equal(sent().length, before + 1);
 
+          const reconnected = await propose(
+            'GMAIL_SEND_EMAIL',
+            { ...email, subject: 'Synthetic reconnected', connectionId: first!.id },
+            'apps',
+          );
+          const [reconnectedCard] = await approvalsFor(reconnected);
+          await pool.query('UPDATE app_connections SET account_id=$2 WHERE id=$1', [
+            first!.id,
+            `synthetic-${randomUUID()}`,
+          ]);
+          try {
+            const resumed = await answer(reconnectedCard);
+            assert.match(prompts.get(resumed) ?? '', /did not run[\s\S]*connected again/);
+          } finally {
+            await pool.query('UPDATE app_connections SET account_id=$2 WHERE id=$1', [
+              first!.id,
+              first!.account_id,
+            ]);
+          }
+          assert.equal((await approvalsFor(reconnected))[0].status, 'expired');
+          assert.equal(sent().length, before + 1);
+
           const removed = await propose(
             'GMAIL_SEND_EMAIL',
             { ...email, subject: 'Synthetic removed', connectionId: second.id },

@@ -1274,6 +1274,7 @@ async function initializeApplication(
       ? {
           name: account.name,
           identity: account.accountEmail ?? account.accountName,
+          ...(account.accountId ? { accountId: account.accountId } : {}),
           ...(path ? { method: path.kind, endpoint: path.endpoint } : {}),
         }
       : undefined;
@@ -1290,7 +1291,9 @@ async function initializeApplication(
           ? `This action was approved for ${approved}, but that account is no longer connected. Nothing ran.`
           : now !== approved
             ? `This action was approved for ${approved}, but its connection now belongs to ${now}. Nothing ran. Ask again to use the current account.`
-            : `This action was approved for ${approved}, but the connection's access path changed. Nothing ran. Ask again to use the current path.`,
+            : current.accountId !== (reviewed as { accountId?: unknown }).accountId
+              ? `This action was approved for ${approved}, but that account was connected again since. Nothing ran. Ask again to use the new connection.`
+              : `This action was approved for ${approved}, but the connection's access path changed. Nothing ran. Ask again to use the current path.`,
       ),
       { notRun: true },
     );
@@ -1396,7 +1399,15 @@ async function initializeApplication(
       } else await integrations.prepare(ownerId, action, args, undefined, undefined, false, client);
     },
     (reply) => trust.answer(reply),
-    communication.describe,
+    (proposal, signal) => {
+      if (!proposal.details?.account || typeof proposal.details.account !== 'object')
+        return communication.describe(proposal, signal);
+      const { accountId: _, ...account } = proposal.details.account as Record<string, unknown>;
+      return communication.describe(
+        { ...proposal, details: { ...proposal.details, account } },
+        signal,
+      );
+    },
     captureAnalytics,
   );
   retireScheduleConfirmations = approvals.retireScheduleConfirmations;

@@ -136,6 +136,9 @@
   font-size: 13px;
   line-height: 18px;
 }
+.choice-card-account {
+  overflow-wrap: anywhere;
+}
 .choice-card-title .message-text {
   margin: 0;
   font-weight: 500;
