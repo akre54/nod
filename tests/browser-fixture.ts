@@ -73,6 +73,13 @@ export function createBrowserFixture(options: Options, preferRealSocket = false)
       await onDaemonCommand?.(structuredClone(command));
       const session = [...sessions].find(([id]) => path === resolve(socketDir, `${id}.sock`))?.[1];
       if (!session) return existingDaemonCommand(path, command, signal, timeoutMs);
+      if (command.action === 'stream_status') {
+        const result = await run(session.executable, [...session.args, 'stream', 'status'], {
+          ...session.options,
+          signal,
+        });
+        return JSON.parse(result.stdout).data ?? {};
+      }
       if (command.action === 'tab_list') {
         const result = await run(session.executable, [...session.args, 'get', 'url'], {
           ...session.options,
@@ -224,6 +231,7 @@ export type DevtoolsModel = {
   masked?: boolean;
   failMasks?: boolean;
   steal?: { after: number; field: string };
+  tabs?: string[];
 };
 
 export async function fakeDevtools(model: DevtoolsModel) {
@@ -305,9 +313,28 @@ export async function fakeDevtools(model: DevtoolsModel) {
       if (message.method === 'Network.enable') return reply({});
       if (message.method === 'DOM.getDocument') return reply({ root: { backendNodeId: 1 } });
       if (message.method === 'Runtime.releaseObjectGroup') return reply({});
-      if (message.method === 'Target.attachToTarget') return reply({ sessionId: 'page' });
+      if (message.method === 'Target.attachToTarget')
+        return reply({
+          sessionId:
+            message.params.targetId === 'fixture-target' ? 'page' : message.params.targetId,
+        });
       if (message.method === 'Target.getTargets')
-        return reply({ targetInfos: [{ targetId: 'fixture-target', type: 'page' }] });
+        return reply({
+          targetInfos: [
+            { targetId: 'fixture-target', type: 'page' },
+            ...(model.tabs ?? []).map((_, index) => ({ targetId: `tab-${index}`, type: 'page' })),
+          ],
+        });
+      if (message.method === 'Page.getFrameTree' && session?.startsWith('tab-'))
+        return reply({
+          frameTree: {
+            frame: {
+              id: session,
+              securityOrigin: frames[0]?.origin,
+              loaderId: model.tabs?.[Number(session.slice(4))],
+            },
+          },
+        });
       if (message.method === 'Target.setAutoAttach') {
         for (const child of new Set(
           model.frames
@@ -394,6 +421,48 @@ export async function fakeDevtools(model: DevtoolsModel) {
   const { port } = server.address() as { port: number };
   return {
     url: `ws://127.0.0.1:${port}/devtools/browser/fixture`,
+    async close() {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+export async function fakeScreencast() {
+  const server = createServer();
+  const sockets = new Set<Socket>();
+  let seq = 0;
+  server.on('upgrade', (request, socket: Socket) => {
+    const accept = createHash('sha1')
+      .update(`${request.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+      .digest('base64');
+    socket.write(
+      `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
+    );
+    socket.on('data', () => {});
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    port: (server.address() as { port: number }).port,
+    send(image: string) {
+      const data = Buffer.from(
+        JSON.stringify({
+          type: 'frame',
+          seq: ++seq,
+          data: Buffer.from(image).toString('base64'),
+          metadata: { deviceWidth: 800, deviceHeight: 600 },
+        }),
+      );
+      const header =
+        data.length < 126 ? Buffer.from([0x81, data.length]) : Buffer.from([0x81, 126, 0, 0]);
+      if (data.length >= 126) header.writeUInt16BE(data.length, 2);
+      for (const socket of sockets) socket.write(Buffer.concat([header, data]));
+    },
+    get connected() {
+      return sockets.size;
+    },
     async close() {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));

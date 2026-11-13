@@ -133,6 +133,9 @@ export function TaskCard({
   }, [inChat, task.id]);
   const [showActivity, setShowActivity] = useState(false);
   const [watching, setWatching] = useState(false);
+  useEffect(() => {
+    if (task.status !== 'working') setWatching(false);
+  }, [task.status]);
   const [stopping, setStopping] = useState(false);
   const [error, setError] = useState('');
   const format = useDateFormat();
@@ -348,7 +351,10 @@ export function TaskCard({
                   variant="ghost"
                   size="sm"
                   aria-expanded={watching}
-                  onClick={() => setWatching(!watching)}
+                  onClick={() => {
+                    if (!watching) captureAnalytics('task_action', { action: 'watch_browser' });
+                    setWatching(!watching);
+                  }}
                 >
                   <Eye size={16} aria-hidden="true" />
                   {watching ? 'Hide browser' : 'Watch browser'}

@@ -44,7 +44,12 @@ import {
 import { startContainerBrowserWorker } from '../src/providers/container-browser/worker.ts';
 import { createAgentRuntime } from '../src/runtime/index.ts';
 import { toolDefinitions } from '../src/runtime/tools.ts';
-import { createBrowserFixture, fakeDevtools, type DevtoolsModel } from './browser-fixture.ts';
+import {
+  createBrowserFixture,
+  fakeDevtools,
+  fakeScreencast,
+  type DevtoolsModel,
+} from './browser-fixture.ts';
 import { stagedLoginBrowser } from './login-fixture.ts';
 import { fakeComputer, fakeWorkspace } from './runtime-fixtures.ts';
 import { accessCookie, accessKey } from '../src/server/access.ts';
@@ -534,8 +539,8 @@ test(
         const closed = deferred();
         onView = async function* (signal) {
           try {
-            started.resolve(signal);
             yield Buffer.from('synthetic-live-frame');
+            started.resolve(signal);
             await new Promise((resolve) =>
               signal.addEventListener('abort', resolve, { once: true }),
             );
@@ -1090,6 +1095,84 @@ test('a card goes only into the approved fields on the approved sites and stays 
     assert.doesNotMatch((await computer.act('shop', { action: 'snapshot' })).text, /4242/);
   } finally {
     await computer.dispose();
+    await devtools.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('watching stays blank while any tab still holds a page Nod filled privately', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'nod-browser-watch-'));
+  let url = 'about:blank';
+  let documents = 0;
+  const model: DevtoolsModel = {
+    document: 'loader-0',
+    frames: [{ id: 'main', session: 'page', origin: 'https://1.1.1.1' }],
+    frameOf: { '@e3': 'main' },
+    values: new Map(),
+    tabs: [],
+  };
+  const devtools = await fakeDevtools(model);
+  const screencast = await fakeScreencast();
+  const computer = createBrowserFixture({
+    dataRoot: directory,
+    run: async (_executable, args, options) => {
+      const command = args.slice(args.indexOf('--idle-timeout') + 2);
+      let data: Record<string, unknown> = {};
+      if (command[0] === 'open') {
+        url = command[1]!;
+        model.document = `loader-${++documents}`;
+        model.values.clear();
+        model.focused = model.field = model.armed = undefined;
+      }
+      if (command[0] === 'get' && command[1] === 'url') data = { url };
+      if (command[0] === 'get' && command[1] === 'cdp-url') data = { cdpUrl: devtools.url };
+      if (command[0] === 'stream' && command[1] === 'status') data = { port: screencast.port };
+      if (command[0] === 'focus') {
+        model.field = command[1]!;
+        model.focused = model.frameOf[command[1]!];
+      }
+      if (command[0] === 'eval') data = { result: options?.input?.length ?? 0 };
+      return { stdout: JSON.stringify({ success: true, data }), stderr: '', exitCode: 0 };
+    },
+  });
+  const controller = new AbortController();
+  const signIn = () =>
+    computer.injectCredentials({
+      threadId: 'watch',
+      origin: 'https://1.1.1.1',
+      kind: 'password',
+      password: 'synthetic-watch-password',
+      passwordSelector: '@e3',
+    });
+  try {
+    await computer.act('watch', { action: 'open', url: 'https://1.1.1.1/login' });
+    await signIn();
+    model.tabs = [model.document];
+    await computer.act('watch', { action: 'open', url: 'https://1.1.1.1/second-login' });
+    await signIn();
+    const frames = computer
+      .view('watch', controller.signal, { watch: true })
+      [Symbol.asyncIterator]();
+    const first = frames.next();
+    while (!screencast.connected) await delay(5);
+    screencast.send('synthetic-sealed-frame');
+    assert.equal((await first).value?.length, 0);
+    await computer.act('watch', { action: 'open', url: 'https://1.1.1.1/account' });
+    const next = frames.next();
+    for (let sent = 0; sent < 10; sent++) {
+      screencast.send('synthetic-background-sealed-frame');
+      await delay(150);
+    }
+    assert.equal(await Promise.race([next.then(() => 'frame'), delay(200, 'none')]), 'none');
+    model.tabs = [];
+    const resumed = await Promise.race([next, delay(5_000, undefined)]);
+    assert.equal(String(resumed?.value), 'synthetic-background-sealed-frame');
+    screencast.send('synthetic-open-frame');
+    assert.equal(String((await frames.next()).value), 'synthetic-open-frame');
+  } finally {
+    controller.abort();
+    await computer.dispose();
+    await screencast.close();
     await devtools.close();
     await rm(directory, { recursive: true, force: true });
   }
