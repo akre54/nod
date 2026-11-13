@@ -3,6 +3,7 @@ import { stat } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { Socket } from 'node:net';
 import { resolve } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { runInNewContext } from 'node:vm';
 import { BrowserActionError } from '../src/ports/computer.ts';
 import { createAgentBrowserComputer } from '../src/providers/agent-browser/index.ts';
@@ -432,6 +433,7 @@ export async function fakeScreencast() {
   const server = createServer();
   const sockets = new Set<Socket>();
   let seq = 0;
+  let acked = 0;
   server.on('upgrade', (request, socket: Socket) => {
     const accept = createHash('sha1')
       .update(`${request.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
@@ -439,14 +441,34 @@ export async function fakeScreencast() {
     socket.write(
       `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
     );
-    socket.on('data', () => {});
+    let buffer = Buffer.alloc(0);
+    socket.on('data', (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      while (buffer.length >= 6) {
+        const length = buffer[1]! & 0x7f;
+        if (length > 125 || buffer.length < 6 + length) return;
+        const mask = buffer.subarray(2, 6);
+        const payload = Buffer.from(buffer.subarray(6, 6 + length));
+        for (let index = 0; index < payload.length; index++) payload[index]! ^= mask[index % 4]!;
+        const opcode = buffer[0]! & 0x0f;
+        buffer = buffer.subarray(6 + length);
+        if (opcode !== 1) continue;
+        const message = JSON.parse(payload.toString()) as { type?: string; seq?: number };
+        if (message.type === 'ack' && message.seq === seq) acked = seq;
+      }
+    });
     sockets.add(socket);
     socket.on('close', () => sockets.delete(socket));
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   return {
     port: (server.address() as { port: number }).port,
-    send(image: string) {
+    async send(image: string) {
+      const deadline = Date.now() + 5_000;
+      while (acked < seq) {
+        if (Date.now() > deadline) throw new Error(`Frame ${seq} was not acknowledged.`);
+        await delay(5);
+      }
       const data = Buffer.from(
         JSON.stringify({
           type: 'frame',

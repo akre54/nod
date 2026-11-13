@@ -1154,21 +1154,26 @@ test('watching stays blank while any tab still holds a page Nod filled privately
       .view('watch', controller.signal, { watch: true })
       [Symbol.asyncIterator]();
     const first = frames.next();
-    while (!screencast.connected) await delay(5);
-    screencast.send('synthetic-sealed-frame');
+    const connecting = Date.now() + 5_000;
+    while (!screencast.connected) {
+      assert.ok(Date.now() < connecting, 'The watch view did not connect.');
+      await Promise.race([first, delay(5)]);
+    }
+    await screencast.send('synthetic-sealed-frame');
     assert.equal((await first).value?.length, 0);
     await computer.act('watch', { action: 'open', url: 'https://1.1.1.1/account' });
     const next = frames.next();
     for (let sent = 0; sent < 10; sent++) {
-      screencast.send('synthetic-background-sealed-frame');
+      await screencast.send('synthetic-background-sealed-frame');
       await delay(150);
     }
     assert.equal(await Promise.race([next.then(() => 'frame'), delay(200, 'none')]), 'none');
     model.tabs = [];
     const resumed = await Promise.race([next, delay(5_000, undefined)]);
     assert.equal(String(resumed?.value), 'synthetic-background-sealed-frame');
-    screencast.send('synthetic-open-frame');
-    assert.equal(String((await frames.next()).value), 'synthetic-open-frame');
+    const after = frames.next();
+    await screencast.send('synthetic-open-frame');
+    assert.equal(String((await after).value), 'synthetic-open-frame');
   } finally {
     controller.abort();
     await computer.dispose();
