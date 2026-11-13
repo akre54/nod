@@ -6381,6 +6381,7 @@ function composioProxyFixture(
     parseCallback: async () => assert.fail('Unexpected fixture callback.'),
     upload: async () => assert.fail('Unexpected fixture upload.'),
     isPendingAccount: () => false,
+    backoff: () => undefined,
     ...overrides,
   };
 }
@@ -9113,6 +9114,192 @@ test('Composio connection requests classify HTTP failures without repeating cons
     create.mock.restore();
   }
 });
+
+async function connectionServiceFixture(t: TestContext) {
+  t.mock.method(globalThis, 'fetch', async () => {
+    throw new Error('Unexpected external request in the connection service fixture.');
+  });
+  const root = await mkdtemp(join(tmpdir(), 'nod-connection-wait-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const calls: string[] = [];
+  let userId = '';
+  let reply = () =>
+    Response.json({ data: {}, error: null, log_id: 'fixture-log', result_type: 'completed' });
+  const proxy = createComposioProxy({
+    dataRoot: root,
+    ownerId: 'fixture-owner',
+    keyStore: installationKeyStore,
+    checkpoint: fixtureIdentityCheckpoint,
+    url: 'https://proxy.example.test',
+    request: async (input, init) => {
+      const url = new URL(new Request(input, init).url);
+      if (url.pathname === '/v2/access/enroll') return Response.json({ state: 'enabled', userId });
+      calls.push(url.pathname);
+      if (url.pathname === '/v2/api/v3.1/tool_router/session')
+        return Response.json({
+          session_id: 'trs_fixture_wait',
+          mcp: { type: 'http', url: 'https://proxy.example.test/unsupported-mcp' },
+          config: { user_id: userId, toolkits: { enabled: ['gmail'] }, connected_accounts: {} },
+          config_version: 1,
+        });
+      return reply();
+    },
+  });
+  await proxy.initialize();
+  userId = proxy.userId;
+  const provider = createComposioProvider({ proxy });
+  return {
+    provider,
+    executions: () => calls.filter((path) => path.endsWith('/execute')).length,
+    reply: (next: () => Response) => {
+      reply = next;
+    },
+    send: async () =>
+      (await provider.createSession('fixture-owner', { gmail: 'ca_fixture_wait' })).execute(
+        'GMAIL_SEND_EMAIL',
+        { recipient_email: 'person@example.test' },
+        'ca_fixture_wait',
+      ),
+  };
+}
+
+const busyReply = (headers: Record<string, string> = {}) =>
+  Response.json({ error: 'installation_busy' }, { status: 429, headers });
+
+test('connection service refusals pause the install from Retry-After or a growing wait, and writes are never retried', async (t) => {
+  const service = await connectionServiceFixture(t);
+  const waited = () => {
+    const wait = service.provider.connectionBackoff!();
+    return wait && Math.round((wait.until - Date.now()) / 1000);
+  };
+  service.reply(() => busyReply({ 'retry-after': '120' }));
+  await assert.rejects(service.send());
+  assert.equal(service.executions(), 1);
+  assert.equal(service.provider.connectionBackoff!()?.status, 429);
+  assert.equal(service.provider.connectionBackoff!()?.code, 'installation_busy');
+  assert.ok(Math.abs(waited()! - 120) <= 2);
+  service.reply(() => busyReply({ 'retry-after': new Date(Date.now() + 3_600_000).toUTCString() }));
+  await assert.rejects(service.send());
+  assert.ok(Math.abs(waited()! - 900) <= 2);
+  service.reply(() =>
+    Response.json({ data: {}, error: null, log_id: 'fixture-log', result_type: 'completed' }),
+  );
+  await service.send();
+  assert.equal(service.provider.connectionBackoff!(), undefined);
+  service.reply(() => Response.json({ error: 'service_unavailable' }, { status: 503 }));
+  const growth = [];
+  for (let attempt = 0; attempt < 7; attempt++) {
+    await assert.rejects(service.send());
+    growth.push(waited());
+  }
+  assert.deepEqual(growth, [60, 120, 240, 480, 960, 1800, 1800]);
+  assert.equal(service.provider.connectionBackoff!()?.code, 'service_unavailable');
+  service.reply(() =>
+    Response.json({ data: {}, error: null, log_id: 'fixture-log', result_type: 'completed' }),
+  );
+  await service.send();
+  service.reply(() => busyReply());
+  await assert.rejects(service.send());
+  assert.equal(waited(), 60);
+  assert.equal(service.executions(), 12);
+});
+
+test(
+  'a connection service wait skips background reads across apps, refuses writes and lets an owner read try once',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    const f = await appsFixture(t);
+    const gmail = await f.connect('gmail');
+    const slack = await f.connect('slack');
+    let reads = 0;
+    let polls = 0;
+    f.provider.activity = {
+      gmail: {
+        read: async () => {
+          reads++;
+          return { records: [] };
+        },
+      },
+    };
+    f.provider.pollInbox = async () => {
+      polls++;
+      return { cursor: 'synthetic-cursor', hasMore: false, messages: [] };
+    };
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    const service = await connectionServiceFixture(t);
+    service.reply(() => busyReply({ 'retry-after': '120' }));
+    await assert.rejects(service.send());
+    f.provider.connectionBackoff = service.provider.connectionBackoff;
+    const until = new Date(Date.now() + 120_000).toISOString();
+    const signal = new AbortController().signal;
+    const sessions = f.sessions.length;
+    const background = () => [
+      f.service.readActivity({ connectionId: gmail.connectionId! }, signal),
+      f.service.execute(
+        'local-development',
+        'SLACK_LIST_CONVERSATIONS',
+        { connectionId: slack.connectionId },
+        undefined,
+        signal,
+        undefined,
+        'background',
+      ),
+    ];
+    await Promise.all(
+      background().map((read) =>
+        assert.rejects(read, (error: Error & { status?: number }) => {
+          assert.ok(
+            error.message.includes(
+              `rate limiting this install (installation_busy, HTTP 429), so Nod is not calling it until ${until}`,
+            ),
+          );
+          assert.match(error.message, /Do not retry this source now/);
+          assert.equal(error.status, 429);
+          return true;
+        }),
+      ),
+    );
+    await f.pool.query('UPDATE app_connections SET inbox_poll_at=NULL WHERE id=$1', [
+      gmail.connectionId,
+    ]);
+    await f.service.pollInboxes();
+    assert.equal(
+      (
+        await f.pool.query('SELECT inbox_failed FROM app_connections WHERE id=$1', [
+          gmail.connectionId,
+        ])
+      ).rows[0].inbox_failed,
+      true,
+    );
+    await assert.rejects(
+      f.service.execute('local-development', 'SLACK_SEND_MESSAGE', {
+        connectionId: slack.connectionId,
+        channel: 'C0SYNTHETIC',
+        text: 'Synthetic update',
+      }),
+      (error: Error & { notRun?: boolean }) => {
+        assert.ok(error.message.includes(until));
+        assert.match(error.message, /did not send this action/);
+        assert.equal(error.notRun, true);
+        return true;
+      },
+    );
+    assert.deepEqual([reads, polls, f.executed.length, f.sessions.length], [0, 0, 0, sessions]);
+    await f.service.execute(
+      'local-development',
+      'SLACK_LIST_CONVERSATIONS',
+      { connectionId: slack.connectionId },
+      undefined,
+      signal,
+      undefined,
+      'read',
+    );
+    assert.equal(f.executed.length, 1);
+    t.mock.timers.tick(121_000);
+    await Promise.all(background());
+    assert.deepEqual([reads, f.executed.length, service.executions()], [1, 2, 1]);
+  },
+);
 
 test('Composio proxy sessions omit SDK metadata and refuse unsupported webhooks', async (t) => {
   const client = new Composio({

@@ -7,12 +7,22 @@ import {
 import { Composio } from '@composio/core';
 import { createHash, randomBytes, randomUUID, sign } from 'node:crypto';
 import { z } from 'zod';
-import type { IntegrationFile, IntegrationConnectionBrowser } from '../../ports/integrations.ts';
+import type {
+  IntegrationBackoff,
+  IntegrationFile,
+  IntegrationConnectionBrowser,
+} from '../../ports/integrations.ts';
 import type { CredentialKeyStore } from '../../ports/key-store.ts';
 import type { IntegrationIdentityCheckpoint } from '../../ports/integration-identity.ts';
 import { loadIntegrationIdentity } from './identity.ts';
 
 const stateSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
+const refusalCode = z.enum([
+  'installation_busy',
+  'public_budget_exceeded',
+  'service_unavailable',
+  'security_service_unavailable',
+]);
 const pendingPrefix = 'pending_';
 const browserKeySchema = z
   .object({
@@ -63,6 +73,40 @@ export function createComposioProxy(options: {
       });
     await initializing;
   }
+  let pause: IntegrationBackoff | undefined;
+  let refusals = 0;
+  let generation = 0;
+  function observe(response: Response, started: number, path: string) {
+    if (response.ok) {
+      if (
+        started !== generation ||
+        /^\/v2\/api\/v3\.1\/tool_router\/session(?:\/[^/]+)?$/.test(path)
+      )
+        return;
+      refusals = 0;
+      pause = undefined;
+      return;
+    }
+    if (response.status !== 429 && response.status !== 503) return;
+    generation++;
+    refusals++;
+    const header = response.headers.get('retry-after')?.trim() ?? '';
+    const requested = /^\d+$/.test(header)
+      ? Number(header) * 1000
+      : header
+        ? Date.parse(header) - Date.now()
+        : Number.NaN;
+    const wait = Number.isNaN(requested)
+      ? Math.min(60_000 * 2 ** Math.min(refusals - 1, 5), 30 * 60_000)
+      : Math.min(Math.max(requested, 0), 15 * 60_000);
+    pause = { until: Math.max(pause?.until ?? 0, Date.now() + wait), status: response.status };
+  }
+  function refused(error: unknown) {
+    const failure = error as { status?: unknown; error?: { error?: unknown } } | undefined;
+    const code = refusalCode.safeParse(failure?.error?.error);
+    if (code.success && pause && failure?.status === pause.status)
+      pause = { ...pause, code: code.data };
+  }
   function requiredIdentity() {
     if (!identity) throw new Error('The integration identity has not been initialized.');
     return identity;
@@ -104,13 +148,16 @@ export function createComposioProxy(options: {
     if (url.pathname === '/v2/files/upload') headers.set('x-nod-content-sha256', bodyHash);
     if (value.headers.has('content-type'))
       headers.set('content-type', value.headers.get('content-type')!);
-    return (options.request ?? fetch)(url, {
+    const started = generation;
+    const response = await (options.request ?? fetch)(url, {
       method: value.method,
       headers,
       ...(body.length ? { body } : {}),
       signal: value.signal,
       redirect: 'error',
     });
+    observe(response, started, url.pathname);
+    return response;
   };
   const client = new Composio({
     apiKey: 'nod-managed-proxy',
@@ -193,6 +240,7 @@ export function createComposioProxy(options: {
           controller.signal.throwIfAborted();
           return await active(operation);
         } catch (error) {
+          refused(error);
           return failure(error);
         } finally {
           cleanup();
@@ -281,6 +329,7 @@ export function createComposioProxy(options: {
     origin,
     initialize,
     ownsConnectionUrl: (url: string) => options.browser?.owns(url) ?? false,
+    backoff: () => (pause && pause.until > Date.now() ? { ...pause } : undefined),
     get userId() {
       return requiredIdentity().userId;
     },

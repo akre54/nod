@@ -7256,6 +7256,39 @@ test(
                     next.turnId,
                   ]);
                 }
+                await reset();
+                await db.pool.query(
+                  "INSERT INTO proactive_sources(owner_id,source_id,label,status,revision,cursor) VALUES($1,$2,'Synthetic source','ready',$3,'synthetic-page-two')",
+                  [ownerId, sourceId, revision],
+                );
+                const until = new Date(Date.now() + 120_000);
+                sourceFailure = Object.assign(
+                  new Error(
+                    `The connection service is rate limiting this install (installation_busy, HTTP 429), so Nod is not calling it until ${until.toISOString()}. Nod did not read this source. Do not retry this source now; it is checked again after that time.`,
+                  ),
+                  { statusCode: 429, status: 429, notRun: true },
+                );
+                await assert.rejects(
+                  engine.read(ref, { sourceId }, new AbortController().signal),
+                  sourceFailure,
+                );
+                const waiting = (
+                  await db.pool.query(
+                    'SELECT status,cursor,checked_at,next_poll FROM proactive_sources WHERE owner_id=$1 AND source_id=$2',
+                    [ownerId, sourceId],
+                  )
+                ).rows[0];
+                assert.deepEqual(
+                  [waiting.status, waiting.cursor, waiting.checked_at],
+                  ['unavailable', 'synthetic-page-two', null],
+                );
+                assert.ok(waiting.next_poll > until);
+                const waitingReads = sourceReads;
+                await assert.rejects(
+                  engine.read(ref, { sourceId }, new AbortController().signal),
+                  /HTTP 429.*Do not retry this source now/,
+                );
+                assert.equal(sourceReads, waitingReads);
               },
             );
             await t.test(

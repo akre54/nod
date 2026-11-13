@@ -129,6 +129,11 @@ export class IntegrationConnectionError extends Error {
             : 502;
   }
 }
+export interface IntegrationBackoff {
+  until: number;
+  status: number;
+  code?: IntegrationConnectionError['code'];
+}
 export interface VerificationEmailQuery {
   recipient: string;
   senderDomain: string;
@@ -177,6 +182,7 @@ export interface IntegrationProvider {
   configured: boolean;
   configurationId?: string;
   ownsConnectionUrl?(url: string): boolean;
+  connectionBackoff?(): IntegrationBackoff | undefined;
   supportedServices?: readonly IntegrationService[];
   listServices?(): Promise<IntegrationServiceInfo[]>;
   webhooksConfigured: boolean;

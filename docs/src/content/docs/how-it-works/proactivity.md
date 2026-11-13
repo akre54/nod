@@ -54,6 +54,8 @@ For an app without its own reader, the worker searches that account's tools, pic
 
 An HTTP 429 rate limit or 5xx service failure leaves the source state unknown, including a failure while reading one record. The observer does not call that source again during the same check. A later check can try again. Invalid arguments and expired page cursors can still be repaired within the current check. Read errors keep the HTTP status and available service reason after secret removal.
 
+Apps connected through the connection service share one allowance for your install. When that service answers HTTP 429 or 503, Nod stops calling it for background work: source reads, the server's own batch reads, first-task discovery, Gmail inbox polling and change checks. It waits as long as the service's `Retry-After` header asks, up to 15 minutes. Without that header, it waits one minute and doubles the wait after each refusal, up to 30 minutes. A successful call resets it. A skipped source counts as a failed read: its state stays unknown, its saved page cursor stays, and a later check reads it. The observer is told the time the wait ends and not to retry that source now. Nod keeps the wait in memory, so a restart starts without one.
+
 All sources use the same observer. An instruction such as "forward Ana's invoices to accounting" starts a separate task for that action. The task uses the normal tools and Trust check. Its question or approval wait leaves the observer free to process later activity.
 
 An upgrade cancels queued account checks from the old event path. The observer reads current sources through its own queue.

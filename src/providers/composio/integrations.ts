@@ -634,6 +634,7 @@ export function createComposioProvider(options: {
   return {
     id: 'composio',
     ownsConnectionUrl: (url) => options.proxy.ownsConnectionUrl(url),
+    connectionBackoff: () => options.proxy.backoff(),
     configured: true,
     get configurationId() {
       return options.proxy.configurationId;
