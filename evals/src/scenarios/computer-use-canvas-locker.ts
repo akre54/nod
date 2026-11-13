@@ -125,6 +125,7 @@ function parcelbox(state: State): Site {
 }
 
 const clicked = (call: ToolCall) =>
+  !call.isError &&
   call.name === 'browser' &&
   call.input?.action === 'click' &&
   typeof call.input?.x === 'number' &&

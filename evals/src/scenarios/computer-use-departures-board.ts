@@ -42,7 +42,7 @@ const paragraphs = (text: string) => text.split(/\n\s*\n/);
 const pierFive = /\bpier\s*(?:no\.?\s*)?5\b|\bcais\s*5\b/i;
 const departure = /\b19[:.h]05\b|\b7[:.]05\s*(?:pm|p\.m\.)/i;
 const screenshot = (call: ToolCall) =>
-  call.name === 'browser' && call.input?.action === 'screenshot';
+  !call.isError && call.name === 'browser' && call.input?.action === 'screenshot';
 
 export default scenario({
   id: 'computer-use-departures-board',
@@ -76,12 +76,12 @@ export default scenario({
     return [
       check(
         'gives-pier-5-for-the-1905',
-        (run) => ({
-          pass: paragraphs(run.said).some(
+        (run) => {
+          const found = paragraphs(run.said).find(
             (paragraph) => pierFive.test(paragraph) && departure.test(paragraph),
-          ),
-          evidence: run.final.slice(0, 300),
-        }),
+          );
+          return { pass: Boolean(found), evidence: (found ?? run.final).slice(0, 300) };
+        },
         {
           failure: 'reasoning',
           otherwise: 'The answer says the 19:05 ferry to Cacilhas leaves from Pier 5 today.',

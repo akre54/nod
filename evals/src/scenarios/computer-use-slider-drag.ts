@@ -50,7 +50,7 @@ const script = `(() => {
     if (!dragging) return;
     const { x } = point(event);
     const fraction = Math.min(1, Math.max(0, (x - track.left) / (track.right - track.left)));
-    value = Math.round(fraction * ${most});
+    value = Math.max(1, Math.round(fraction * ${most}));
     field.value = String(value);
     draw();
   });
@@ -113,7 +113,10 @@ function voltio(state: State): Site {
 }
 
 const dragged = (call: ToolCall) =>
-  call.name === 'browser' && call.input?.action === 'drag' && Array.isArray(call.input?.points);
+  !call.isError &&
+  call.name === 'browser' &&
+  call.input?.action === 'drag' &&
+  Array.isArray(call.input?.points);
 
 export default scenario({
   id: 'computer-use-slider-drag',
@@ -141,7 +144,7 @@ export default scenario({
   },
   evidence(_run, world) {
     const s = world.state;
-    return `The settings page draws the daily heating limit as a slider on a canvas with no text or accessibility labels. Its current value, ${start} kWh, is drawn above the handle, and only dragging the handle changes it, in whole kWh from 0 to ${most}. Save settings posts the limit and the hot water boost box, which starts ticked. Saves: ${s.saves.map((item) => `${item.limit} kWh, boost ${item.boost ? 'on' : 'off'}`).join('; ') || 'none'}. Rejected saves: ${s.rejected.join(' | ') || 'none'}. Final limit ${s.limit} kWh, boost ${s.boost ? 'on' : 'off'}.`;
+    return `The settings page draws the daily heating limit as a slider on a canvas with no text or accessibility labels. Its current value, ${start} kWh, is drawn above the handle, and only dragging the handle changes it, in whole kWh from 1 to ${most}. Save settings posts the limit and the hot water boost box, which starts ticked. Saves: ${s.saves.map((item) => `${item.limit} kWh, boost ${item.boost ? 'on' : 'off'}`).join('; ') || 'none'}. Rejected saves: ${s.rejected.join(' | ') || 'none'}. Final limit ${s.limit} kWh, boost ${s.boost ? 'on' : 'off'}.`;
   },
   expect(world) {
     const s = world.state;

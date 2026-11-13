@@ -1464,7 +1464,7 @@ test('the capability matrix fills a capability only from the newest usable run t
     label,
     summary: {
       manifest: { label, model, startedAt },
-      coverage: { missing: [] },
+      coverage: { missing: [], incomplete: 0 },
       contaminated: false,
       capabilities: capabilities.map(([capability, passAt1]) => ({
         capability,
@@ -1478,9 +1478,13 @@ test('the capability matrix fills a capability only from the newest usable run t
   const rows = await capabilityMatrix([
     run('noisy', model, '2026-11-03', [['computer-use', 1]], { contaminated: true }),
     run('partial', model, '2026-11-02', [['computer-use', 0.9]], {
-      coverage: { missing: ['computer-use-slider-drag.3'] },
+      coverage: { missing: ['computer-use-slider-drag.3'], incomplete: 0 },
+    }),
+    run('unfinished', model, '2026-11-02', [['computer-use', 0.8]], {
+      coverage: { missing: [], incomplete: 1 },
     }),
     run('apps-only', model, '2026-11-01', [['apps', 0.8]]),
+    run('older', model, '2026-10-20', [['computer-use', 0.2]]),
     run('computer', model, '2026-10-30', [['computer-use', 0.5]]),
     run('other', 'openai/not-in-the-catalog', '2026-10-30', [['files', 0.4]]),
   ]);

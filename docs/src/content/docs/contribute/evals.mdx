@@ -715,17 +715,17 @@ pnpm run eval:capability capabilities
 
 It prints one row for each provider's default agent model and for every model in a saved run. Add `--json` for the raw rows.
 
-| Column          | Source                                                                                                               |
-| --------------- | -------------------------------------------------------------------------------------------------------------------- |
-| Image input     | Declared. The `images` flag on the model's catalog entry                                                             |
-| Context window  | Declared. The catalog's `contextWindow`, or the 8,192-token limit Nod sets for the OpenRouter routers                |
-| Context profile | Declared. **Compact** below 65,536 tokens, where Nod uses short instructions and loads one detailed tool at a time   |
-| Thinking levels | Declared. The effort levels the catalog entry supports                                                               |
-| Computer use    | Measured. Task completion pass@1 on the `computer-use` cases                                                         |
-| Tool selection  | Measured. Task completion pass@1 on the `apps` cases, which need the right tool among many connected apps            |
-| Coding          | Measured. Task completion pass@1 on the `files` cases, which Nod solves by writing and running code in the workspace |
+| Column          | Source                                                                                                                             |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Image input     | Declared. The `images` flag on the model's catalog entry                                                                           |
+| Context window  | Declared. The catalog's `contextWindow`, or the 8,192-token limit Nod sets for the `openrouter/free` and `openrouter/auto` routers |
+| Context profile | Declared. **Compact** below 65,536 tokens, where Nod uses short instructions and loads one detailed tool at a time                 |
+| Thinking levels | Declared. The effort levels the catalog entry supports                                                                             |
+| Computer use    | Measured. Task completion pass@1 on the `computer-use` cases                                                                       |
+| Tool selection  | Measured. Task completion pass@1 on the `apps` cases, which need the right tool among many connected apps                          |
+| Coding          | Measured. Task completion pass@1 on the `files` cases, which Nod solves by writing and running code in the workspace               |
 
-The declared columns read the model catalog bundled with Nod and make no network request. A model the catalog doesn't list shows **Unknown**. A measured column comes from the newest saved run of that model that ran cases with the capability. Runs that are contaminated or have attempts not run don't count. A column with no such run shows **Not measured**.
+The declared columns read the model catalog bundled with Nod and make no network request. A model the catalog doesn't list shows **Unknown**. A measured column comes from the newest saved run of that model that ran cases with the capability. Runs that are contaminated or have attempts that didn't finish or weren't run don't count. A column with no such run shows **Not measured**.
 
 To fill the measured columns, run the same cases on each model you want to compare:
 

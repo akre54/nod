@@ -23,7 +23,9 @@ export interface CapabilityRow {
 }
 
 const usable = (summary: RunSummary) =>
-  !summary.contaminated && summary.coverage.missing.length === 0;
+  !summary.contaminated &&
+  summary.coverage.incomplete === 0 &&
+  summary.coverage.missing.length === 0;
 
 export async function capabilityMatrix(runs: Array<{ label: string; summary: RunSummary }>) {
   const backend = createPiModelBackend({
