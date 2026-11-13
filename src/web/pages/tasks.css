@@ -442,29 +442,10 @@
   margin: 0;
   padding: 12px;
   border-radius: 8px;
-  background: var(--surface-inset);
+  background: var(--surface-subtle);
   list-style: none;
 }
-.task-command-line,
-.task-command-output {
-  margin: 0;
-  font-family: var(--font-mono);
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-.task-command-output {
-  max-height: 12rem;
-  overflow: auto;
-  color: var(--text-secondary);
-}
-.task-command-status {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  margin: 4px 0 0;
+.task-commands li > small {
   color: var(--muted-foreground);
-}
-.task-commands [data-state='failed'] svg,
-.task-commands [data-state='finished']:not([data-exit='0'], [data-exit='']) svg {
-  color: var(--error);
+  font-size: 12px;
 }

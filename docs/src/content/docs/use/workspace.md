@@ -51,21 +51,26 @@ The workspace can reach the internet. Code that Nod runs there can download file
 
 You can watch the commands a task runs in the workspace. Open the task's preview in chat and select **Show commands**.
 
-Each entry shows the command, the end of its output, and how it ended:
+Each row shows the command and its status. Select a row to open the command and its saved output.
 
-| Status                         | What it means                                                                                  |
-| ------------------------------ | ---------------------------------------------------------------------------------------------- |
-| **Exit code 0**                | The command finished without an error                                                          |
-| **Exit code** and a number     | The command finished with an error. The output usually says why                                |
-| **Ended without an exit code** | Nod couldn't record an exit code, for example after a timeout, cancellation or workspace error |
-| **May still be running**       | The task is still working and the command hasn't reported back                                 |
-| **Ended before it finished**   | The task stopped, for example after **Stop**, before the command ended                         |
+| Status                | What it means                                                               |
+| --------------------- | --------------------------------------------------------------------------- |
+| **Exit 0**            | The command finished without an error                                       |
+| **Exit** and a number | The command finished with that exit code. A nonzero code indicates an error |
+| **Finished**          | The command finished, but Nod did not record an exit code                   |
+| **Running**           | The command has not reported back, and its turn is still running            |
+| **Failed**            | The command failed before Nod could record an exit code                     |
+| **Interrupted**       | The turn ended before Nod could record the command's result                 |
 
-Commands from a task's helpers start with **Helper**. The list shows the latest 200 commands and the last 16,000 characters of each output.
+Commands from a task's helpers have a **Helper** label. The task shows the latest 200 commands. Each output keeps at most the last 16,000 characters that Pi received. Output is saved when a command ends or fails. It does not stream while the command runs.
 
-The view is read-only. It shows only commands from the workspace, never from your computer, and you can't type commands there. To stop a command, stop the task.
+The view is read-only. Commands run in Nod's isolated workspace. To stop a running command, stop the task.
 
-Before an entry is saved, Nod removes known secrets from the command and its output, such as provider keys, tokens and values assigned to names like `password`. It can't recognize every secret, so a value Nod doesn't know about can still appear.
+You can also open **Usage** and select a request to see its commands in the [step log](/use/spending/#see-your-spending). Select a command to open the same detail view. **Export** includes the recorded command, exit code, status and saved output in the CSV file. Older commands without a saved command record still appear as a Bash step.
+
+Before Nod saves an entry, it removes known secrets from the command and output. This includes provider keys, tokens and values assigned to names such as `password`. Nod cannot identify every secret. Private file content can remain in the saved output and the CSV export.
+
+The display limits do not delete older records. The command records remain in your local or self-hosted database until you [remove all data](/trust/privacy/#delete-your-data).
 
 ## Give Nod files
 

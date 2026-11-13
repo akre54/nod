@@ -24,6 +24,7 @@ import type {
 } from '../../shared/contracts';
 import { taskHeadline, taskLabels } from '../../shared/task-status';
 import { InlineName } from '../components/inline-name';
+import { WorkspaceCommandDialog, WorkspaceCommandLine } from '../components/workspace-command';
 import { pageDataCache } from '../lib/page-data-cache';
 import { api } from '../lib/api';
 import { PageTitle } from '../components/page-title';
@@ -98,21 +99,10 @@ function TaskActivity({ id }: { id: string }) {
   );
 }
 
-function commandStatus(command: WorkspaceCommand) {
-  if (command.state === 'running') return { Icon: LoaderCircle, text: 'May still be running' };
-  if (command.state === 'interrupted')
-    return { Icon: CircleSlash, text: 'Ended before it finished' };
-  if (command.state === 'failed') return { Icon: CircleAlert, text: 'Ended without an exit code' };
-  if (command.exitCode === null) return { Icon: CircleCheck, text: 'Finished' };
-  return {
-    Icon: command.exitCode ? CircleAlert : CircleCheck,
-    text: `Exit code ${command.exitCode}`,
-  };
-}
-
 function TaskCommands({ id }: { id: string }) {
   const data = usePageData<{ commands: WorkspaceCommand[] }>(`/api/tasks/${id}/commands`);
   const commands = data.data?.commands ?? [];
+  const [selected, setSelected] = useState<string | null>(null);
   return (
     <section className="task-commands" aria-label="Workspace commands">
       <p className="task-commands-where">
@@ -120,35 +110,29 @@ function TaskCommands({ id }: { id: string }) {
         Nod runs these in its isolated workspace, not on your computer. You can watch, not type.
       </p>
       {data.error ? (
-        <Notice>Could not load commands.</Notice>
+        <Notice>{data.error}</Notice>
       ) : !data.data ? (
         <Loading label="Loading commands…" />
       ) : !commands.length ? (
         <p className="task-preview-meta">No commands yet.</p>
       ) : (
         <ol role="list">
-          {commands.map((command) => {
-            const { Icon, text } = commandStatus(command);
-            return (
-              <li key={command.id} data-state={command.state} data-exit={command.exitCode ?? ''}>
-                <pre className="task-command-line">
-                  <span aria-hidden="true">$ </span>
-                  {command.command}
-                </pre>
-                {command.output && <pre className="task-command-output">{command.output}</pre>}
-                <p className="task-command-status">
-                  <Icon
-                    size={14}
-                    aria-hidden="true"
-                    className={command.state === 'running' ? 'spin' : undefined}
-                  />
-                  {command.helper ? `Helper · ${text}` : text}
-                </p>
-              </li>
-            );
-          })}
+          {commands.map((command) => (
+            <li
+              key={command.id}
+              className={
+                command.state === 'failed' || (command.exitCode !== null && command.exitCode !== 0)
+                  ? 'is-failed'
+                  : undefined
+              }
+            >
+              {command.helper && <small>Helper</small>}
+              <WorkspaceCommandLine command={command} onOpen={() => setSelected(command.id)} />
+            </li>
+          ))}
         </ol>
       )}
+      {selected && <WorkspaceCommandDialog id={selected} onClose={() => setSelected(null)} />}
     </section>
   );
 }

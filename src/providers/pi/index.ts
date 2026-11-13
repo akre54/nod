@@ -6,7 +6,12 @@ import { join, resolve } from 'node:path';
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { getSupportedThinkingLevels, InMemoryCredentialStore } from '@earendil-works/pi-ai';
+import {
+  getSupportedThinkingLevels,
+  InMemoryCredentialStore,
+  isContextOverflow,
+  type AssistantMessage,
+} from '@earendil-works/pi-ai';
 import { Agent as Connections, Dispatcher1Wrapper, buildConnector } from 'undici';
 import { Compile } from 'typebox/compile';
 import {
@@ -208,8 +213,12 @@ type CachedRequest = {
   messages?: Array<{ role: string; content: string | CachedBlock[] }>;
 };
 
-function observerCache(cached: { owner?: string; stable?: string[] }) {
-  const long = { type: 'ephemeral', ttl: '1h' };
+function stableRequestCache(
+  cached: { owner?: string; stable?: string[] },
+  retention: 'short' | 'long',
+  moveOwnerFirst = false,
+) {
+  const durable = retention === 'long' ? { type: 'ephemeral', ttl: '1h' } : { type: 'ephemeral' };
   const short = { type: 'ephemeral' };
   return (pi: ExtensionAPI) => {
     pi.on('before_provider_request', ({ payload }) => {
@@ -217,15 +226,44 @@ function observerCache(cached: { owner?: string; stable?: string[] }) {
       if (!request || !Array.isArray(request.messages)) return;
       if (Array.isArray(request.system) && request.system.filter((b) => b.cache_control).length > 1)
         return;
-      const blocks = request.messages.flatMap((message, at) =>
+      const prefixes = [...new Set(cached.stable ?? [])].sort((a, b) => a.length - b.length);
+      const longest = prefixes.at(-1);
+      const ordered = [...request.messages];
+      if (moveOwnerFirst && cached.owner && longest) {
+        const ownerAt = ordered.findIndex(
+          (message) =>
+            Array.isArray(message.content) &&
+            message.content.length === 1 &&
+            message.content[0]?.type === 'text' &&
+            message.content[0].text === cached.owner,
+        );
+        const stableAt = ordered.findIndex(
+          (message) =>
+            Array.isArray(message.content) &&
+            message.content.some(
+              (block) =>
+                block.type === 'text' &&
+                typeof block.text === 'string' &&
+                block.text.startsWith(longest),
+            ),
+        );
+        if (
+          stableAt >= 0 &&
+          ownerAt === stableAt + 1 &&
+          ordered[stableAt]?.role === 'user' &&
+          ordered[ownerAt]?.role === 'user'
+        ) {
+          const [owner] = ordered.splice(ownerAt, 1);
+          ordered.splice(stableAt, 0, owner!);
+        }
+      }
+      const blocks = ordered.flatMap((message, at) =>
         Array.isArray(message.content)
           ? message.content.map((block, index) => ({ block, at, index }))
           : [],
       );
       const lastText = (match: (text: string) => boolean) =>
         blocks.findLast(({ block }) => block.type === 'text' && match(block.text ?? ''));
-      const prefixes = [...new Set(cached.stable ?? [])].sort((a, b) => a.length - b.length);
-      const longest = prefixes.at(-1);
       const stable = longest
         ? lastText((text) => text.length > longest.length && text.startsWith(longest))
         : undefined;
@@ -236,22 +274,26 @@ function observerCache(cached: { owner?: string; stable?: string[] }) {
         (found.at < stable.at || (found.at === stable.at && found.index < stable.index))
           ? found
           : undefined;
-      const messages = request.messages.map((message, at) =>
+      const messages = ordered.map((message, at) =>
         Array.isArray(message.content)
           ? {
               ...message,
               content: message.content.flatMap((block, index): CachedBlock[] => {
                 const rolling = block.cache_control ? { cache_control: short } : {};
                 if (owner?.at === at && owner.index === index)
-                  return [{ ...block, cache_control: long }];
+                  return [{ ...block, cache_control: durable }];
                 if (stable?.at === at && stable.index === index)
                   return [
                     ...prefixes.map((prefix, step) => ({
                       type: 'text',
                       text: prefix.slice(step ? prefixes[step - 1]!.length : 0),
-                      cache_control: long,
+                      cache_control: durable,
                     })),
-                    { ...block, text: block.text!.slice(longest!.length), ...rolling },
+                    {
+                      ...block,
+                      text: block.text!.slice(longest!.length),
+                      ...(moveOwnerFirst ? { cache_control: short } : rolling),
+                    },
                   ];
                 return [{ ...block, ...rolling }];
               }),
@@ -344,6 +386,53 @@ function completeAssistantMessages(pi: ExtensionAPI) {
     const complete = completeAssistantMessage(message);
     if (complete !== message) return { message: complete };
   });
+}
+
+const oversizedHistoryCheckpoint =
+  'Older session context does not fit this model. It remains in the saved transcript. Use history_search for earlier messages and read workspace files for work results. Do not infer missing facts or repeat uncertain actions. Follow the current owner instruction and rules.';
+
+const imageOutputExtensions: Record<string, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/jpg': 'jpg',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+  'image/bmp': 'bmp',
+};
+
+function checkpointOversizedHistory(
+  manager: SessionManager,
+  budget: ReturnType<typeof modelContextBudget>,
+  historyTokens: number,
+  keepRecentTokens = budget.recent,
+) {
+  const entries = manager.buildContextEntries();
+  const lastAnswer = entries.findLastIndex(
+    (entry) =>
+      entry.type === 'message' &&
+      entry.message.role === 'assistant' &&
+      ['stop', 'length'].includes(entry.message.stopReason),
+  );
+  const firstPending = entries
+    .slice(lastAnswer + 1)
+    .find(
+      (entry) =>
+        (entry.type === 'message' && entry.message.role === 'user') ||
+        (entry.type === 'custom_message' && entry.customType === 'nod-audio-input'),
+    );
+  let recentTokens = 0;
+  let firstKept: string | null = null;
+  for (const entry of entries.toReversed()) {
+    if (entry.type !== 'message') continue;
+    recentTokens += estimateModelTokens(entry.message);
+    if (recentTokens > keepRecentTokens) break;
+    if (entry.message.role === 'user') firstKept = entry.id;
+  }
+  manager.appendCompaction(
+    oversizedHistoryCheckpoint,
+    entries.find((entry) => entry.id === firstKept || entry.id === firstPending?.id)?.id ?? null,
+    historyTokens,
+  );
 }
 
 export function createPiAgent(options: {
@@ -485,11 +574,46 @@ export function createPiAgent(options: {
           .filter((part) => part.type === 'text')
           .map((part) => part.text)
           .join('\n');
-        if (text.length <= Math.floor(budget.window / 2)) return result;
+        const images = result.content.filter((part) => part.type === 'image');
+        if (!text && !images.length) return result;
+        const history = manager.buildSessionContext().messages;
+        const lastCompleted = history.findLastIndex(
+          (message) =>
+            message.role === 'assistant' && ['stop', 'length'].includes(message.stopReason),
+        );
+        const pending = history.slice(lastCompleted + 1);
+        const lastAssistant = pending.findLastIndex((message) => message.role === 'assistant');
+        const ownerCopy = input.ownerContext ? history.findLastIndex(isOwnerContext) : -1;
+        const active = history.filter(
+          (message, index) => message.role !== 'system' && index !== ownerCopy,
+        );
+        const assistant = pending[lastAssistant];
+        const remainingCalls = Math.max(
+          1,
+          (assistant?.role === 'assistant'
+            ? assistant.content.filter((part) => part.type === 'toolCall').length
+            : 1) -
+            pending.slice(lastAssistant + 1).filter((message) => message.role === 'toolResult')
+              .length,
+        );
+        const overheadTokens = requestOverheadTokens();
+        const pointerTokens = Math.max(
+          0,
+          Math.floor(
+            (budget.window - overheadTokens - estimateModelTokens(active)) / remainingCalls,
+          ),
+        );
+        if (
+          text.length <= Math.floor(budget.window / 2) &&
+          estimateModelTokens(text) + (images.length ? estimateModelTokens(images) : 0) <=
+            pointerTokens
+        )
+          return result;
         signal?.throwIfAborted();
         if (input.shouldStop()) throw new Error('The turn was stopped.');
         const directory = `${input.workspace.path}/.nod/outputs`;
-        const path = `${directory}/${randomUUID()}.txt`;
+        const stem = `.nod/outputs/${randomBytes(12).toString('base64url')}`;
+        const textFile = `${stem}.txt`;
         if (
           (
             await input.workspace.exec(`mkdir -p -- '${directory.replaceAll("'", "'\\''")}'`, {
@@ -498,18 +622,59 @@ export function createPiAgent(options: {
           ).exitCode
         )
           throw new Error('The full tool output could not be saved.');
-        await writeWorkspaceFile(input.workspace, path, Buffer.from(text), signal);
-        const saved = JSON.stringify({
-          workspaceFile: path,
-          characters: text.length,
-          preview: text.slice(0, 1000),
-        });
+        let file = textFile;
+        if (images.length) {
+          const savedContent = [];
+          for (const [index, part] of result.content.entries()) {
+            const mimeType =
+              part.type === 'image' ? part.mimeType.toLowerCase().split(';')[0]!.trim() : '';
+            const partFile =
+              part.type === 'image'
+                ? `${stem}-${index}.${imageOutputExtensions[mimeType] ?? 'bin'}`
+                : `${stem}-${index}.txt`;
+            await writeWorkspaceFile(
+              input.workspace,
+              `${input.workspace.path}/${partFile}`,
+              part.type === 'image' ? Buffer.from(part.data, 'base64') : Buffer.from(part.text),
+              signal,
+            );
+            savedContent.push(
+              part.type === 'image'
+                ? { type: 'image', path: partFile, mimeType: part.mimeType }
+                : { type: 'text', path: partFile },
+            );
+          }
+          file = `${stem}.json`;
+          await writeWorkspaceFile(
+            input.workspace,
+            `${input.workspace.path}/${file}`,
+            Buffer.from(JSON.stringify({ content: savedContent })),
+            signal,
+          );
+        } else
+          await writeWorkspaceFile(
+            input.workspace,
+            `${input.workspace.path}/${textFile}`,
+            Buffer.from(text),
+            signal,
+          );
+        let preview = text.slice(0, 1000);
+        const reference = (excerpt: string) =>
+          JSON.stringify(
+            excerpt
+              ? { workspaceFile: file, characters: text.length, preview: excerpt }
+              : { workspaceFile: file },
+          );
+        let saved = reference(preview);
+        let pointer = result.isError ? saved : untrustedBlock(name, saved);
+        while (preview && estimateModelTokens(pointer) > pointerTokens) {
+          preview = preview.slice(0, Math.floor(preview.length / 2));
+          saved = reference(preview);
+          pointer = result.isError ? saved : untrustedBlock(name, saved);
+        }
         return {
           ...result,
-          content: [
-            { type: 'text' as const, text: result.isError ? saved : untrustedBlock(name, saved) },
-            ...result.content.filter((part) => part.type === 'image'),
-          ],
+          content: [{ type: 'text' as const, text: pointer }],
         };
       };
       let idle = false;
@@ -530,7 +695,8 @@ export function createPiAgent(options: {
         model.api === 'anthropic-messages' &&
         last !== undefined &&
         Date.now() - last.timestamp < longCache;
-      if (keepCache) {
+      const scheduleCache = model.api === 'anthropic-messages' ? input.scheduleCache : undefined;
+      if (keepCache || scheduleCache === 'long') {
         const stream = runtime.streamSimple.bind(runtime);
         runtime.streamSimple = (target, context, options) =>
           stream(target, context, { ...options, cacheRetention: 'long' });
@@ -541,36 +707,9 @@ export function createPiAgent(options: {
           null,
           priorTokens,
         );
-      const historyTokens = budget.compact
-        ? estimateModelTokens(manager.buildSessionContext().messages)
-        : 0;
-      if (budget.compact && historyTokens > budget.window / 2) {
-        const entries = manager.buildContextEntries();
-        const lastAnswer = entries.findLastIndex(
-          (entry) => entry.type === 'message' && entry.message.role === 'assistant',
-        );
-        const firstPending = entries
-          .slice(lastAnswer + 1)
-          .find(
-            (entry) =>
-              (entry.type === 'message' && entry.message.role === 'user') ||
-              (entry.type === 'custom_message' && entry.customType === 'nod-audio-input'),
-          );
-        let recentTokens = 0;
-        let firstKept: string | null = null;
-        for (const entry of entries.toReversed()) {
-          if (entry.type !== 'message') continue;
-          recentTokens += estimateModelTokens(entry.message);
-          if (recentTokens > budget.recent) break;
-          if (entry.message.role === 'user') firstKept = entry.id;
-        }
-        manager.appendCompaction(
-          'Older session context does not fit this model. It remains in the saved transcript. Use history_search for earlier messages and read workspace files for work results. Do not infer missing facts or repeat uncertain actions. Follow the current owner instruction and rules.',
-          entries.find((entry) => entry.id === firstKept || entry.id === firstPending?.id)?.id ??
-            null,
-          historyTokens,
-        );
-      }
+      const historyTokens = estimateModelTokens(manager.buildSessionContext().messages);
+      if (budget.compact && historyTokens > budget.window / 2)
+        checkpointOversizedHistory(manager, budget, historyTokens);
       const sandboxTools = input.restricted ? [] : createSandbox(input.workspace, input.timeZone);
       const tools: ToolDefinition[] = [
         ...sandboxTools.map((definition): ToolDefinition => ({
@@ -684,13 +823,13 @@ export function createPiAgent(options: {
                         ...tool,
                         name: 'nod_tool_search',
                         description: tool.description.replaceAll('tool_search', 'nod_tool_search'),
-                        execute: (id, params, signal, update, context) => {
+                        execute: async (id, params, signal, update, context) => {
                           if (budget.compact)
                             pi.setActiveTools([
                               ...sandboxTools.map((tool) => tool.name),
                               'nod_tool_search',
                             ]);
-                          return tool.execute(
+                          const result = await tool.execute(
                             id,
                             budget.compact
                               ? ({ ...(params as object), limit: 1 } as typeof params)
@@ -699,6 +838,16 @@ export function createPiAgent(options: {
                             update,
                             context,
                           );
+                          const loaded = (result.details as { loaded?: string[] } | undefined)
+                            ?.loaded;
+                          return budget.compact && loaded?.length
+                            ? {
+                                ...result,
+                                content: [
+                                  { type: 'text' as const, text: `Loaded: ${loaded.join(', ')}` },
+                                ],
+                              }
+                            : result;
                         },
                       }),
                   }),
@@ -707,7 +856,15 @@ export function createPiAgent(options: {
           recentImages,
           audioContext(manager, readsNativeAudio(model) && Boolean(input.readAudio)),
           threadPromptCache(input.threadId),
-          ...(keepCache ? [observerCache(cached)] : []),
+          ...(keepCache || scheduleCache
+            ? [
+                stableRequestCache(
+                  cached,
+                  keepCache ? 'long' : scheduleCache!,
+                  Boolean(scheduleCache),
+                ),
+              ]
+            : []),
           ownerContextCopies(input.ownerContext),
           (pi: ExtensionAPI) =>
             pi.on('session_before_compact', async ({ preparation, reason, signal }) => {
@@ -722,20 +879,63 @@ export function createPiAgent(options: {
                 return { cancel: true };
               }
               const target = session.model ?? model;
-              return {
-                compaction: await compact(
-                  preparation,
-                  target,
-                  undefined,
-                  undefined,
-                  undefined,
-                  signal,
-                  lightestEffort(getSupportedThinkingLevels(target)),
-                  session.agent.streamFunction,
-                  undefined,
-                  settings.getRetrySettings(),
-                ),
-              };
+              try {
+                return {
+                  compaction: await compact(
+                    preparation,
+                    target,
+                    undefined,
+                    undefined,
+                    undefined,
+                    signal,
+                    lightestEffort(getSupportedThinkingLevels(target)),
+                    session.agent.streamFunction,
+                    undefined,
+                    settings.getRetrySettings(),
+                  ),
+                };
+              } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                if (
+                  signal.aborted ||
+                  !isContextOverflow({
+                    stopReason: 'error',
+                    errorMessage: message,
+                    provider: target.provider,
+                  } as AssistantMessage)
+                )
+                  throw error;
+                const entries = manager.buildSessionProjection().entries;
+                const cut = entries.findIndex(
+                  (entry) => entry.sourceEntry.id === preparation.firstKeptEntryId,
+                );
+                const lastAnswer = entries.findLastIndex((entry) =>
+                  entry.messages.some(
+                    (message) =>
+                      message.role === 'assistant' &&
+                      ['stop', 'length'].includes(message.stopReason),
+                  ),
+                );
+                const firstPending = entries.findIndex(
+                  (entry, index) =>
+                    index > lastAnswer &&
+                    entry.messages.some(
+                      (message) =>
+                        message.role === 'user' ||
+                        (message.role === 'custom' && message.customType === 'nod-audio-input'),
+                    ),
+                );
+                return {
+                  compaction: {
+                    summary: oversizedHistoryCheckpoint,
+                    firstKeptEntryId:
+                      firstPending >= 0 && firstPending < cut
+                        ? entries[firstPending]!.sourceEntry.id
+                        : preparation.firstKeptEntryId,
+                    tokensBefore: preparation.tokensBefore,
+                  },
+                };
+              }
             }),
           (pi: ExtensionAPI) =>
             pi.on('cache_warming_decision', async () => {
@@ -892,6 +1092,19 @@ export function createPiAgent(options: {
       });
       if (budget.compact)
         session.setActiveToolsByName([...sandboxTools.map((tool) => tool.name), 'nod_tool_search']);
+      const requestOverheadTokens = () =>
+        estimateModelTokens({
+          systemPrompt,
+          ownerContext: input.ownerContext,
+          tools: session.getActiveToolNames().flatMap((name) => {
+            const tool = session.getToolDefinition(name);
+            return tool
+              ? [{ name: tool.name, description: tool.description, parameters: tool.parameters }]
+              : [];
+          }),
+        }) +
+        budget.margin +
+        128;
       if (disposed) {
         session.dispose();
         throw new Error('The agent service has stopped.');
@@ -900,7 +1113,21 @@ export function createPiAgent(options: {
       const finishTurn = session.agent.finishTurn;
       session.agent.finishTurn = async (turn, signal) => {
         const result = await finishTurn?.(turn, signal);
-        if (input.shouldStop()) return { action: 'end' as const };
+        if (
+          input.shouldStop(
+            turn.toolResults.map((result) => ({
+              name: result.toolName,
+              ...(result.isError
+                ? {
+                    error: result.content
+                      .flatMap((part) => (part.type === 'text' ? [part.text] : []))
+                      .join('\n'),
+                  }
+                : {}),
+            })),
+          )
+        )
+          return { action: 'end' as const };
         if (
           input.nextMessages &&
           result?.action !== 'end' &&
@@ -1085,6 +1312,74 @@ export function createPiAgent(options: {
             throw new Error(
               `This request does not fit the model's ${budget.window}-token context. Use a model with a larger context or a shorter request.`,
             );
+          const overheadTokens = requestOverheadTokens();
+          const incomingTokens = estimateModelTokens({ text, images, audio });
+          const currentHistory = manager.buildSessionContext().messages;
+          const lastCompleted = currentHistory.findLastIndex(
+            (message) =>
+              message.role === 'assistant' && ['stop', 'length'].includes(message.stopReason),
+          );
+          const unfinished = currentHistory.slice(lastCompleted + 1);
+          if (
+            unfinished.some(
+              (message) =>
+                message.role === 'user' ||
+                (message.role === 'custom' && message.customType === 'nod-audio-input'),
+            ) &&
+            estimateModelTokens(unfinished) + incomingTokens + overheadTokens >= budget.window
+          )
+            throw new Error(
+              `The unfinished request does not fit this model's ${budget.window}-token context. Use a model with a larger context or reset the conversation.`,
+            );
+          if (
+            !budget.compact &&
+            currentHistory.length > 0 &&
+            estimateModelTokens(currentHistory) + incomingTokens + overheadTokens >= budget.window
+          ) {
+            try {
+              await session.compact();
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              if (
+                message !== 'Nothing to compact (session too small)' &&
+                message !== 'Already compacted' &&
+                !isContextOverflow({
+                  stopReason: 'error',
+                  errorMessage: message,
+                  provider: model.provider,
+                } as AssistantMessage)
+              )
+                throw error;
+            }
+            const remaining = estimateModelTokens(manager.buildSessionContext().messages);
+            if (remaining + incomingTokens + overheadTokens >= budget.window) {
+              checkpointOversizedHistory(
+                manager,
+                budget,
+                remaining,
+                Math.min(
+                  budget.recent,
+                  Math.max(
+                    0,
+                    budget.window -
+                      incomingTokens -
+                      overheadTokens -
+                      estimateModelTokens(oversizedHistoryCheckpoint),
+                  ),
+                ),
+              );
+              session.refreshContext();
+              if (
+                estimateModelTokens(manager.buildSessionContext().messages) +
+                  incomingTokens +
+                  overheadTokens >=
+                budget.window
+              )
+                throw new Error(
+                  `This request does not fit this model's ${budget.window}-token context after reducing saved history. Use a model with a larger context or a shorter request.`,
+                );
+            }
+          }
           const owner = input.ownerContext;
           const copy = manager.buildSessionContext().messages.findLast(isOwnerContext);
           if (owner && (copy as { content?: unknown } | undefined)?.content !== owner)
