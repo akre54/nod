@@ -47,6 +47,31 @@ flowchart LR
 The workspace can reach the internet. Code that Nod runs there can download files and call websites.
 :::
 
+## Watch Nod's commands
+
+You can watch the commands a task runs in the workspace. Open the task's preview in chat and select **Show commands**.
+
+Each row shows the command and its status. Select a row to open the command and its saved output.
+
+| Status                | What it means                                                               |
+| --------------------- | --------------------------------------------------------------------------- |
+| **Exit 0**            | The command finished without an error                                       |
+| **Exit** and a number | The command finished with that exit code. A nonzero code indicates an error |
+| **Finished**          | The command finished, but Nod did not record an exit code                   |
+| **Running**           | The command has not reported back, and its turn is still running            |
+| **Failed**            | The command failed before Nod could record an exit code                     |
+| **Interrupted**       | The turn ended before Nod could record the command's result                 |
+
+Commands from a task's helpers have a **Helper** label. The task shows the latest 200 commands. Each output keeps at most the last 16,000 characters of the redacted command output. The exit code is saved when available. Output is saved when a command ends or fails. It does not stream while the command runs.
+
+The view is read-only. Commands run in Nod's isolated workspace. To stop a running command, stop the task.
+
+You can also open **Usage** and select a request to see its commands in the [step log](/use/spending/#see-your-spending). Select a command to open the same detail view. **Export** includes the recorded command, exit code, status and saved output in the CSV file. Older commands without a saved command record still appear as a Bash step.
+
+Before Nod saves an entry, it removes known secrets from the command and output. This includes provider keys, tokens and values assigned to names such as `password`. Nod cannot identify every secret. Private file content can remain in the saved output and the CSV export.
+
+The display limits do not delete older records. The command records remain in your local or self-hosted database until you [remove all data](/trust/privacy/#delete-your-data).
+
 ## Give Nod files
 
 - **Attach them in chat.** Each file can be 90 MB or smaller. Nod gets a copy in the workspace and sees images directly.

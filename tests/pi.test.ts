@@ -37,6 +37,8 @@ import type { DecisionQuestion } from '../src/ports/decisions.ts';
 import type { ProviderUsageEvent } from '../src/ports/provider-usage.ts';
 import { createSandbox } from '../src/providers/pi/sandbox.ts';
 import { createAgentRuntime } from '../src/runtime/index.ts';
+import { createCommandRedactor } from '../src/server/redaction.ts';
+import type { WorkspaceCommandRecord } from '../src/shared/execution.ts';
 import { Type } from '@sinclair/typebox';
 import { fakeComputer, fakeWorkspace, fakeExecution } from './runtime-fixtures.ts';
 
@@ -621,6 +623,22 @@ test('small Pi sessions save full output and keep nested results available to sc
   const read = captured!.customTools!.find((tool) => tool.name === 'read')!;
   await read.execute('read', { path: saved, limit: 2 }, undefined, undefined, undefined as never);
   assert.deepEqual(guarded, ['read']);
+  const bash = captured!.customTools!.find((tool) => tool.name === 'bash')!;
+  const command = (await bash.execute(
+    'bash',
+    { command: "printf 'synthetic-line-%05d\\n' $(seq 1 600); echo synthetic-last-line; exit 4" },
+    undefined,
+    undefined,
+    undefined as never,
+  )) as Awaited<ReturnType<ToolDefinition['execute']>> & {
+    exitCode?: number;
+    commandOutput?: string;
+  };
+  const shown = command.content.find((part) => part.type === 'text')!.text;
+  assert.match(shown, /"workspaceFile"/);
+  assert.equal(shown.includes('synthetic-last-line'), false);
+  assert.equal(command.exitCode, 4);
+  assert.match(command.commandOutput!, /synthetic-line-00600\nsynthetic-last-line/);
   await session.dispose();
 });
 
@@ -2031,6 +2049,91 @@ test('bash output larger than Pi limits stays in the sandbox and never creates h
   await assert.rejects(run('bash', { command: 'sleep 5', timeout: 1 }));
   const after = (await readdir(tmpdir())).filter((name) => name.startsWith('pi-bash-'));
   assert.deepEqual(after, before);
+});
+
+test('the owner command stream records exit status and output without known secrets', async (t) => {
+  const { workspace } = await hostSandbox(t);
+  const directory = await mkdtemp(join(tmpdir(), 'nod-command-stream-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const secret = 'synthetic-workspace-secret-4417';
+  const calls: Array<Record<string, string | number>> = [
+    { command: `echo ${secret}; echo password=synthetic-assigned-value; exit 3` },
+    { command: `echo late-${secret}; sleep 5`, timeout: 1 },
+  ];
+  const run = async (redactCommand?: (text: string) => string) => {
+    let step = 0;
+    const events: Array<{ type: string; command?: WorkspaceCommandRecord }> = [];
+    const runtime = createAgentRuntime({
+      agent: createPiAgent({
+        provider: 'openai',
+        apiKey: 'fixture',
+        sessionRoot: join(directory, randomUUID()),
+        createSession: async (options) => {
+          const result = await createAgentSession(options);
+          result.session.setActiveToolsByName(
+            result.session.getAllTools().map((tool) => tool.name),
+          );
+          result.session.agent.streamFunction = (model) => {
+            const call = calls[step++];
+            const message: AssistantMessage = {
+              role: 'assistant',
+              api: model.api,
+              provider: model.provider,
+              model: model.id,
+              timestamp: Date.now(),
+              stopReason: call ? 'toolUse' : 'stop',
+              content: call
+                ? [{ type: 'toolCall', id: `bash-${step}`, name: 'bash', arguments: call }]
+                : [{ type: 'text', text: 'Done' }],
+              usage: {
+                input: 1,
+                output: 1,
+                cacheRead: 0,
+                cacheWrite: 0,
+                totalTokens: 2,
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+              },
+            };
+            const stream = createAssistantMessageEventStream();
+            stream.push({ type: 'start', partial: message });
+            stream.push({ type: 'done', reason: call ? 'toolUse' : 'stop', message });
+            return stream;
+          };
+          return result;
+        },
+      }),
+      computer: fakeComputer(),
+      workspace: fakeWorkspace({ open: () => workspace }),
+      redactCommand,
+    });
+    try {
+      await runtime.runTurn({
+        ...context(directory),
+        threadId: randomUUID(),
+        turnId: randomUUID(),
+        emit: async (type, _summary, event) => {
+          events.push({ type, command: event?.command });
+        },
+      });
+    } finally {
+      await runtime.dispose();
+    }
+    return events.filter((event) => event.command);
+  };
+  const records = await run(createCommandRedactor([secret]));
+  assert.deepEqual(
+    records.map(({ type, command }) => [type, command?.command, command?.exitCode]),
+    [
+      ['tool_start', 'echo [redacted]; echo password=[redacted]; exit 3', undefined],
+      ['tool_complete', undefined, 3],
+      ['tool_start', 'echo late-[redacted]; sleep 5', undefined],
+      ['tool_failed', undefined, undefined],
+    ],
+  );
+  assert.match(records[1].command!.output!, /^\[redacted\]\npassword=\[redacted\]/);
+  assert.match(records[3].command!.output!, /late-\[redacted\][\s\S]*timed out/);
+  assert.equal(JSON.stringify(records).includes('synthetic-'), false);
+  assert.deepEqual(await run(), []);
 });
 
 // Runtime: one active turn, stop and shutdown drain.

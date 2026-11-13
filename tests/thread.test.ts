@@ -39,6 +39,7 @@ import type {
   SubmitMessageResponse,
   Task,
   Turn,
+  WorkspaceCommand,
 } from '../src/shared/contracts.ts';
 import { fakeComputer, fakeWorkspace } from './runtime-fixtures.ts';
 import { createMemoryLearning } from '../src/server/memory-learning.ts';
@@ -1072,6 +1073,76 @@ test(
             assert.ok(!emitted.includes(privateValue));
         },
       );
+
+      await t.test('a task command stream shows only its own owner’s commands', async (t) => {
+        const turns: string[] = [];
+        const tasksMade: string[] = [];
+        const callIds: string[] = [];
+        const commandTask = async (owner: string, status: string, command: string) => {
+          const id = randomUUID();
+          const turnId = randomUUID();
+          tasksMade.push(id);
+          turns.push(turnId);
+          await db.pool.query(
+            "INSERT INTO turns(id,owner_id,thread_id,session_id,source,prompt,status,background) VALUES($1,$2,$3,$4,'task','Synthetic command task',$5,true)",
+            [turnId, owner, threadId, id, status],
+          );
+          await db.pool.query(
+            "INSERT INTO tasks(id,owner_id,turn_id,session_id,title,done_when,now_text,applied_revision) VALUES($1,$2,$3,$1,'Synthetic command task','Synthetic result','Working',1)",
+            [id, owner, turnId],
+          );
+          await db.pool.query('UPDATE turns SET task_id=$2 WHERE id=$1', [turnId, id]);
+          const events = [
+            ['tool_start', randomUUID(), { command }],
+            ['tool_start', randomUUID(), { command: `${command} --second` }],
+          ] as const;
+          callIds.push(...events.map(([, callId]) => callId));
+          for (const [index, [type, callId, record]] of events.entries())
+            await db.pool.query(
+              "INSERT INTO turn_events(id,turn_id,type,summary,call_id,command,created_at) VALUES($1,$2,$3,'bash',$4,$5,now()+$6*interval '1 second')",
+              [randomUUID(), turnId, type, callId, record, index],
+            );
+          await db.pool.query(
+            "INSERT INTO turn_events(id,turn_id,type,summary,call_id,command) VALUES($1,$2,'tool_complete','bash',$3,$4)",
+            [randomUUID(), turnId, events[0][1], { exitCode: 2, output: 'synthetic output' }],
+          );
+          return id;
+        };
+        t.after(async () => {
+          await db.pool.query('UPDATE turns SET task_id=NULL WHERE id=ANY($1::uuid[])', [turns]);
+          await db.pool.query('DELETE FROM turn_events WHERE turn_id=ANY($1::uuid[])', [turns]);
+          await db.pool.query('DELETE FROM tasks WHERE id=ANY($1::uuid[])', [tasksMade]);
+          await db.pool.query('DELETE FROM turns WHERE id=ANY($1::uuid[])', [turns]);
+        });
+        const own = await commandTask(ownerId, 'running', 'ls synthetic-own');
+        const ended = await commandTask(ownerId, 'cancelled', 'ls synthetic-ended');
+        const foreign = await commandTask('synthetic-other-command-owner', 'running', 'cat x');
+        const read = async (id: string) => {
+          const response = await request('GET', `/api/tasks/${id}/commands`);
+          return { status: response.statusCode, body: response.json() };
+        };
+        const mine = await read(own);
+        assert.equal(mine.status, 200);
+        assert.deepEqual(
+          mine.body.commands.map((command: WorkspaceCommand) => [
+            command.command,
+            command.state,
+            command.exitCode,
+            command.output,
+          ]),
+          [
+            ['ls synthetic-own', 'finished', 2, 'synthetic output'],
+            ['ls synthetic-own --second', 'running', null, ''],
+          ],
+        );
+        const stopped = await read(ended);
+        assert.equal(stopped.body.commands[1].state, 'interrupted');
+        for (const executionId of [...callIds, ...turns])
+          assert.equal(JSON.stringify([mine.body, stopped.body]).includes(executionId), false);
+        const other = await read(foreign);
+        assert.equal(other.status, 404);
+        assert.equal(JSON.stringify(other.body).includes('cat x'), false);
+      });
 
       await t.test('first-card tasks stay in the ledger after 100 newer tasks', async (t) => {
         const owner = `first-card-ledger-${randomUUID()}`;

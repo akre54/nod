@@ -169,10 +169,10 @@ flowchart TB
   <a href="docs/src/assets/readme/heading-next.webp#gh-light-mode-only"><img src="docs/src/assets/readme/heading-next.webp" alt="Next on the list" width="316" /></a>
 </p>
 
-- **Run while your machine is asleep.** Hosted, so the morning brief still arrives.
-- **Call businesses on the phone.** For the errands that still need a voice.
-- **One Nod for your team.** Today one owner per Nod. Next, a few people sharing one.
-- **Make it your own.** Change how Nod works in the open code, and send it back.
+- **Managed hosting.** An always-on Nod, hosted for you.
+- **Make phone calls.** For the errands that still need a voice.
+- **Nod for your team.** Share one Nod, with its apps and memory.
+- **Make it your own.** Add your own skills and tools without touching the core.
 
 <br />
 

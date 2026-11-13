@@ -718,14 +718,26 @@ export function createPiAgent(options: {
             const result = await input.runTool(
               definition.name,
               params,
-              () =>
-                id.includes('/')
-                  ? definition.execute(id, params, signal, onUpdate, context)
-                  : boundedOutput(
-                      definition.name,
-                      () => definition.execute(id, params, signal, onUpdate, context),
-                      signal,
-                    ),
+              async () => {
+                const output = await definition.execute(id, params, signal, onUpdate, context);
+                const bounded = id.includes('/')
+                  ? output
+                  : await boundedOutput(definition.name, async () => output, signal);
+                if (definition.name !== 'bash') return bounded;
+                const exitCode = (output.structuredContent as { exit_code?: unknown } | undefined)
+                  ?.exit_code;
+                return {
+                  ...bounded,
+                  ...(Number.isInteger(exitCode) ? { exitCode: exitCode as number } : {}),
+                  ...(bounded === output
+                    ? {}
+                    : {
+                        commandOutput: output.content
+                          .flatMap((part) => (part.type === 'text' ? [part.text] : []))
+                          .join('\n'),
+                      }),
+                };
+              },
               { nested: id.includes('/') },
             );
             return { ...result, details: result.details ?? {} };

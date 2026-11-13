@@ -40,7 +40,7 @@ import { repeatsTaskStart } from '../shared/task-ack.ts';
 import { currentUserTime, localResultTimes } from './time-context.ts';
 import { connectedTools, mcpNamespaces, nodTools } from './tools.ts';
 import type { ReplyDelivery, Turn } from './turn.ts';
-import type { ExecutionScope } from '../shared/execution.ts';
+import type { ExecutionScope, WorkspaceCommandRecord } from '../shared/execution.ts';
 import type { MemoryBrief } from '../ports/memory-recall.ts';
 import { delimit } from './untrusted.ts';
 
@@ -136,6 +136,16 @@ function textResult(value: unknown): AgentToolResult {
   };
 }
 
+const commandOutputChars = 16_000;
+const omittedOutput = '[Earlier output omitted]\n';
+
+function commandOutput(redact: (text: string) => string, text: string) {
+  const safe = redact(text);
+  return safe.length > commandOutputChars
+    ? `${omittedOutput}${safe.slice(-(commandOutputChars - omittedOutput.length))}`
+    : safe;
+}
+
 function isToolResult(value: unknown): value is AgentToolResult {
   const content = value && typeof value === 'object' && (value as AgentToolResult).content;
   return (
@@ -169,6 +179,7 @@ export function createAgentRuntime(dependencies: {
   skills?: SkillLibrary;
   documentation?: Documentation;
   redactError?(text: string): string;
+  redactCommand?(text: string): string;
   observe?(turnId: string, event: RuntimeObservation): void;
   keepWarm?(threadId: string): Promise<boolean>;
   prepareMemory?(
@@ -463,7 +474,13 @@ export function createAgentRuntime(dependencies: {
           name === 'browser' && typeof (params as { action?: unknown })?.action === 'string'
             ? `${label} ${(params as { action: string }).action}`
             : label;
-        const event = () => ({
+        const redactCommand = name === 'bash' ? dependencies.redactCommand : undefined;
+        const commandLine = (params as { command?: unknown } | null)?.command;
+        const command =
+          redactCommand && typeof commandLine === 'string'
+            ? redactCommand(commandLine).slice(0, 4000)
+            : undefined;
+        const event = (record?: WorkspaceCommandRecord) => ({
           execution: source,
           callId: id,
           ...(browserTools.has(name) && sites.has(source.browserId)
@@ -471,6 +488,7 @@ export function createAgentRuntime(dependencies: {
             : app
               ? { site: app }
               : {}),
+          ...(record && command !== undefined ? { command: record } : {}),
         });
         const end = (fields: {
           status: 'succeeded' | 'failed' | 'cancelled';
@@ -501,7 +519,7 @@ export function createAgentRuntime(dependencies: {
           assertActive();
           await untilAborted(pendingReplies, signal);
           assertActive();
-          await context.emit('tool_start', label, event());
+          await context.emit('tool_start', label, event({ command }));
           assertActive();
           const output = await untilAborted(execute(), signal);
           signal.throwIfAborted();
@@ -524,8 +542,27 @@ export function createAgentRuntime(dependencies: {
               message: String((params as { message?: unknown }).message ?? ''),
               previousReply: lastReply,
             };
-          if (!stopped) await context.emit('tool_complete', eventLabel, event());
-          result = isToolResult(output) ? output : textResult(output);
+          const { commandOutput: fullOutput, ...toolResult } = isToolResult(output)
+            ? output
+            : textResult(output);
+          result = toolResult;
+          if (!stopped)
+            await context.emit(
+              'tool_complete',
+              eventLabel,
+              event(
+                redactCommand && {
+                  ...(result.exitCode === undefined ? {} : { exitCode: result.exitCode }),
+                  output: commandOutput(
+                    redactCommand,
+                    fullOutput ??
+                      result.content
+                        .flatMap((part) => (part.type === 'text' ? [part.text] : []))
+                        .join('\n'),
+                  ),
+                },
+              ),
+            );
           if (
             !nested &&
             output !== confirmationNotice &&
@@ -550,9 +587,23 @@ export function createAgentRuntime(dependencies: {
             if (times)
               result = { ...result, content: [{ type: 'text', text: times }, ...result.content] };
           }
-          end({ status: 'succeeded', output });
+          end({ status: 'succeeded', output: fullOutput === undefined ? output : toolResult });
         } catch (error) {
-          if (!stopped) await context.emit('tool_failed', eventLabel, event()).catch(() => {});
+          if (!stopped)
+            await context
+              .emit(
+                'tool_failed',
+                eventLabel,
+                event(
+                  redactCommand && {
+                    output: commandOutput(
+                      redactCommand,
+                      error instanceof Error ? error.message : String(error),
+                    ),
+                  },
+                ),
+              )
+              .catch(() => {});
           const browserFailure = error instanceof BrowserActionError ? error.message : undefined;
           const failure = signal.aborted
             ? 'The action was cancelled.'

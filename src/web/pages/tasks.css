@@ -422,3 +422,30 @@
   color: var(--muted-foreground);
   font-size: 12px;
 }
+.task-commands {
+  display: grid;
+  gap: 8px;
+  font-size: var(--text-control);
+}
+.task-commands-where {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  color: var(--text-secondary);
+}
+.task-commands ol {
+  display: grid;
+  gap: 12px;
+  max-height: 24rem;
+  overflow: auto;
+  margin: 0;
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--surface-subtle);
+  list-style: none;
+}
+.task-commands li > small {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}

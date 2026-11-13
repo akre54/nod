@@ -294,6 +294,8 @@ export const appConfirmation = Symbol('appConfirmation');
 export interface AgentToolResult {
   content: Array<{ type: 'text'; text: string } | AgentImage>;
   details?: unknown;
+  exitCode?: number;
+  commandOutput?: string;
 }
 export interface AgentToolMetadata {
   name: string;

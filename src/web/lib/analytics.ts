@@ -116,7 +116,14 @@ type AnalyticsEvents = {
   };
   task_action: {
     action:
-      'expand' | 'stop' | 'show_in_chat' | 'open_browser' | 'open_page' | 'show_activity' | 'reply';
+      | 'expand'
+      | 'stop'
+      | 'show_in_chat'
+      | 'open_browser'
+      | 'open_page'
+      | 'show_activity'
+      | 'show_commands'
+      | 'reply';
   };
   tab_viewed: { page: 'apps'; tab: 'all' | 'connected' };
   ui_error: {
@@ -259,6 +266,7 @@ const eventProperties: Record<keyof AnalyticsEvents, Record<string, readonly unk
       'open_browser',
       'open_page',
       'show_activity',
+      'show_commands',
       'reply',
     ],
   },

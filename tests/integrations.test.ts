@@ -9195,8 +9195,8 @@ test(
         CREATE TABLE threads(id uuid PRIMARY KEY,owner_id text NOT NULL,archived_at timestamptz);
         CREATE TABLE turns(id uuid PRIMARY KEY,owner_id text NOT NULL,source text NOT NULL,source_id text,
           message_id uuid,prompt text NOT NULL,channel text NOT NULL DEFAULT 'web',status text NOT NULL DEFAULT 'succeeded',
-          error text,created_at timestamptz NOT NULL DEFAULT now(),thread_id uuid,session_id uuid);
-        CREATE TABLE turn_events(id uuid DEFAULT gen_random_uuid(),turn_id uuid,type text,summary text DEFAULT '',site text,parent_run_id uuid,created_at timestamptz NOT NULL DEFAULT now());
+          error text,created_at timestamptz NOT NULL DEFAULT now(),thread_id uuid,session_id uuid,task_id uuid);
+        CREATE TABLE turn_events(id uuid DEFAULT gen_random_uuid(),turn_id uuid,type text,summary text DEFAULT '',site text,parent_run_id uuid,call_id uuid,command jsonb,created_at timestamptz NOT NULL DEFAULT now());
         CREATE TABLE messages(id uuid,owner_id text,role text,text text,turn_id uuid,thread_id uuid,created_at timestamptz DEFAULT now(),hidden_at timestamptz);
         CREATE TABLE preferences(owner_id text PRIMARY KEY,time_zone text,locale text,hour_cycle text);
         CREATE TABLE schedules(id uuid,owner_id text,title text);
@@ -9467,32 +9467,97 @@ test(
           ($3,'owner','card','https://shop.example.test','card','@SUM(1+1)','said_yes',300,'EUR')`,
         [randomUUID(), randomUUID(), randomUUID()],
       );
+      const commandIds: string[] = [];
+      const commandOutput = '=SUM(1,2)\r\nsynthetic "output"';
+      for (const [turnId, status, exitCode] of [
+        [chat, 'tool_complete', 3],
+        [chat, 'tool_failed', null],
+        [chat, null, null],
+        [foreign, 'tool_complete', 0],
+        [scheduled, null, null],
+      ] as const) {
+        const id = randomUUID(),
+          call = randomUUID();
+        commandIds.push(id);
+        await pool.query(
+          `INSERT INTO turn_events(id,turn_id,type,summary,call_id,command,parent_run_id)
+           VALUES($1,$2,'tool_start','bash',$3,$4,$5)`,
+          [id, turnId, call, { command: '@synthetic --arg "value"' }, chat],
+        );
+        if (status)
+          await pool.query(
+            `INSERT INTO turn_events(turn_id,type,summary,call_id,command)
+             VALUES($1,$2,'bash',$3,$4)`,
+            [turnId, status, call, { exitCode, output: commandOutput }],
+          );
+      }
+      await pool.query("UPDATE turns SET status='running' WHERE id=$1", [chat]);
+      await pool.query("UPDATE turns SET status='cancelled' WHERE id=$1", [scheduled]);
+      const commandSteps = (await app.inject(`/api/trust/entries/${chat}/steps`))
+        .json()
+        .steps.filter((step: TrustStep) => step.command);
+      assert.equal(commandSteps.length, 3);
+      assert.deepEqual(
+        commandSteps.map((step: TrustStep) => [
+          step.command?.state,
+          step.command?.exitCode,
+          Boolean(step.failed),
+        ]),
+        [
+          ['finished', 3, true],
+          ['failed', null, true],
+          ['running', null, false],
+        ],
+      );
+      assert.ok(
+        commandSteps.every((step: TrustStep) => step.helper && step.command?.output === undefined),
+      );
+      const detail = (await app.inject(`/api/trust/commands/${commandIds[0]}`)).json().command;
+      assert.equal(detail.output, commandOutput);
+      assert.equal(detail.exitCode, 3);
+      assert.equal(detail.state, 'finished');
+      assert.equal(detail.helper, true);
+      assert.equal((await app.inject(`/api/trust/commands/${commandIds[3]}`)).statusCode, 404);
+      const stopped = (await app.inject(`/api/trust/commands/${commandIds[4]}`)).json().command;
+      assert.equal(stopped.state, 'interrupted');
       const exported = await app.inject('/api/trust/export');
       assert.equal(exported.statusCode, 200);
       const cells = (body: string) =>
-        body
-          .replace(/^\ufeff/, '')
-          .trim()
-          .split('\r\n')
-          .map((line) => {
-            const row: string[] = [];
-            let cell = '';
-            let quoted = false;
-            for (let index = 0; index < line.length; index++) {
-              const char = line[index]!;
-              if (quoted && char === '"' && line[index + 1] === '"') {
-                cell += '"';
-                index++;
-              } else if (char === '"') quoted = !quoted;
-              else if (char === ',' && !quoted) {
-                row.push(cell);
-                cell = '';
-              } else cell += char;
-            }
-            return [...row, cell];
-          });
+        (() => {
+          const rows: string[][] = [];
+          let row: string[] = [];
+          let cell = '';
+          let quoted = false;
+          const line = body.replace(/^\ufeff/, '');
+          for (let index = 0; index < line.length; index++) {
+            const char = line[index]!;
+            if (quoted && char === '"' && line[index + 1] === '"') {
+              cell += '"';
+              index++;
+            } else if (char === '"') quoted = !quoted;
+            else if (char === ',' && !quoted) {
+              row.push(cell);
+              cell = '';
+            } else if (char === '\r' && line[index + 1] === '\n' && !quoted) {
+              rows.push([...row, cell]);
+              row = [];
+              cell = '';
+              index++;
+            } else cell += char;
+          }
+          return rows;
+        })();
       const rows = cells(exported.body);
       assert.ok(rows.every((row) => row.length === rows[0]!.length));
+      const commandRows = rows.slice(1).filter((row) => row[8]);
+      assert.equal(commandRows.length, 4);
+      assert.deepEqual(commandRows.find((row) => row[9] === '3')?.slice(8), [
+        '\'@synthetic --arg "value"',
+        '3',
+        'finished',
+        `'${commandOutput}`,
+      ]);
+      assert.equal(commandRows.filter((row) => row[10] === 'interrupted').length, 1);
       await ledger.withExecution(
         {
           threadId: conversation,
@@ -9533,6 +9598,29 @@ test(
       assert.doesNotMatch(exported.body, /Foreign|foreign\.example/);
       const scoped = cells((await app.inject(`/api/trust/export?session=${scheduled}`)).body);
       assert.deepEqual([...new Set(scoped.slice(1).map((row) => row[1]))], ['Morning brief']);
+      await pool.query(
+        `WITH calls AS (SELECT gen_random_uuid() AS call,n FROM generate_series(1,205) n)
+         INSERT INTO turn_events(turn_id,type,summary,call_id,command,created_at)
+         SELECT $1::uuid,'tool_start','bash',call,jsonb_build_object('command','synthetic-page-' || n),
+           now()+n*interval '1 second' FROM calls
+         UNION ALL
+         SELECT $1::uuid,'tool_complete','bash',call,jsonb_build_object('exitCode',0,'output','synthetic-output-' || n),
+           now()+n*interval '1 second'+interval '1 millisecond' FROM calls`,
+        [chat],
+      );
+      const pagedCommands = cells((await app.inject('/api/trust/export')).body).filter((row) =>
+        row[8]?.startsWith('synthetic-page-'),
+      );
+      assert.equal(pagedCommands.length, 205);
+      assert.equal(new Set(pagedCommands.map((row) => row[8])).size, 205);
+      assert.ok(
+        pagedCommands.every(
+          (row) =>
+            row[9] === '0' &&
+            row[10] === 'finished' &&
+            row[11] === row[8]!.replace('page', 'output'),
+        ),
+      );
       assert.deepEqual((await activity.read({ from: '2000-01-01' }, 200)).entries, []);
       const tied = Array.from({ length: 31 }, () => randomUUID());
       await pool.query(

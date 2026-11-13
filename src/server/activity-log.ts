@@ -25,7 +25,7 @@ const kinds: Record<TrustStep['kind'], string> = {
 };
 
 const chunkSize = 200;
-const pageRows = 5000;
+const pageRows = 200;
 
 export interface ActivityLogEntry {
   at: string;
@@ -70,7 +70,7 @@ interface Sources {
   ): Promise<{ entries: VaultActivityEntry[]; next: Cursor | null }>;
   steps(
     turnIds: string[],
-    page: { offset: number; limit: number },
+    page: { offset: number; limit: number; output?: true },
   ): Promise<Map<string, TrustStep[]>>;
 }
 
@@ -157,8 +157,12 @@ export function createActivityLog(log: Sources) {
         '',
         vaultReason(use),
         '',
+        '',
+        '',
+        '',
+        '',
       ]);
-    yield `\ufeff${line([`Time (${span.timeZone})`, 'Request', 'Source', 'Kind', 'Step', 'Detail', 'Allowed by', 'Cost (USD)'])}`;
+    yield `\ufeff${line([`Time (${span.timeZone})`, 'Request', 'Source', 'Kind', 'Step', 'Detail', 'Allowed by', 'Cost (USD)', 'Command', 'Exit code', 'State', 'Output'])}`;
     let after: Cursor | null = null;
     let from: Date | string | null = span.start;
     for (;;) {
@@ -192,13 +196,15 @@ export function createActivityLog(log: Sources) {
       }
       const base = (entry: TrustEntry) => [entry.title, sources[entry.source]];
       const close = (entry: TrustEntry) =>
-        entry.error ? line([time(entry.at), ...base(entry), 'Error', entry.error, '', '', '']) : '';
+        entry.error
+          ? line([time(entry.at), ...base(entry), 'Error', entry.error, '', '', '', '', '', '', ''])
+          : '';
       const index = new Map(entries.map((entry, position) => [entry.id, position]));
       const ids = entries.map((entry) => entry.id);
       let position = 0;
       let open: TrustEntry | null = null;
       for (let offset = 0; ids.length; offset += pageRows) {
-        const page = await log.steps(ids, { offset, limit: pageRows });
+        const page = await log.steps(ids, { offset, limit: pageRows, output: true });
         let count = 0;
         let out = '';
         for (const [turnId, list] of page) {
@@ -222,6 +228,10 @@ export function createActivityLog(log: Sources) {
                 '',
                 '',
                 entry.costUsd?.toFixed(6),
+                '',
+                '',
+                '',
+                '',
               ]);
               out += close(entry);
             } else open = entry;
@@ -236,6 +246,10 @@ export function createActivityLog(log: Sources) {
               step.detail ?? '',
               step.because ? becauseText(step.because) : '',
               step.costUsd?.toFixed(6),
+              step.command?.command,
+              step.command?.exitCode ?? undefined,
+              step.command?.state,
+              step.command?.output,
             ]);
         }
         if (out) yield out;
@@ -247,7 +261,19 @@ export function createActivityLog(log: Sources) {
         if (out) yield out;
         out = '';
         yield* vaultBefore(entry.at);
-        out += line([time(entry.at), ...base(entry), '', '', '', '', entry.costUsd?.toFixed(6)]);
+        out += line([
+          time(entry.at),
+          ...base(entry),
+          '',
+          '',
+          '',
+          '',
+          entry.costUsd?.toFixed(6),
+          '',
+          '',
+          '',
+          '',
+        ]);
         out += close(entry);
       }
       if (out) yield out;

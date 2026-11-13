@@ -19,6 +19,7 @@ import type {
 import { trustStepPage as stepPage } from '../shared/trust.ts';
 import { becauseOf, type TrustBasis } from './trust-basis.ts';
 import { recordedAction, toolTitle } from './action-presentation.ts';
+import { workspaceCommandsSql, workspaceCommand } from './workspace-commands.ts';
 import { formattingLocale, localeRegion, timeZoneRegion } from '../shared/date-locale.ts';
 import type { UsageReport } from './usage-report.ts';
 import { afterCommit, transaction } from './transaction.ts';
@@ -115,6 +116,19 @@ const tokens = (value: unknown) => {
 function presentStep(row: Record<string, any>): TrustStep {
   const at = row.at.toISOString();
   const helper = row.helper ? { helper: true as const } : {};
+  if (row.kind === 'command') {
+    const command: TrustStep['command'] = row.command;
+    return {
+      at,
+      kind: 'tool',
+      title: 'Workspace command',
+      command,
+      ...(command?.state === 'failed' || (command?.exitCode != null && command.exitCode !== 0)
+        ? { failed: true as const }
+        : {}),
+      ...helper,
+    };
+  }
   if (row.kind === 'model') {
     const usage = row.usage ?? {};
     const input =
@@ -866,28 +880,34 @@ export function createLedger({
   }
 
   const stepUnion = `         SELECT e.turn_id,e.created_at AS at,'event' AS kind,e.type,e.summary,e.site AS detail,NULL::jsonb AS basis,
-           false AS said,false AS whole,NULL::jsonb AS usage,NULL::float8 AS cost,e.parent_run_id IS NOT NULL AS helper,e.id::text AS id
+           false AS said,false AS whole,NULL::jsonb AS usage,NULL::float8 AS cost,e.parent_run_id IS NOT NULL AS helper,e.id::text AS id,NULL::jsonb AS command
          FROM turn_events e JOIN turns u ON u.id=e.turn_id AND u.owner_id=$1
          WHERE e.turn_id=ANY($2::uuid[]) AND e.type IN ('step','thought','tool_complete','tool_failed')
+           AND e.command IS NULL
            AND NOT (e.type<>'step' AND e.type<>'thought' AND e.summary IN ('apps','files'))
          UNION ALL
          SELECT a.turn_id,a.created_at,'action',NULL,a.action,a.target,a.basis,m.id IS NOT NULL,
            COALESCE(regexp_replace(lower(m.text),'[^[:alnum:]]+','','g')=regexp_replace(lower(a.basis->>'quote'),'[^[:alnum:]]+','','g'),false),
-           NULL,NULL,a.parent_run_id IS NOT NULL,a.id::text
+           NULL,NULL,a.parent_run_id IS NOT NULL,a.id::text,NULL
          FROM app_actions a LEFT JOIN messages m ON a.basis->>'kind'='message'
            AND m.owner_id=$1 AND m.id=(a.basis->>'messageId')::uuid
          WHERE a.owner_id=$1 AND a.turn_id=ANY($2::uuid[])
          UNION ALL
-         SELECT turn_id,created_at,'model',NULL,NULL,NULL,NULL,false,false,details,cost_usd,parent_run_id IS NOT NULL,id
+         SELECT turn_id,created_at,'model',NULL,NULL,NULL,NULL,false,false,details,cost_usd,parent_run_id IS NOT NULL,id,NULL
          FROM model_usage WHERE owner_id=$1 AND turn_id=ANY($2::uuid[])
          UNION ALL
-         SELECT turn_id,created_at,'reply',NULL,left(text,300),NULL,NULL,false,false,NULL,NULL,false,id::text
-         FROM messages WHERE owner_id=$1 AND turn_id=ANY($2::uuid[]) AND role='assistant' AND hidden_at IS NULL AND text<>''`;
+         SELECT turn_id,created_at,'reply',NULL,left(text,300),NULL,NULL,false,false,NULL,NULL,false,id::text,NULL
+         FROM messages WHERE owner_id=$1 AND turn_id=ANY($2::uuid[]) AND role='assistant' AND hidden_at IS NULL AND text<>''
+         UNION ALL
+         SELECT turn_id,"startedAt",'command',NULL,NULL,NULL,NULL,false,false,NULL,NULL,helper,id::text,
+           jsonb_build_object('id',id,'command',command,'state',state,'exitCode',result->'exitCode') ||
+             CASE WHEN $3::boolean THEN jsonb_build_object('output',COALESCE(result->>'output','')) ELSE '{}'::jsonb END
+         FROM (${workspaceCommandsSql}) commands WHERE owner_id=$1 AND turn_id=ANY($2::uuid[])`;
 
-  async function steps(turnIds: string[], page?: { offset: number; limit: number }) {
+  async function steps(turnIds: string[], page?: { offset: number; limit: number; output?: true }) {
     const { rows } = await pool.query(
-      `SELECT * FROM (${stepUnion}) s ORDER BY array_position($2::uuid[],s.turn_id),s.at,s.id OFFSET $3 LIMIT $4`,
-      [ownerId, turnIds, page?.offset ?? 0, page ? page.limit : null],
+      `SELECT * FROM (${stepUnion}) s ORDER BY array_position($2::uuid[],s.turn_id),s.at,s.id OFFSET $4 LIMIT $5`,
+      [ownerId, turnIds, page?.output === true, page?.offset ?? 0, page ? page.limit : null],
     );
     const grouped = new Map<string, TrustStep[]>();
     for (const row of rows) {
@@ -901,7 +921,7 @@ export function createLedger({
   async function stepCount(turnId: string) {
     const { rows } = await pool.query<{ total: number }>(
       `SELECT count(*)::int AS total FROM (${stepUnion}) s`,
-      [ownerId, [turnId]],
+      [ownerId, [turnId], false],
     );
     return rows[0]?.total ?? 0;
   }
@@ -1106,6 +1126,16 @@ export function createLedger({
         stepCount(id),
       ]);
       return { steps: found.get(id) ?? [], total };
+    });
+    app.get<{ Params: { id: string } }>('/api/trust/commands/:id', async (request) => {
+      const id = z.uuid().parse(request.params.id);
+      const { rows } = await pool.query(
+        `SELECT * FROM (${workspaceCommandsSql}) commands WHERE id=$1 AND owner_id=$2`,
+        [id, ownerId],
+      );
+      if (!rows[0])
+        throw Object.assign(new Error('Workspace command not found.'), { statusCode: 404 });
+      return { command: workspaceCommand(rows[0]) };
     });
     app.put('/api/trust/limit', (request) => setLimits(request.body));
   }
