@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { Task, TaskDetail, TaskStatus } from '../shared/contracts.ts';
 import { recordedAction, toolTitle } from './action-presentation.ts';
+import { workspaceCommandsSql, workspaceCommand } from './workspace-commands.ts';
 import type { ChannelPresentation } from './channels.ts';
 import { classifyVerificationReply } from '../shared/verification-code.ts';
 import {
@@ -749,6 +750,23 @@ export function createTasks(options: {
           : { ...event, summary: toolTitle(event.summary) };
       });
       return { task, events };
+    });
+    app.get<{ Params: { id: string } }>('/api/tasks/:id/commands', async (request) => {
+      const id = z.uuid().parse(request.params.id);
+      const task = await pool.query('SELECT 1 FROM tasks WHERE id=$1 AND owner_id=$2', [
+        id,
+        ownerId,
+      ]);
+      if (!task.rowCount) throw failure('Task not found.', 404);
+      const { rows } = await pool.query(
+        `SELECT * FROM (
+           SELECT * FROM (${workspaceCommandsSql}) commands
+           WHERE task_id=$1 AND owner_id=$2
+           ORDER BY "startedAt" DESC,id DESC LIMIT 200
+         ) recent ORDER BY "startedAt",id`,
+        [id, ownerId],
+      );
+      return { commands: rows.map(workspaceCommand) };
     });
     app.post<{ Params: { id: string } }>('/api/tasks/:id/stop', async (request) => {
       const capture = snapshotAnalytics(options.analytics);

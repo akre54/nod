@@ -1,3 +1,5 @@
+import type { WorkspaceCommand } from './contracts.ts';
+
 export type TrustSource = 'chat' | 'task' | 'started' | 'schedule' | 'event' | 'check' | 'resume';
 
 export interface TrustOutside {
@@ -28,6 +30,7 @@ export interface TrustStep {
   costUsd?: number;
   helper?: true;
   failed?: true;
+  command?: Pick<WorkspaceCommand, 'id' | 'command' | 'state' | 'exitCode'> & { output?: string };
 }
 
 export function actionText(action: Pick<TrustAction, 'label' | 'target'>) {

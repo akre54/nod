@@ -103,6 +103,8 @@ export async function initializeDatabase() {
     ALTER TABLE turn_events ADD COLUMN IF NOT EXISTS browser_id text;
     ALTER TABLE turn_events ADD COLUMN IF NOT EXISTS call_id uuid;
     ALTER TABLE turn_events ADD COLUMN IF NOT EXISTS site text;
+    ALTER TABLE turn_events ADD COLUMN IF NOT EXISTS command jsonb;
+    CREATE INDEX IF NOT EXISTS turn_events_call ON turn_events(turn_id,call_id) WHERE call_id IS NOT NULL;
     CREATE TABLE IF NOT EXISTS messages (
       id uuid PRIMARY KEY, owner_id text NOT NULL, role text NOT NULL, text text NOT NULL,
       display_text text,

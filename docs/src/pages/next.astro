@@ -2,11 +2,22 @@
 import { Image, Picture } from 'astro:assets';
 import '../styles/nod.css';
 import n8nLogo from '../assets/landing/n8n-logo.svg?url';
-import crosshair from '../assets/landing/crosshair.svg?url';
 import githubIcon from '../assets/landing/github.svg?url';
-import nodMark from '../assets/landing/nod-mark.svg?url';
-import heroCollage from '../assets/landing/hero-collage.png';
-import heroVideoPoster from '../assets/landing/hero-video-poster.jpg';
+import appleIcon from '../assets/landing/apple.svg?url';
+import windowsIcon from '../assets/landing/windows.svg?url';
+import chatBubbleIcon from '../assets/landing/chat-bubble.svg?url';
+import eyesIcon from '../assets/landing/eyes.svg?url';
+import pencilComposeIcon from '../assets/landing/pencil-compose.svg?url';
+import graduationCapIcon from '../assets/landing/graduation-cap.svg?url';
+import downloadIcon from '../assets/landing/download.svg?url';
+import heroCollage from '../assets/landing/hero-collage.webp';
+import heroVideoPoster from '../assets/landing/hero-video-poster.png';
+import demoAv1 from '../assets/video/nod-demo-1080.av1.mp4?url';
+import demoAv1Small from '../assets/video/nod-demo-720.av1.mp4?url';
+import demoHevc from '../assets/video/nod-demo-1080.hevc.mp4?url';
+import demoHevcSmall from '../assets/video/nod-demo-720.hevc.mp4?url';
+import demoH264 from '../assets/video/nod-demo-1080.h264.mp4?url';
+import demoH264Small from '../assets/video/nod-demo-720.h264.mp4?url';
 import briefCollage from '../assets/landing/brief-collage.png';
 import replyCollage from '../assets/landing/reply-collage.png';
 import watchCollage from '../assets/landing/watch-collage.png';
@@ -25,10 +36,6 @@ const description =
 const url = 'https://nod.n8n.io/';
 const image = new URL(socialImage.src, Astro.site);
 const photo = { formats: ['webp'], fallbackFormat: 'jpg', quality: 80, alt: '', class: 'bg' } as const;
-const stars = await fetch('https://api.github.com/repos/n8n-io/nod')
-  .then((response) => (response.ok ? response.json() : null))
-  .then((repo) => repo?.stargazers_count?.toLocaleString('en-US'))
-  .catch(() => null);
 const panelSizes = '(min-width: 1440px) 808px, (min-width: 1100px) 56vw, 92vw';
 ---
 
@@ -64,35 +71,27 @@ const panelSizes = '(min-width: 1440px) 808px, (min-width: 1100px) 56vw, 92vw';
   <body class="lp">
     <div class="lp-page">
       <header class="lp-header">
-        <a class="lp-logo" href={n8n} target="_blank" rel="noopener">
-          <img class="lockup" src={n8nLogo} alt="n8n" width="180" height="36" />
-        </a>
-        <div class="lp-header-right">
-          <p class="lp-crumb mono">
-            <span class="lp-crumb-dim">n8n labs</span>
-            <span class="lp-crumb-slash" aria-hidden="true">/</span>
-            <span>Nod</span>
-            <span class="lp-crumb-badge">Research preview</span>
-          </p>
-          <a
-            class="lp-capsule lp-star gray-tertiary mono"
-            href={github}
-            target="_blank"
-            rel="noopener"
-            ><svg viewBox="0 0 16 16" width="20" height="20" aria-hidden="true"
-              ><path
-                fill="currentColor"
-                d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"
-              ></path></svg
-            ><span>Star</span>{stars && <span class="lp-star-count">{stars}</span>}</a
+        <div class="lp-brand">
+          <a class="lp-brand-logo" href={n8n} target="_blank" rel="noopener"
+            ><img src={n8nLogo} alt="n8n" width="100" height="20" /></a
           >
+          <span class="lp-brand-badge mono">Labs</span>
+        </div>
+        <div class="lp-header-right">
+          <a class="lp-header-link mono" href={base}>Docs</a>
+          <a class="lp-capsule lp-header-github gray-tertiary mono" href={github} target="_blank" rel="noopener"
+            ><svg viewBox="0 0 16 16" width="20" height="20" aria-hidden="true"
+              ><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg
+            ><span>GitHub</span></a
+          >
+          <a class="lp-download-btn lp-header-download mono" href={installGuide} data-download>Download</a>
         </div>
       </header>
 
       <main class="lp-main">
       <section class="lp-hero">
         <div class="lp-hero-top">
-          <p class="lp-eyebrow mono">More tasks than time?</p>
+          <span class="lp-hero-tag mono">Research preview</span>
           <div class="lp-hero-headline-frame lp-dot-grid-bg">
             <h1 class="lp-hero-headline">
               <span class="lp-hero-name"
@@ -106,107 +105,75 @@ const panelSizes = '(min-width: 1440px) 808px, (min-width: 1100px) 56vw, 92vw';
                   >d</span
                 ></span
               >
-              <span class="lp-hero-tagline"
-                ><span>Open source personal agent</span> <span>with its own computer</span></span
-              >
             </h1>
           </div>
           <p class="lp-hero-copy">
-            It chases invoices, preps your calls and cancels trials, on real websites. On your machine, and it asks before it
-            acts for you.
+            Open source personal agent with its own computer. It chases invoices, preps your calls, and cancels trials. With your approval.
           </p>
-          <div class="lp-hero-cta">
-            <div class="lp-hero-buttons">
+          <div class="lp-hero-buttons">
               <div class="lp-cta-frame">
-                <a class="lp-download-btn mono" href={installGuide} data-download="label">Choose installer</a>
-                <img class="lp-crosshair tl" src={crosshair} alt="" />
-                <img class="lp-crosshair tr" src={crosshair} alt="" />
-                <img class="lp-crosshair bl" src={crosshair} alt="" />
-                <img class="lp-crosshair br" src={crosshair} alt="" />
+                <a class="lp-download-btn lp-download-btn-platform mono" href={installGuide} data-download="label"
+                  ><img class="lp-btn-icon lp-os-icon mac" src={appleIcon} alt="" /><img
+                    class="lp-btn-icon lp-os-icon windows"
+                    src={windowsIcon}
+                    alt=""
+                  /><span data-download-label>Choose installer</span></a
+                >
               </div>
               <div class="lp-cta-frame">
                 <a class="lp-download-btn lp-download-btn-grey mono" href={github} target="_blank" rel="noopener"
                   ><img class="lp-btn-icon" src={githubIcon} alt="" />View the code</a
                 >
-                <img class="lp-crosshair tl" src={crosshair} alt="" />
-                <img class="lp-crosshair tr" src={crosshair} alt="" />
-                <img class="lp-crosshair bl" src={crosshair} alt="" />
-                <img class="lp-crosshair br" src={crosshair} alt="" />
               </div>
             </div>
-            <p class="lp-platforms">
-              macOS 14+ · Win 11 preview · Linux x64 preview · Apache 2.0 · free · use ChatGPT Plus/Pro or any AI key
-            </p>
-          </div>
+          <p class="lp-hero-note">Free · Apache 2.0 · <a href={installGuide}>All install options</a></p>
         </div>
 
         <div class="lp-demo-photo">
           <Picture
             src={heroCollage}
             {...photo}
-            widths={[640, 960, 1312, 1920, 2560]}
+            widths={[640, 960, 1312, 2000]}
             sizes="(min-width: 1440px) 1312px, 92vw"
             loading="eager"
             fetchpriority="high"
           />
           <div class="lp-hero-video">
-            <button type="button" class="lp-video-play" id="heroPlayBtn">
+            <button type="button" class="lp-video-play" id="heroPlayBtn" aria-label="Play video">
               <Image
                 src={heroVideoPoster}
                 alt=""
-                widths={[640, 960, 1280]}
-                sizes="(min-width: 1100px) 960px, 92vw"
+                widths={[640, 960, 1280, 1920, 2560]}
+                sizes="(min-width: 1440px) 1155px, 81vw"
                 format="webp"
                 quality={80}
                 loading="eager"
               />
-              <span class="lp-video-play-label mono"
-                ><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4.5 2.5v11l9-5.5z"></path></svg
-                >Play video</span
-              >
+              <span class="lp-video-play-icon"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M5 2.5v11l9-5.5z"></path></svg></span>
             </button>
+            <video id="heroVideo" controls playsinline preload="none" poster={heroVideoPoster.src} width="1920" height="1080" aria-label="Nod demo video" hidden>
+              <source src={demoAv1Small} media="(max-width: 719px)" type='video/mp4; codecs="av01.0.05M.10, mp4a.40.2"' />
+              <source src={demoAv1} type='video/mp4; codecs="av01.0.08M.10, mp4a.40.2"' />
+              <source src={demoHevcSmall} media="(max-width: 719px)" type='video/mp4; codecs="hvc1.1.6.L93.B0, mp4a.40.2"' />
+              <source src={demoHevc} type='video/mp4; codecs="hvc1.1.6.L120.B0, mp4a.40.2"' />
+              <source src={demoH264Small} media="(max-width: 719px)" type="video/mp4" />
+              <source src={demoH264} type="video/mp4" />
+            </video>
           </div>
         </div>
-      </section>
-
-      <section class="lp-trust-stats" aria-labelledby="benchmark-heading">
-        <div class="lp-benchmark-intro">
-          <h2 id="benchmark-heading"><span>678 test runs.</span> <span>Zero actions without permission.</span></h2>
-        </div>
-        <div class="lp-trust-stats-grid">
-          <div class="lp-trust-stat">
-            <p class="lp-trust-stat-number">98%</p>
-            <h3 class="lp-trust-stat-label"><a class="lp-stat-link" href={`${benchmarkGuide}#task-completion`}>Does it finish the job?</a></h3>
-            <p class="lp-trust-stat-desc">Of 226 errands in test accounts and websites, each run three times.</p>
-          </div>
-          <div class="lp-trust-stat">
-            <p class="lp-trust-stat-number">93.2%</p>
-            <h3 class="lp-trust-stat-label"><a class="lp-stat-link" href={`${benchmarkGuide}#longmemeval-s-recall`}>Does it remember what you told it?</a></h3>
-            <p class="lp-trust-stat-desc">Of 500 questions about earlier chats, asked in new sessions <span>(LongMemEval-S)</span>.</p>
-          </div>
-          <div class="lp-trust-stat">
-            <p class="lp-trust-stat-number">0 of 216</p>
-            <h3 class="lp-trust-stat-label"><a class="lp-stat-link" href={`${benchmarkGuide}#whisperbench-memory-poisoning`}>Can an email plant a false memory?</a></h3>
-            <p class="lp-trust-stat-desc">108 published attack emails, tried two ways (WhisperBench).</p>
-          </div>
-        </div>
-        <p class="lp-trust-stats-footnote">October 2026, GPT-6.1 Sol. Errand types come from 900,000+ anonymised production workflows. Your results depend on your model and the sites you use. <a class="lp-stat-link" href={benchmarkGuide}>How we measured this</a></p>
       </section>
 
       <section class="lp-hard-ones-heading">
-        <div class="lp-hard-ones-frame wide lp-dot-grid-bg">
-          <h2>On your machine, on your <span class="lp-pink-accent">word</span></h2>
+        <div class="lp-hard-ones-frame wide with-sub lp-dot-grid-bg">
+          <h2>On your machine, on your word</h2>
+          <p class="lp-hard-ones-sub">It gets on with the work, and asks before it speaks for you.</p>
         </div>
-        <p class="lp-hard-ones-sub">It gets on with the work, and asks before it speaks for you.</p>
       </section>
 
       <div class="lp-stack">
         <div class="lp-pillar">
           <div class="lp-claim">
-            <div class="lp-claim-header">
-              <p class="lp-claim-eyebrow">On your machine</p>
-              <h3 class="lp-claim-heading">Walk into every call prepared</h3>
-            </div>
+            <h3 class="lp-claim-heading">Walk into every call prepared</h3>
             <div class="lp-claim-body">
               <p class="lp-claim-paragraph">
                 Every morning, Nod reads your threads, your calendar and the client's latest news, and writes a one-page brief
@@ -279,10 +246,7 @@ const panelSizes = '(min-width: 1440px) 808px, (min-width: 1100px) 56vw, 92vw';
 
         <div class="lp-pillar">
           <div class="lp-claim">
-            <div class="lp-claim-header">
-              <p class="lp-claim-eyebrow">On your word</p>
-              <h3 class="lp-claim-heading">Catch the question you missed</h3>
-            </div>
+            <h3 class="lp-claim-heading">Catch the question you missed</h3>
             <div class="lp-claim-body">
               <p class="lp-claim-paragraph">
                 Nod finds the question you never answered, like a client's pricing ask from last week, and drafts the reply
@@ -343,10 +307,7 @@ const panelSizes = '(min-width: 1440px) 808px, (min-width: 1100px) 56vw, 92vw';
 
         <div class="lp-pillar">
           <div class="lp-claim">
-            <div class="lp-claim-header">
-              <p class="lp-claim-eyebrow">On your key</p>
-              <h3 class="lp-claim-heading">Hear about it when it matters</h3>
-            </div>
+            <h3 class="lp-claim-heading">Hear about it when it matters</h3>
             <div class="lp-claim-body">
               <p class="lp-claim-paragraph">
                 Tell Nod to keep an eye on a client's pricing page. It checks every few hours and only speaks up when
@@ -432,81 +393,157 @@ const panelSizes = '(min-width: 1440px) 808px, (min-width: 1100px) 56vw, 92vw';
         </div>
       </div>
 
-      <section class="lp-hard-ones-heading">
-        <div class="lp-hard-ones-frame lp-dot-grid-bg">
-          <h2>A memory like an <span class="lp-pink-accent">elephant</span></h2>
-        </div>
-        <p class="lp-hard-ones-sub">Say once that Anna, not Bob, handles invoices. It remembers.</p>
-      </section>
-
-      <ol class="lp-feature-list">
-        <li>
-          <div class="lp-capsules">
-            <span class="lp-dot lp-dot-pink"></span><span class="lp-capsule gray-tertiary mono small">Every note, visible.</span
-            ><span class="lp-dot lp-dot-pink"></span>
+      <section class="lp-split">
+        <div class="lp-split-intro">
+          <div class="lp-hard-ones-frame lp-dot-grid-bg">
+            <h2>A memory like an elephant</h2>
           </div>
+          <p class="lp-trust-stats-footnote">See how we test <a class="lp-stat-link" href={`${benchmarkGuide}#longmemeval-s-recall`}>recall</a>.</p>
+        </div>
+        <ol class="lp-feature-list">
+        <li>
+          <h3><img src={chatBubbleIcon} alt="" />Tell it once</h3>
+          <p>Say Anna handles invoices now, and it remembers from then on.</p>
+        </li>
+        <li>
+          <h3><img src={eyesIcon} alt="" />Every note, visible</h3>
           <p>See, edit or forget each one, with the message it came from.</p>
         </li>
         <li>
-          <div class="lp-capsules">
-            <span class="lp-dot lp-dot-pink"></span><span class="lp-capsule gray-tertiary mono small"
-              >Drafts that sound like you.</span
-            ><span class="lp-dot lp-dot-pink"></span>
-          </div>
+          <h3><img src={pencilComposeIcon} alt="" />Drafts that sound like you</h3>
           <p>Learns your style from sent emails, no names or numbers.</p>
         </li>
         <li>
-          <div class="lp-capsules">
-            <span class="lp-dot lp-dot-pink"></span><span class="lp-capsule gray-tertiary mono small">Tell it once.</span><span
-              class="lp-dot lp-dot-pink"></span>
-          </div>
-          <p>Say something changed, and it uses the new fact from then on.</p>
-        </li>
-        <li>
-          <div class="lp-capsules">
-            <span class="lp-dot lp-dot-pink"></span><span class="lp-capsule gray-tertiary mono small"
-              >It learns how to do a task.</span
-            ><span class="lp-dot lp-dot-pink"></span>
-          </div>
+          <h3><img src={graduationCapIcon} alt="" />It learns how to do a task</h3>
           <p>Reuses the steps and fixes them when a site changes.</p>
         </li>
       </ol>
+      </section>
 
-      <p class="lp-memory-evidence lp-trust-stats-footnote">See how <a class="lp-stat-link" href={`${benchmarkGuide}#longmemeval-s-recall`}>LongMemEval-S</a> tests recall and <a class="lp-stat-link" href={`${benchmarkGuide}#whisperbench-memory-poisoning`}>WhisperBench</a> tests whether attack emails can plant false memories.</p>
+      <section class="lp-split">
+        <div class="lp-split-intro">
+          <div class="lp-hard-ones-frame wide lp-dot-grid-bg">
+            <h2 class="lp-heading-pair"><span>678 test runs.</span> <span>Zero actions without permission.</span></h2>
+          </div>
+          <p class="lp-trust-stats-footnote">Results from 678 test runs and two public memory tests, October 2026, on GPT-6.1 Sol. <a class="lp-stat-link" href={benchmarkGuide}>How we measured this</a></p>
+        </div>
+        <div class="lp-trust-stats-grid">
+        <div class="lp-trust-stat">
+          <h3>
+            <span class="lp-trust-stat-number">98%</span>
+            <span class="lp-trust-stat-label">of jobs finished</span>
+          </h3>
+          <p class="lp-trust-stat-desc">226 errands, each run three times.</p>
+        </div>
+        <div class="lp-trust-stat">
+          <h3>
+            <span class="lp-trust-stat-number">0 of 678</span>
+            <span class="lp-trust-stat-label">runs acted without permission</span>
+          </h3>
+          <p class="lp-trust-stat-desc">The same runs, checked for any action beyond what the user allowed.</p>
+        </div>
+        <div class="lp-trust-stat">
+          <h3>
+            <span class="lp-trust-stat-number">93%</span>
+            <span class="lp-trust-stat-label">of facts recalled</span>
+          </h3>
+          <p class="lp-trust-stat-desc">500 questions about earlier chats, asked in new sessions.</p>
+        </div>
+        <div class="lp-trust-stat">
+          <h3>
+            <span class="lp-trust-stat-number">0 of 216</span>
+            <span class="lp-trust-stat-label">false memories planted</span>
+          </h3>
+          <p class="lp-trust-stat-desc">108 published attack emails, each tried two ways.</p>
+        </div>
+      </div>
+      </section>
 
       <section class="lp-hard-ones-heading">
-        <div class="lp-hard-ones-frame lp-dot-grid-bg">
-          <h2>Next on the <span class="lp-pink-accent">list</span></h2>
+        <div class="lp-hard-ones-frame with-sub lp-dot-grid-bg">
+          <h2>Hand it the hard ones</h2>
+          <p class="lp-hard-ones-sub wide">Jobs that take an afternoon of tabs, logins and forms. Nod finishes them start to end.</p>
+        </div>
+      </section>
+
+      <div class="lp-carousel" id="hardOnesCarousel">
+        <div class="lp-cards-row" id="hardOnesTrack">
+          <div class="lp-usecase-card pat-finance align-bottom" style="background:#e7e6dd">
+            <p class="lp-usecase-category mono">Finance</p>
+            <div class="lp-usecase-body">
+              <p class="lp-usecase-title">Chase it until it's paid</p>
+              <p class="lp-usecase-desc">Friendly reminders, and it asks before a second nudge</p>
+            </div>
+          </div>
+          <div class="lp-usecase-card pat-lifeadmin align-top" style="background:var(--gray-15)">
+            <p class="lp-usecase-category mono">Life Admin</p>
+            <div class="lp-usecase-body">
+              <p class="lp-usecase-title">Get your money back</p>
+              <p class="lp-usecase-desc">Cancels, turns down the offers to stay, asks for a refund</p>
+            </div>
+          </div>
+          <div class="lp-usecase-card pat-work align-bottom" style="background:var(--pink-10)">
+            <p class="lp-usecase-category mono">Work</p>
+            <div class="lp-usecase-body">
+              <p class="lp-usecase-title">Client requests into tasks</p>
+              <p class="lp-usecase-desc">From email and Slack into Linear, skipping duplicates</p>
+            </div>
+          </div>
+          <div class="lp-usecase-card pat-shopping align-top" style="background:#d2ceca">
+            <p class="lp-usecase-category mono">Reports</p>
+            <div class="lp-usecase-body">
+              <p class="lp-usecase-title">Your weekly numbers, with what changed</p>
+              <p class="lp-usecase-desc">Every Monday, from behind the login into your sheet</p>
+            </div>
+          </div>
+          <div class="lp-usecase-card pat-grocery align-bottom" style="background:var(--gray-20)">
+            <p class="lp-usecase-category mono">Admin</p>
+            <div class="lp-usecase-body">
+              <p class="lp-usecase-title">File your month-end paperwork</p>
+              <p class="lp-usecase-desc">Bank and tax statements, downloaded and filed by name</p>
+            </div>
+          </div>
+          <div class="lp-usecase-card pat-travel align-bottom" style="background:#f2effe">
+            <p class="lp-usecase-category mono">Travel</p>
+            <div class="lp-usecase-body">
+              <p class="lp-usecase-title">Book the team offsite</p>
+              <p class="lp-usecase-desc">Compares three spaces, books the best once you say go</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <section class="lp-hard-ones-heading">
+        <div class="lp-hard-ones-frame plain">
+          <h2>Coming next</h2>
         </div>
       </section>
 
       <div class="lp-roadmap-track" id="roadmapTrack">
         <div class="lp-roadmap-connector" id="roadmapConnector" aria-hidden="true"></div>
         <ol class="lp-feature-list single-col">
-          <li class="lp-roadmap-featured-row">
-            <span class="lp-number-badge"><span class="lp-circle-pink"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8.75 15.75h-1.5v-3h1.5zM5.06 12 1.5 15.56.44 14.5 4 10.94zm10.5 2.5-1.06 1.06L10.94 12 12 10.94zM8.25 4.75a3 3 0 0 1 3 3v.5a3 3 0 0 1-3 3h-.5a3 3 0 0 1-3-3v-.5a3 3 0 0 1 3-3zm-.5 1.5a1.5 1.5 0 0 0-1.5 1.5v.5a1.5 1.5 0 0 0 1.5 1.5h.5a1.5 1.5 0 0 0 1.5-1.5v-.5a1.5 1.5 0 0 0-1.5-1.5zM3.256 8.745h-3v-1.5h3zm12.5 0h-3v-1.5h3zM5.06 4 4 5.06.44 1.5 1.5.44zm10.5-2.5L12 5.06 10.94 4 14.5.44zM8.75 3.25h-1.5v-3h1.5z"></path></svg></span></span>
-            <p class="lp-roadmap-featured">
-              <b>Managed hosting.</b> An always-on Nod without running your own server.
-            </p>
+          <li>
+            <span class="lp-number-badge"><span class="lp-circle-pink"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="m15.743 1-1.198 1.266L10.533 6.5l4.012 4.234L15.743 12H2.5v3.25H1V1zM2.5 10.5h9.756l-3.3-3.484-.49-.516.49-.516 3.3-3.484H2.5z"></path></svg></span></span>
+            <p><b>Managed hosting.</b> An always-on Nod, hosted for you.</p>
           </li>
           <li>
             <span class="lp-number-badge"><span class="lp-circle-grey"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M2.25 4.5c0 2.9 2.35 5.25 5.25 5.25h1c2.9 0 5.25-2.35 5.25-5.25V3.25h1.5V4.5a6.75 6.75 0 0 1-6.5 6.743V13.5h6V15H1.25v-1.5h6v-2.257A6.75 6.75 0 0 1 .75 4.5V3.25h1.5zM8.5.25a3.25 3.25 0 0 1 3.25 3.25v1A3.25 3.25 0 0 1 8.5 7.75h-1A3.25 3.25 0 0 1 4.25 4.5v-1A3.25 3.25 0 0 1 7.5.25zm-1 1.5A1.75 1.75 0 0 0 5.75 3.5v1c0 .966.784 1.75 1.75 1.75h1a1.75 1.75 0 0 0 1.75-1.75v-1A1.75 1.75 0 0 0 8.5 1.75z"></path></svg></span></span>
-            <p><b>Call businesses on the phone.</b> For the errands that still need a voice.</p>
+            <p><b>Make phone calls.</b> For the errands that still need a voice.</p>
           </li>
           <li>
-            <span class="lp-number-badge"><span class="lp-circle-grey"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path><path d="M16 3.128a4 4 0 0 1 0 7.744"></path><path d="M22 21v-2a4 4 0 0 0-3-3.87"></path><circle cx="9" cy="7" r="4"></circle></svg></span></span>
-            <p><b>One Nod for your team.</b> Today one owner per Nod. Next, a few people sharing one.</p>
+            <span class="lp-number-badge"><span class="lp-circle-grey"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4.568.75c-.36.441-.641.948-.825 1.5H3.25a1.5 1.5 0 0 0-1.5 1.5V4c0 .69.56 1.25 1.25 1.25h1.057l-.349.998-1.4 4.002H3.75v3.5H5v1.5H2.25v-3.5H.193l.349-.998 1.466-4.19A2.75 2.75 0 0 1 .25 4v-.25a3 3 0 0 1 3-3zm11.182 14.5h-8v-3.5H5.143l.41-1.028 1.664-4.159A2.998 2.998 0 0 1 8.25.75h7.5zm-8.393-5H9.25v3.5h5v-4h-3v-2.5a.5.5 0 0 0-.5-.5H8.758zm.893-8a1.5 1.5 0 1 0 0 3h2.5a2 2 0 0 1 2 2v1h1.5v-6z"></path></svg></span></span>
+            <p><b>Nod for your team.</b> Share one Nod, with its apps and memory.</p>
           </li>
           <li>
-            <span class="lp-number-badge"><span class="lp-circle-grey"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6 2.25h-.75a1.5 1.5 0 0 0-1.5 1.5v8.5a1.5 1.5 0 0 0 1.5 1.5H6v1.5h-.75a3 3 0 0 1-3-3v-3.5H0v-1.5h2.25v-3.5a3 3 0 0 1 3-3H6zm4.75-1.5a3 3 0 0 1 3 3v3.5H16v1.5h-2.25v3.5a3 3 0 0 1-3 3H10v-1.5h.75a1.5 1.5 0 0 0 1.5-1.5v-8.5a1.5 1.5 0 0 0-1.5-1.5H10V.75z"></path></svg></span></span>
-            <p><b>Make it your own.</b> Change how Nod works in the open code, and send it back.</p>
+            <span class="lp-number-badge"><span class="lp-circle-grey"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4.75 4.25h3v1.5h-3v9.5h-1.5v-9.5h-3v-1.5h3V.75h1.5zm8 6h3v1.5h-3v3.5h-1.5v-3.5h-3v-1.5h3V.75h1.5z"></path></svg></span></span>
+            <p><b>Make it your own.</b> Add your own skills and tools without touching the core.</p>
           </li>
         </ol>
       </div>
 
       <section class="lp-hard-ones-heading">
-        <div class="lp-hard-ones-frame lp-dot-grid-bg">
-          <h2>Straight <span class="lp-pink-accent">answers</span></h2>
+        <div class="lp-hard-ones-frame plain">
+          <h2>Straight answers</h2>
         </div>
       </section>
 
@@ -605,66 +642,9 @@ const panelSizes = '(min-width: 1440px) 808px, (min-width: 1100px) 56vw, 92vw';
       </div>
 
       <section class="lp-hard-ones-heading">
-        <div class="lp-hard-ones-frame lp-dot-grid-bg">
-          <h2>Hand it the <span class="lp-pink-accent">hard ones</span></h2>
-        </div>
-        <p class="lp-hard-ones-sub wide">Jobs that take an afternoon of tabs, logins and forms. Nod finishes them start to end.</p>
-      </section>
-
-      <div class="lp-carousel" id="hardOnesCarousel">
-        <div class="lp-cards-row" id="hardOnesTrack">
-          <div class="lp-usecase-card pat-finance align-bottom" style="background:#e7e6dd">
-            <p class="lp-usecase-category mono">Finance</p>
-            <div class="lp-usecase-body">
-              <p class="lp-usecase-title">Chase it until it's paid</p>
-              <p class="lp-usecase-desc">Friendly reminders, and it asks before a second nudge</p>
-            </div>
-          </div>
-          <div class="lp-usecase-card pat-lifeadmin align-top" style="background:var(--gray-15)">
-            <p class="lp-usecase-category mono">Life Admin</p>
-            <div class="lp-usecase-body">
-              <p class="lp-usecase-title">Get your money back</p>
-              <p class="lp-usecase-desc">Cancels, turns down the offers to stay, asks for a refund</p>
-            </div>
-          </div>
-          <div class="lp-usecase-card pat-work align-bottom" style="background:var(--pink-10)">
-            <p class="lp-usecase-category mono">Work</p>
-            <div class="lp-usecase-body">
-              <p class="lp-usecase-title">Client requests into tasks</p>
-              <p class="lp-usecase-desc">From email and Slack into Linear, skipping duplicates</p>
-            </div>
-          </div>
-          <div class="lp-usecase-card pat-shopping align-top" style="background:#d2ceca">
-            <p class="lp-usecase-category mono">Reports</p>
-            <div class="lp-usecase-body">
-              <p class="lp-usecase-title">Your weekly numbers, with what changed</p>
-              <p class="lp-usecase-desc">Every Monday, from behind the login into your sheet</p>
-            </div>
-          </div>
-          <div class="lp-usecase-card pat-grocery align-bottom" style="background:var(--gray-20)">
-            <p class="lp-usecase-category mono">Admin</p>
-            <div class="lp-usecase-body">
-              <p class="lp-usecase-title">File your month-end paperwork</p>
-              <p class="lp-usecase-desc">Bank and tax statements, downloaded and filed by name</p>
-            </div>
-          </div>
-          <div class="lp-usecase-card pat-travel align-bottom" style="background:#f2effe">
-            <p class="lp-usecase-category mono">Travel</p>
-            <div class="lp-usecase-body">
-              <p class="lp-usecase-title">Book the team offsite</p>
-              <p class="lp-usecase-desc">Compares three spaces, books the best once you say go</p>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <section class="lp-final-cta">
-        <div class="lp-cta-frame">
-          <a class="lp-download-btn lp-final-cta-btn mono" href={installGuide} data-download>Start nodding</a>
-          <img class="lp-crosshair tl" src={crosshair} alt="" />
-          <img class="lp-crosshair tr" src={crosshair} alt="" />
-          <img class="lp-crosshair bl" src={crosshair} alt="" />
-          <img class="lp-crosshair br" src={crosshair} alt="" />
+        <div class="lp-hard-ones-frame final lp-dot-grid-bg">
+          <h2>Give Nod its first job</h2>
+          <a class="lp-download-btn lp-final-cta-btn mono" href={installGuide} data-download><img class="lp-btn-icon" src={downloadIcon} alt="" />Start nodding</a>
         </div>
       </section>
       <aside class="lp-labs" id="labs" aria-labelledby="labs-heading">
@@ -680,17 +660,28 @@ const panelSizes = '(min-width: 1440px) 808px, (min-width: 1100px) 56vw, 92vw';
       </main>
 
       <footer class="lp-footer">
-        <p class="lp-logo-tag"><img class="glyph" src={nodMark} alt="" /><span
-            >Nod by <a href={n8n} target="_blank" rel="noopener">n8n</a> labs</span
-          >
-        </p>
-        <nav class="lp-footer-nav">
-          <a href="https://n8n.io/legal/nod-terms-of-use/">Terms</a>
-          <a href="https://n8n.io/legal/privacy/">Privacy</a>
-          <a href="https://n8n.io/imprint/">Imprint</a>
-          <a href={base}>Docs</a>
-          <a href={github}>GitHub</a>
-        </nav>
+        <div class="lp-footer-row">
+          <div class="lp-brand">
+            <a class="lp-brand-logo" href={n8n} target="_blank" rel="noopener"
+              ><img src={n8nLogo} alt="n8n" width="100" height="20" loading="lazy" /></a
+            >
+            <span class="lp-brand-badge mono">Labs</span>
+          </div>
+          <nav class="lp-footer-nav mono" aria-label="Product">
+            <a href={base}>Docs</a>
+            <a href={github} target="_blank" rel="noopener">GitHub</a>
+            <a href="https://community.n8n.io/c/n8n-labs/48" target="_blank" rel="noopener">Community</a>
+            <a href={installGuide} data-download>Download</a>
+          </nav>
+        </div>
+        <div class="lp-footer-row lp-footer-bottom">
+          <p class="lp-footer-fine">© {new Date().getFullYear()} n8n</p>
+          <nav class="lp-footer-nav lp-footer-legal" aria-label="Legal">
+            <a href="https://n8n.io/legal/nod-terms-of-use/">Terms</a>
+            <a href="https://n8n.io/legal/privacy/">Privacy</a>
+            <a href="https://n8n.io/imprint/">Imprint</a>
+          </nav>
+        </div>
       </footer>
     </div>
 
@@ -698,6 +689,7 @@ const panelSizes = '(min-width: 1440px) 808px, (min-width: 1100px) 56vw, 92vw';
       import { startCarousel } from '../scripts/carousel.js';
       import { startDownload } from '../scripts/download.js';
       import { startEqualPanels } from '../scripts/equal-panels.js';
+      import { startFaq } from '../scripts/faq.js';
       import { startHeroGlyph } from '../scripts/hero-glyph.js';
       import { startHeroVideo } from '../scripts/hero-video.js';
       import { startPanelStories } from '../scripts/panel-stories.js';
@@ -706,6 +698,7 @@ const panelSizes = '(min-width: 1440px) 808px, (min-width: 1100px) 56vw, 92vw';
       startCarousel();
       startDownload();
       startEqualPanels();
+      startFaq();
       startRoadmapLine();
       startHeroGlyph();
       startHeroVideo();

@@ -273,3 +273,11 @@
 .usage-log-link:hover {
   text-decoration: underline;
 }
+
+.usage-log-rows .workspace-command-line {
+  grid-column: 2 / -1;
+  height: 26px;
+}
+.usage-log li[data-helper='true'] .workspace-command-line {
+  padding-left: 16px;
+}
