@@ -34,19 +34,19 @@ Select **Export history** at the top of **Usage** to download a JSON file of wha
 
 Each event has only these fields. Nothing else is copied into the file.
 
-| Field      | What it holds                                                                                                                                       |
-| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `at`       | When it happened                                                                                                                                    |
-| `type`     | `proposal` for an action Nod asked you about, `read` for an app read, `effect` for an action that changed something outside Nod                     |
-| `action`   | The tool's name, such as `GMAIL_SEND_EMAIL`                                                                                                         |
-| `kind`     | `app`, `browser`, `sign_in`, `files`, `memory` or `settings`                                                                                        |
-| `app`      | The app's name, when the action has one                                                                                                             |
-| `account`  | The ID of the connected account it used                                                                                                             |
-| `work`     | What started it: `chat`, `task`, `schedule`, `event` or `check`. `resume` marks the run that follows your approval                                  |
-| `task`     | The task's ID, for work in a task                                                                                                                   |
-| `approval` | The approval's ID. A proposal and the effect it led to share it                                                                                     |
-| `policy`   | `asked` for a proposal. For a read or effect, what allowed it: `read`, `owner_message`, `schedule`, `notification_rule`, `owner_rule` or `approved` |
-| `outcome`  | For a proposal: `waiting`, `approved`, `running`, `ran`, `declined`, `not_run` or `uncertain`. Reads and effects are always `ran`                   |
+| Field      | What it holds                                                                                                                                                                                |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `at`       | When it happened                                                                                                                                                                             |
+| `type`     | `proposal` for an action Nod asked you about, `read` for an action allowed as a read, `effect` for any other action that ran                                                                 |
+| `action`   | The tool's name, such as `GMAIL_SEND_EMAIL`                                                                                                                                                  |
+| `kind`     | `app`, `browser`, `sign_in`, `files`, `memory` or `settings`                                                                                                                                 |
+| `app`      | The app's name, when the action has one                                                                                                                                                      |
+| `account`  | The ID of the connected account it used or would use, when it has one                                                                                                                        |
+| `work`     | What started it: `chat`, `task`, `schedule`, `event` or `check`. `resume` marks the run that follows your approval, and `other` any other source                                             |
+| `task`     | The task's ID, for work in a task                                                                                                                                                            |
+| `approval` | The approval's ID. A proposal and the effect it led to share it                                                                                                                              |
+| `policy`   | `asked` for a proposal. For a read or effect, what allowed it: `read`, `owner_message`, `schedule`, `notification_rule`, `owner_rule` or `approved`, or `unknown` when no basis was recorded |
+| `outcome`  | For a proposal: `waiting`, `approved`, `running`, `ran`, `declined`, `not_run` or `uncertain`. Reads and effects are always `ran`                                                            |
 
 The file never includes message text, the words Nod quoted as your permission, action arguments, results, error messages, email addresses or account names. An approved action that ran once shows as one proposal and one effect, even if Nod tried it again later. A background action the check refused without asking isn't listed yet.
 
