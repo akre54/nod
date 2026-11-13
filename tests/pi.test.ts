@@ -597,6 +597,22 @@ test('small Pi sessions save full output and keep nested results available to sc
   const read = captured!.customTools!.find((tool) => tool.name === 'read')!;
   await read.execute('read', { path: saved, limit: 2 }, undefined, undefined, undefined as never);
   assert.deepEqual(guarded, ['read']);
+  const bash = captured!.customTools!.find((tool) => tool.name === 'bash')!;
+  const command = (await bash.execute(
+    'bash',
+    { command: "printf 'synthetic-line-%05d\\n' $(seq 1 600); echo synthetic-last-line; exit 4" },
+    undefined,
+    undefined,
+    undefined as never,
+  )) as Awaited<ReturnType<ToolDefinition['execute']>> & {
+    exitCode?: number;
+    commandOutput?: string;
+  };
+  const shown = command.content.find((part) => part.type === 'text')!.text;
+  assert.match(shown, /"workspaceFile"/);
+  assert.equal(shown.includes('synthetic-last-line'), false);
+  assert.equal(command.exitCode, 4);
+  assert.match(command.commandOutput!, /synthetic-line-00600\nsynthetic-last-line/);
   await session.dispose();
 });
 

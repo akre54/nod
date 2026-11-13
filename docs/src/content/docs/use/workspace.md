@@ -53,13 +53,13 @@ You can watch the commands a task runs in the workspace. Open the task's preview
 
 Each entry shows the command, the end of its output, and how it ended:
 
-| Status                         | What it means                                                          |
-| ------------------------------ | ---------------------------------------------------------------------- |
-| **Exit code 0**                | The command finished without an error                                  |
-| **Exit code** and a number     | The command finished with an error. The output usually says why        |
-| **Ended without an exit code** | The command timed out or was cancelled                                 |
-| **May still be running**       | The task is still working and the command hasn't reported back         |
-| **Ended before it finished**   | The task stopped, for example after **Stop**, before the command ended |
+| Status                         | What it means                                                                                  |
+| ------------------------------ | ---------------------------------------------------------------------------------------------- |
+| **Exit code 0**                | The command finished without an error                                                          |
+| **Exit code** and a number     | The command finished with an error. The output usually says why                                |
+| **Ended without an exit code** | Nod couldn't record an exit code, for example after a timeout, cancellation or workspace error |
+| **May still be running**       | The task is still working and the command hasn't reported back                                 |
+| **Ended before it finished**   | The task stopped, for example after **Stop**, before the command ended                         |
 
 Commands from a task's helpers start with **Helper**. The list shows the latest 200 commands and the last 16,000 characters of each output.
 

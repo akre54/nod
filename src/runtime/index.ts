@@ -105,12 +105,13 @@ function textResult(value: unknown): AgentToolResult {
 }
 
 const commandOutputChars = 16_000;
+const omittedOutput = '[Earlier output omitted]\n';
 
 function commandOutput(redact: (text: string) => string, text: string) {
   const start = Math.max(0, text.length - 64_000);
   const safe = redact(start ? text.slice(text.indexOf('\n', start) + 1 || start) : text);
   return safe.length > commandOutputChars
-    ? `[Earlier output omitted]\n${safe.slice(-commandOutputChars)}`
+    ? `${omittedOutput}${safe.slice(-(commandOutputChars - omittedOutput.length))}`
     : safe;
 }
 
@@ -493,7 +494,10 @@ export function createAgentRuntime(dependencies: {
             (name === 'task' && (params as { action?: unknown } | null)?.action === 'start')
           )
             reported = true;
-          result = isToolResult(output) ? output : textResult(output);
+          const { commandOutput: fullOutput, ...toolResult } = isToolResult(output)
+            ? output
+            : textResult(output);
+          result = toolResult;
           if (!stopped)
             await context.emit(
               'tool_complete',
@@ -503,9 +507,10 @@ export function createAgentRuntime(dependencies: {
                   ...(result.exitCode === undefined ? {} : { exitCode: result.exitCode }),
                   output: commandOutput(
                     redactCommand,
-                    result.content
-                      .flatMap((part) => (part.type === 'text' ? [part.text] : []))
-                      .join('\n'),
+                    fullOutput ??
+                      result.content
+                        .flatMap((part) => (part.type === 'text' ? [part.text] : []))
+                        .join('\n'),
                   ),
                 },
               ),
@@ -534,7 +539,7 @@ export function createAgentRuntime(dependencies: {
             if (times)
               result = { ...result, content: [{ type: 'text', text: times }, ...result.content] };
           }
-          end({ status: 'succeeded', output });
+          end({ status: 'succeeded', output: fullOutput === undefined ? output : toolResult });
         } catch (error) {
           if (!stopped)
             await context

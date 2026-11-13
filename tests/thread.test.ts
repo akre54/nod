@@ -1075,10 +1075,10 @@ test(
             ['tool_start', randomUUID(), { command }],
             ['tool_start', randomUUID(), { command: `${command} --second` }],
           ] as const;
-          for (const [type, callId, record] of events)
+          for (const [index, [type, callId, record]] of events.entries())
             await db.pool.query(
-              "INSERT INTO turn_events(id,turn_id,type,summary,call_id,command) VALUES($1,$2,$3,'bash',$4,$5)",
-              [randomUUID(), turnId, type, callId, record],
+              "INSERT INTO turn_events(id,turn_id,type,summary,call_id,command,created_at) VALUES($1,$2,$3,'bash',$4,$5,now()+$6*interval '1 second')",
+              [randomUUID(), turnId, type, callId, record, index],
             );
           await db.pool.query(
             "INSERT INTO turn_events(id,turn_id,type,summary,call_id,command) VALUES($1,$2,'tool_complete','bash',$3,$4)",
