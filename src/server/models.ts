@@ -386,35 +386,38 @@ export function createModelService(options: {
     const classes = [...new Set(options.dataClasses?.() ?? [])];
     return classes.length ? classes : ['unknown'];
   }
-  function routeAllows(row: Pick<ModelRecord, 'id'>) {
-    const policy = inferenceRoutes;
+  function routeAllows(
+    row: Pick<ModelRecord, 'id'>,
+    state: Pick<ModelState, 'routes' | 'selection'> = { routes: inferenceRoutes, selection },
+  ) {
+    const policy = state.routes;
     return (
       !policy ||
-      ((policy.fallback || row.id === selection?.connectionId) &&
+      ((policy.fallback || row.id === state.selection?.connectionId) &&
         inputClasses().every((dataClass) => policy.routes[dataClass]?.includes(row.id)))
     );
   }
-  function checkRoute(row: Pick<ModelRecord, 'id' | 'provider' | 'method'>) {
-    if (routeAllows(row)) return;
+  function checkRoute(
+    row: Pick<ModelRecord, 'id' | 'provider' | 'method'>,
+    state: Pick<ModelState, 'routes' | 'selection'> = { routes: inferenceRoutes, selection },
+  ) {
+    if (routeAllows(row, state)) return;
     const name = `the ${modelSource(row)} connection`;
     throw new ConnectionError(
-      !inferenceRoutes?.fallback && row.id !== selection?.connectionId
+      !state.routes?.fallback && row.id !== state.selection?.connectionId
         ? `Your inference routes keep every request on your selected connection, so Nod did not send this request to ${name}.`
         : `Your inference routes don't allow ${inputClasses().join(' and ')} data on ${name}, so Nod did not send this request. Choose a model on a connection the routes allow for this data.`,
     );
   }
   function requestAccess(row: ModelRecord): Pick<ModelAccess, 'read' | 'prepareRequest'> {
-    const routedRead = async () => {
-      checkRoute(row);
-      return read(row.id);
-    };
+    const routedRead = () => read(row.id, true);
     if (row.provider !== 'google') return { read: routedRead };
     const tag = (value: ModelCredential | undefined) =>
       value && createHash('sha256').update(JSON.stringify(value)).digest('hex');
     return {
       read: routedRead,
       async prepareRequest(modelId, automatic) {
-        const credentialTag = tag(await read(row.id));
+        const credentialTag = tag(await routedRead());
         const pause = rows.find((item) => item.id === row.id)?.requestPauses?.[modelId];
         if (
           automatic &&
@@ -510,6 +513,7 @@ export function createModelService(options: {
         const peers = candidates.filter(
           (candidate) =>
             candidate?.status === 'connected' &&
+            routeAllows(candidate) &&
             candidate.provider === row.provider &&
             candidate.models.some(
               (model) =>
@@ -537,10 +541,11 @@ export function createModelService(options: {
       return { row, definition };
     }
   }
-  async function read(id: string) {
+  async function read(id: string, routed = false) {
     const result = await store.change(async (state) => {
       const row = state.connections.find((item) => item.id === id);
       if (!row) return {};
+      if (routed) checkRoute(row, state);
       if (row.status === 'reconnect') throw attention(row);
       try {
         const current = credential(row);
@@ -1174,7 +1179,7 @@ export function createModelService(options: {
     },
     async apiCredential(provider: ModelProvider) {
       const row = apiKeyConnection(provider);
-      const value = row && (await read(row.id));
+      const value = row && (await read(row.id, true));
       return value?.type === 'api_key' ? value : undefined;
     },
     async apiKey(provider: ModelProvider) {

@@ -109,6 +109,13 @@ export function createDatabaseModelStore(options: {
         const previous = structuredClone(state);
         const result = await run(state);
         signal?.throwIfAborted();
+        if (state.routes)
+          state.routes.routes = Object.fromEntries(
+            Object.entries(state.routes.routes).map(([dataClass, ids]) => [
+              dataClass,
+              ids.filter((id) => state.connections.some((row) => row.id === id)),
+            ]),
+          );
         for (const row of previous.connections) {
           if (state.connections.some((next) => next.id === row.id)) continue;
           await client.query('DELETE FROM model_connections WHERE id=$1 AND owner_id=$2', [

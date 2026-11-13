@@ -3226,8 +3226,21 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     );
     const restarted = await f.create('fixture-route-owner', backend);
     assert.deepEqual(restarted.routes, { routes: { unknown: [a, b] }, fallback: false });
+    await service.setRoutes({ routes: { unknown: [b] }, fallback: true });
+    assert.equal(
+      (await service.resolveClassification(true))?.definition.spec.baseUrl,
+      'https://b.example/v1',
+    );
+    const access = await service.resolveClassification(true);
+    await service.setRoutes({ routes: { unknown: [a] }, fallback: true });
+    await assert.rejects(access!.read(), /don't allow unknown data/);
+    assert.equal(await service.apiKey('google'), 'fixture-route-key-a');
     await service.setRoutes(null);
     assert.equal((await service.resolveImage()).definition.spec.baseUrl, 'https://b.example/v1');
+    await service.setRoutes({ routes: { unknown: [a, b] }, fallback: true });
+    await service.remove(b);
+    assert.deepEqual(service.routes, { routes: { unknown: [a] }, fallback: true });
+    await service.setRoutes(service.routes);
   });
 
   test('model setup chooses capable defaults, preserves explicit choices and requires valid cloud accounts', async (t) => {
