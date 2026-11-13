@@ -426,6 +426,7 @@ export function TaskPage({ id, activity = [] }: { id: string; activity?: Activit
           <TaskCard task={task} page live={activity.find((item) => item.taskId === id)} />
         </div>
       )}
+      <PlanToast />
     </div>
   );
 }

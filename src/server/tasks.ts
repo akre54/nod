@@ -208,12 +208,9 @@ export function createTasks(options: {
            WHERE r.owner_id=t.owner_id AND r.task_id=t.id
              AND (a.status='uncertain' OR (a.status='executing' AND e.status IS DISTINCT FROM 'queued'
                AND e.status IS DISTINCT FROM 'running' AND e.status IS DISTINCT FROM 'waiting'))
-             ${
-               actions
-                 ? `AND NOT EXISTS(SELECT 1 FROM turns dr JOIN app_actions d ON d.turn_id=dr.id AND d.owner_id=dr.owner_id
-               WHERE dr.owner_id=t.owner_id AND dr.task_id=t.id AND d.action=a.action AND d.created_at>a.created_at)`
-                 : ''
-             }
+             AND NOT EXISTS(SELECT 1 FROM turns dr JOIN approvals d ON d.turn_id=dr.id AND d.owner_id=dr.owner_id
+               WHERE dr.owner_id=t.owner_id AND dr.task_id=t.id AND d.status='completed'
+                 AND d.action=a.action AND d.args=a.args AND d.created_at>a.created_at)
            ORDER BY a.created_at DESC,a.id DESC LIMIT 1) unsure ON true
          WHERE t.position<=100 OR t.source_message_id IN (
            SELECT requested.id FROM messages offer

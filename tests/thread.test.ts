@@ -8652,7 +8652,7 @@ test(
         },
       );
       await t.test(
-        'a task page, a browser handback and a reply from Scheduled reach the same task session without repeating its actions',
+        'a task page, a browser handback and a web reply reach the same task session without repeating its actions',
         async () => {
           await waitFor(settledThread);
           const asked = await thread.enqueueTurn('ask-question', {
@@ -8671,6 +8671,8 @@ test(
           const taskId = randomUUID();
           const foreignTask = randomUUID();
           const approval = randomUUID();
+          const later = randomUUID();
+          const repeated = randomUUID();
           await db.pool.query(
             `INSERT INTO tasks(id,owner_id,turn_id,session_id,message_id,title,done_when,now_text) VALUES
                ($1,$2,$3,$4,$5,'Synthetic order','Order confirmed','Waiting for the account'),
@@ -8785,10 +8787,48 @@ test(
               .task;
             assert.equal(after.uncertainAction?.label, 'Slack: Send message');
             assert.equal(after.lastAction?.label, 'Gmail: Send email');
-          } finally {
-            await db.pool.query('DELETE FROM approvals WHERE id=$1', [approval]);
+
             await db.pool.query(
-              "DELETE FROM app_actions WHERE turn_id=$1 AND action IN ('GMAIL_FETCH_EMAILS','GMAIL_SEND_EMAIL')",
+              `INSERT INTO app_actions(owner_id,turn_id,action,basis,created_at)
+               VALUES($1,$2,'SLACK_SEND_MESSAGE','{"kind":"approved"}',now()+interval '1 second')`,
+              [ownerId, asked],
+            );
+            await db.pool.query(
+              `INSERT INTO approvals(id,owner_id,thread_id,turn_id,action,args,status,created_at)
+               VALUES($1,$2,$3,$4,'SLACK_SEND_MESSAGE',$5,'completed',now()+interval '1 second')`,
+              [
+                later,
+                ownerId,
+                origin.thread_id,
+                asked,
+                JSON.stringify({
+                  channel: 'synthetic-other-channel',
+                  text: 'synthetic-other-body',
+                }),
+              ],
+            );
+            assert.equal(
+              (await request('GET', `/api/tasks/${taskId}`)).json<{ task: Task }>().task
+                .uncertainAction?.label,
+              'Slack: Send message',
+            );
+            await db.pool.query(
+              `INSERT INTO approvals(id,owner_id,thread_id,turn_id,action,args,status,created_at)
+               SELECT $1,owner_id,thread_id,turn_id,action,args,'completed',now()+interval '1 second'
+               FROM approvals WHERE id=$2`,
+              [repeated, approval],
+            );
+            assert.equal(
+              (await request('GET', `/api/tasks/${taskId}`)).json<{ task: Task }>().task
+                .uncertainAction,
+              null,
+            );
+          } finally {
+            await db.pool.query('DELETE FROM approvals WHERE id=ANY($1::uuid[])', [
+              [approval, later, repeated],
+            ]);
+            await db.pool.query(
+              "DELETE FROM app_actions WHERE turn_id=$1 AND action IN ('GMAIL_FETCH_EMAILS','GMAIL_SEND_EMAIL','SLACK_SEND_MESSAGE')",
               [asked],
             );
             await db.pool.query('DELETE FROM tasks WHERE id=$1', [foreignTask]);
