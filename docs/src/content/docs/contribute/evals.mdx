@@ -736,14 +736,24 @@ pnpm run eval:capability capabilities
 
 Use `--capability apps` for tool selection and `--capability files` for coding. Add `--budget` to cap the spend.
 
-The table below shows the default models of the four common providers, from the bundled catalog when this page was written. Run the command for current values. No measured column has a saved run yet.
+The table below shows the default models of the four common providers, from the bundled catalog when this page was written. Run the command for current values.
 
-| Model                           | Image input | Context window | Context profile | Thinking levels               | Computer use | Tool selection | Coding       |
-| ------------------------------- | ----------- | -------------- | --------------- | ----------------------------- | ------------ | -------------- | ------------ |
-| `openai/gpt-6.1-sol`            | Yes         | 272,000        | Full            | low, medium, high, xhigh, max | Not measured | Not measured   | Not measured |
-| `anthropic/claude-opus-5-5`     | Yes         | 1,000,000      | Full            | low, medium, high, xhigh, max | Not measured | Not measured   | Not measured |
-| `google/gemini-3.8-flash`       | Yes         | 1,048,576      | Full            | low, medium, high             | Not measured | Not measured   | Not measured |
-| `openrouter/openai/gpt-6.1-sol` | Yes         | 1,050,000      | Full            | low, medium, high, xhigh, max | Not measured | Not measured   | Not measured |
+| Model                           | Image input | Context window | Context profile | Thinking levels               |
+| ------------------------------- | ----------- | -------------- | --------------- | ----------------------------- |
+| `openai/gpt-6.1-sol`            | Yes         | 272,000        | Full            | low, medium, high, xhigh, max |
+| `anthropic/claude-opus-5-5`     | Yes         | 1,000,000      | Full            | low, medium, high, xhigh, max |
+| `google/gemini-3.8-flash`       | Yes         | 1,048,576      | Full            | low, medium, high             |
+| `openrouter/openai/gpt-6.1-sol` | Yes         | 1,050,000      | Full            | low, medium, high, xhigh, max |
+
+Each provider also documents whether a model supports its own computer use tool. These are the providers' claims as of November 2026, not Nod results:
+
+| Model              | Provider computer use                                                                                                                                                           |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gpt-6.1-sol`      | Yes. `computer_use` is listed in the model's [supported tools](https://developers.openai.com/api/docs/models/gpt-6.1-sol)                                                       |
+| `claude-opus-5-5`  | Yes, through the `computer_toolset_20260801` toolset with no beta header ([computer use tool](https://platform.claude.com/docs/en/agents-and-tools/tool-use/computer-use-tool)) |
+| `gemini-3.8-flash` | Yes. Listed as a model that supports [computer use](https://aistudio.google.com/docs/computer-use)                                                                              |
+
+Nod doesn't call these tools. Its browser runs through agent-browser, with Nod's own snapshot, screenshot, click and drag tools. So provider support says a model was trained for screen work, not that it does well in Nod's harness. The measured columns answer that. No model has a saved run for them yet, so the command shows **Not measured** for computer use, tool selection and coding until you run the cases above.
 
 :::caution[Declared is not measured]
 Image input says a model accepts images, not that it can read a page or click the right place. Tool selection and coding are proxies: the `apps` and `files` cases also test other things.
