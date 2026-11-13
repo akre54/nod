@@ -4,7 +4,6 @@ import type { WorkspaceCommand } from '../../shared/contracts';
 import type { TrustStep } from '../../shared/trust';
 import { usePageData } from '../hooks/use-page-data';
 import { Dialog, DialogContent, DialogDescription, DialogTitle, Loading, Notice } from './ui';
-import './workspace-command.css';
 
 type Command = NonNullable<TrustStep['command']>;
 
