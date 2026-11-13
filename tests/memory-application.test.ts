@@ -763,7 +763,6 @@ test('a record import adds selected summaries once, offers changed revisions and
       record('call-transcript', { class: 'transcript', text: 'Speaker 1: synthetic words.' }),
       record('call-audio', { class: 'audio', text: 'call.m4a' }),
       record('card', { text: 'Pays with card 4111 1111 1111 1111.' }),
-      record('login', { uri: 'https://owner:example-pass@example.com/notes' }),
     ],
   };
 
@@ -773,7 +772,6 @@ test('a record import adds selected summaries once, offers changed revisions and
     'call-transcript': 'excluded',
     'call-audio': 'excluded',
     card: 'secret',
-    login: 'secret',
   });
   const saved = await memory.load();
   assert.deepEqual(
@@ -808,6 +806,11 @@ test('a record import adds selected summaries once, offers changed revisions and
       statusCode: 400,
     },
   );
+  for (const uri of ['ftp://owner:example-pass@example.com/x', 'https://owner@example.com/notes'])
+    await assert.rejects(memory.importManifest({ version: 1, records: [record('x', { uri })] }), {
+      statusCode: 400,
+      message: /username or password/,
+    });
   await assert.rejects(
     memory.importManifest({ version: 1, records: [record('x', { class: 'video' })] }),
     {
@@ -896,9 +899,39 @@ test('a record import adds selected summaries once, offers changed revisions and
   );
   const final = await memory.load();
   assert.ok(!final.entries.some((item) => item.imported?.id === 'decisions'));
+  const transcript = final.entries.find((item) => item.imported?.id === 'call-transcript')!;
+  assert.equal(transcript.imported?.class, 'transcript');
+
+  assert.deepEqual(
+    decisions(
+      await memory.importManifest({
+        version: 1,
+        records: [
+          record('planning', {
+            uri: 'https://notes.example.com/planning',
+            text: 'Planning summary from another tool.',
+          }),
+        ],
+      }),
+    ),
+    { planning: 'added' },
+  );
+  assert.deepEqual(
+    (await memory.load()).entries
+      .filter((item) => item.imported?.id === 'planning')
+      .map((item) => [item.text, item.imported?.uri]),
+    [
+      ['Planning summary from another tool.', 'https://notes.example.com/planning'],
+      ['Owner rewrite of the planning summary.', 'obsidian://open?vault=Synthetic&file=planning'],
+    ],
+  );
+
+  await memory.restate([
+    { area: transcript.area, slug: transcript.slug, text: 'Owner words for the call.' },
+  ]);
   assert.equal(
-    final.entries.find((item) => item.imported?.id === 'call-transcript')?.imported?.class,
-    'transcript',
+    (await memory.load()).entries.find((item) => item.slug === transcript.slug)?.imported?.id,
+    'call-transcript',
   );
 });
 

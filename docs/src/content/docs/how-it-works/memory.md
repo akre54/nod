@@ -173,7 +173,7 @@ Page changes post nothing to chat and work while saving is off. Rewriting a note
 
 ### Import records with their source
 
-A record import brings in notes or meeting summaries the owner selected in another tool, such as a notes app, and keeps where each one came from. The original stays the source of truth. Nod never writes back to it. The memory service (`importManifest` in [`src/server/memory.ts`](https://github.com/n8n-io/nod/blob/main/src/server/memory.ts)) validates and applies a manifest. There is no Settings screen or route for it yet.
+A record import brings in notes or meeting summaries the owner selected in another tool, such as a notes app. Each note it saves keeps where it came from. The original stays the source of truth. Nod never writes back to it. The memory service (`importManifest` in [`src/server/memory.ts`](https://github.com/n8n-io/nod/blob/main/src/server/memory.ts)) validates and applies a manifest. There is no Settings screen or route for it yet.
 
 A manifest lists up to 200 records:
 
@@ -194,20 +194,20 @@ A manifest lists up to 200 records:
 }
 ```
 
-| Field      | Holds                                                                                                                    |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `id`       | The record's stable ID in its source, up to 200 characters. Each ID appears once per manifest.                           |
-| `uri`      | Where the original lives, up to 2,000 characters. `javascript:`, `data:`, `vbscript:` and `blob:` addresses are refused. |
-| `revision` | The source's version of the record, such as a hash or edit counter, up to 200 characters.                                |
-| `at`       | When the source last changed the record, as an ISO date and time with an offset.                                         |
-| `class`    | `note`, `summary`, `decisions`, `links`, `transcript` or `audio`.                                                        |
-| `area`     | The memory area for the note. Optional; `about` by default.                                                              |
-| `text`     | The summary or excerpt the owner chose, up to 4,000 characters. Nod saves it word for word.                              |
-| `locked`   | Optional. `true` keeps the saved note as it is when a later revision arrives.                                            |
+| Field      | Holds                                                                                                                                                         |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`       | The record's stable ID in its source, up to 200 characters. Each ID appears once per manifest.                                                                |
+| `uri`      | Where the original lives, up to 2,000 characters. `javascript:`, `data:`, `vbscript:` and `blob:` addresses and ones with a username or password are refused. |
+| `revision` | The source's version of the record, such as a hash or edit counter, up to 200 characters.                                                                     |
+| `at`       | When the source last changed the record, as an ISO date and time with an offset.                                                                              |
+| `class`    | `note`, `summary`, `decisions`, `links`, `transcript` or `audio`.                                                                                             |
+| `area`     | The memory area for the note. Optional; `about` by default.                                                                                                   |
+| `text`     | The summary or excerpt the owner chose, up to 4,000 characters. Nod saves it word for word, trimming spaces at either end.                                    |
+| `locked`   | Optional. `true` keeps the saved note as it is for this import. Nod doesn't remember it, so a later manifest repeats it.                                      |
 
 An optional top-level `"include": ["transcript"]` lets transcript records in. Without it, only notes, summaries, decisions and links are imported. Audio records are never imported. A manifest with an unknown field or class, a duplicate ID or a field out of range is refused as a whole, and the error names the record and field.
 
-Nod checks each record against what memory already holds:
+Nod checks each record against what memory already holds. A saved note matches a record when both have the same ID and their addresses have the same scheme and host, so `obsidian://open` records never match `https://notes.example.com` ones:
 
 ```mermaid
 flowchart TD
@@ -215,7 +215,7 @@ flowchart TD
   kind -- no --> excluded[Excluded]:::stop
   kind -- yes --> secret{Looks like a secret?}
   secret -- yes --> skipped[Skipped]:::stop
-  secret -- no --> saved{Note with this ID?}
+  secret -- no --> saved{Note with this source and ID?}
   saved -- same revision --> same[Unchanged]:::muted
   saved -- new revision --> lock{Locked?}
   lock -- yes --> locked[Unchanged]:::muted
@@ -226,10 +226,10 @@ flowchart TD
 
 - **Same ID and revision.** Nothing changes, so importing the same manifest twice writes nothing.
 - **New revision.** Nod returns a proposal with the note's current text and the new text. It never changes the note itself, so an edit the owner made in Settings stays. When only the revision changed and the text matches, Nod records the new revision.
-- **Locked.** A record marked `locked` gets no proposal and leaves the saved note and its recorded revision as they are.
+- **Locked.** A record marked `locked` gets no proposal and leaves the saved note and its recorded revision as they are. The next manifest without `locked` gets a proposal again.
 - **Let go.** When the owner archived the imported note, a later import leaves it in **Let go**. **Bring back** restores it. After **Forget note**, the next import adds it again.
 - **Secrets.** A text, ID, revision or address that looks like a password, key, card number or login link is skipped. Nothing from that record is saved.
-- **Same text.** A record whose text matches a note already in its area is not saved twice.
+- **Same text.** A record whose text matches a note already in its area is not saved twice, and that note gets no source fields.
 
 A new record becomes a confirmed note, like a note the owner adds, because the owner chose it. Its source fields stay with the note and its archived versions, and an edit keeps them. They don't reach Pi, the memory model or the export.
 

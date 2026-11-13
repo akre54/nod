@@ -79,7 +79,13 @@ const contentClasses = ['note', 'summary', 'decisions', 'links', 'transcript', '
 export const importedSchema = z
   .object({
     id: line(200),
-    uri: z.url({ protocol: /^(?!(?:javascript|data|vbscript|blob)$)[a-z][a-z0-9+.-]*$/ }).max(2000),
+    uri: z
+      .url({ protocol: /^(?!(?:javascript|data|vbscript|blob)$)[a-z][a-z0-9+.-]*$/ })
+      .max(2000)
+      .refine((value) => {
+        const parsed = new URL(value);
+        return !parsed.username && !parsed.password;
+      }, 'The address must not contain a username or password.'),
     revision: line(200),
     at: timestamp,
     class: z.enum(contentClasses),

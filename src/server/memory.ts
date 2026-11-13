@@ -284,7 +284,14 @@ export function createMemoryService(options: {
         if (current?.origin === 'stated' && current.text === note.text) continue;
         if (current) archive(tree, current, 'superseded', now);
         if (areaEntries(tree, note.area).some((entry) => same(entry.text, note.text))) continue;
-        tree.entries.push({ ...note, origin: 'stated', updated: now, edited: now, sources: [] });
+        tree.entries.push({
+          ...note,
+          ...(current?.imported ? { imported: current.imported } : {}),
+          origin: 'stated',
+          updated: now,
+          edited: now,
+          sources: [],
+        });
       }
     });
   }

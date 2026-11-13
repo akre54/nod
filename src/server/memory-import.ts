@@ -13,6 +13,10 @@ import {
 } from './memory-tree.ts';
 
 const included = new Set(['note', 'summary', 'decisions', 'links']);
+const sourceOf = (uri: string) => {
+  const parsed = new URL(uri);
+  return `${parsed.protocol}//${parsed.host}`;
+};
 
 const record = importedSchema
   .extend({ area: area.default('about'), text: line(), locked: z.boolean().default(false) })
@@ -60,9 +64,11 @@ export function applyManifest(tree: Tree, input: Manifest, now: string) {
   const allowed = new Set([...included, ...input.include]);
   return input.records.map(({ area, text, locked, ...source }): ImportDecision => {
     const { id } = source;
+    const matches = (entry: Entry) =>
+      entry.imported?.id === id && sourceOf(entry.imported.uri) === sourceOf(source.uri);
     if (!allowed.has(source.class)) return { id, decision: 'excluded' };
     if (unsafe(text, source.uri, source.id, source.revision)) return { id, decision: 'secret' };
-    const saved = tree.entries.find((entry) => entry.imported?.id === id);
+    const saved = tree.entries.find(matches);
     if (saved) {
       const path = pathOf(saved);
       if (saved.imported?.revision === source.revision) return { id, decision: 'same', path };
@@ -80,7 +86,7 @@ export function applyManifest(tree: Tree, input: Manifest, now: string) {
         revision: source.revision,
       };
     }
-    const archived = tree.archive.findLast((entry) => entry.imported?.id === id);
+    const archived = tree.archive.findLast(matches);
     if (archived) return { id, decision: 'archived', path: pathOf(archived) };
     const match = areaEntries(tree, area).find((entry) => same(entry.text, text));
     if (match) return { id, decision: 'existing', path: pathOf(match) };
