@@ -5,7 +5,7 @@ sidebar:
   order: 8
 ---
 
-Nod shows which models it used and what it did in your apps. With an API connection, you can also review spending and set a monthly limit.
+Nod shows what it did in your apps, on websites, in your files and in its own settings, and which models it used. With an API connection, you can also review spending and set a monthly limit.
 
 Nod itself doesn't charge you. Your model provider bills you for the requests Nod makes with your key or plan.
 
@@ -14,13 +14,18 @@ Nod itself doesn't charge you. Your model provider bills you for the requests No
 Open **Usage** in the sidebar (⌘5 in the Mac app, Ctrl+5 in the Windows or Linux app).
 
 - **The sentence at the top.** With an API model selected, this month's API spending and your monthly limit. Select the total to inspect spending or the limit to change it. With a ChatGPT plan selected, it says your usage comes from that plan.
-- **The list.** Model requests, connected app actions, sign-ins and card uses, grouped by day. Each line shows where it came from, such as **Schedule**, **Activity check** or **Task Nod started**, and what Nod did. A source check that found nothing to prepare says so, and a task's planned check reads **Checked on** with the task's name. Model requests show the models recorded for that run, including helpers and checks. Changing your selected model doesn't change these records. If an older request didn't record its model, the row says so. Under an action your words allowed, it shows those words, such as _You said "Send Lena the report"_.
+- **The list.** Your requests and Nod's runs, sign-ins and card submissions, grouped by day. Each row shows the request, when it ran, where it came from, such as **Schedule**, **Activity check** or **Task Nod started**, and what it changed, such as _Gmail: send email_ or _Change a schedule_. A source check that found nothing to prepare says so, and a task's planned check reads **Checked on** with the task's name.
+- **The log.** Select a row to see everything Nod did for it, step by step: each model call with its model, tokens and, when it has one, its cost; each action with what it acted on and, when recorded, why it was allowed, such as _Gmail: send email · lena@example.com · Q3 report · You said "Send Lena the report"_; the other tools it used; its notes along the way; work by helpers, indented; and its reply. When the words that allowed an action are your whole request, it says **You asked for it**. Actions cover connected apps (reads included), local files, steps on websites that click, submit or choose something, and changes to Nod's own schedules, settings, rules, memory and limits. Model calls keep the model recorded at the time, even if you change your selected model later. Each step is one line; point to it to read the whole line. Long logs load as you scroll, even with hundreds of thousands of steps. When the request has a chat message, **Show in chat** opens it.
 
-With a ChatGPT plan selected, Usage hides cost amounts, forecasts and monthly limit controls, including amounts on older API requests. Those requests still identify their recorded models and API connection. With an API model selected, recorded API costs are visible again; plan usage stays labeled separately and its API-price estimate is never shown as a charge. A run that used both shows its recorded API cost and identifies the models that used the plan.
+The on-screen list and opened logs show times in your computer's current time zone. The time zone saved in **Settings → General** still controls CSV exports, schedules, quiet hours and the monthly spending period.
 
-Scroll down to load earlier activity automatically.
+With a ChatGPT plan selected, Usage hides cost amounts, forecasts and monthly limit controls, including amounts on older API requests. Their logs still show the recorded models. With an API model selected, recorded API costs are visible again; plan usage stays labeled separately and its API-price estimate is never shown as a charge. A run that used both shows its recorded API cost, marked **API**.
 
-Select an activity with an available chat message to open that message in the conversation, including older messages. Sign-ins and card uses open the saved Vault item when it is still available. Entries without an available destination remain plain rows.
+Scroll down to load earlier activity automatically. Select **Export** to download the full log as a CSV file: one row for every step of every request, plus sign-ins and card submissions, with the time to the second in your time zone, the request, where it came from, why each action was allowed and the cost of each model call. Plan-covered and unpriced model calls leave the cost empty. When Usage shows one task or run, Export downloads only its log.
+
+You can also ask Nod in any chat, including Telegram and WhatsApp, for example "What did you do today?" or "Did you pay anything this week?". It answers from the same records. To get this every evening, ask for it as a [schedule](/use/schedules/).
+
+Sign-ins and card submissions open the saved Vault item when it is still available.
 
 To review or change [standing instructions](/trust/approvals/#standing-instructions), [rules](/trust/approvals/#your-rules) or task check-ins, ask Nod in chat.
 
@@ -77,6 +82,18 @@ Only paid usage with a known price counts toward the limit. See [How each model 
 
 Switching to a ChatGPT plan doesn't remove an existing monthly limit or its recorded API spending. If that limit is already reached, schedules, tasks and background work stay paused, and Nod answers your messages only to change the limit. Tell Nod to raise or remove it, or select an API model to review it in **Usage**.
 
+## Automatic preparation allowance
+
+Automatic preparation has a separate $5 monthly allowance. It starts off for new profiles. Turn it on in **Settings → Notifications**.
+
+In **Usage**, select the preparation allowance to change it. You can also say "Set my preparation allowance to $3". The minimum is $1.
+
+The allowance covers email privacy checks, source reviews, the observer, and tasks Nod starts from those changes. Plan usage counts toward preparation only at a known positive API-price estimate. A plan request without a known price does not start. Plan usage does not count toward the normal monthly spending limit. Your chat requests, schedules, and tasks keep their normal limits.
+
+Nod reserves an estimated maximum before each model request. Parallel requests share the same allowance. A request that cannot fit does not start. Usage shows held funds when the final cost is not yet recorded. An unknown model price blocks automatic preparation. All-zero prices also block it, because those values can mean that the price is unknown. Automatic preparation cannot generate speech. Request audio in chat.
+
+Conservative bounds can pause preparation before its recorded spending reaches the allowance. Preparation can continue next month, or after you raise the allowance. Your normal monthly limit and task check-ins still apply.
+
 ## Task check-ins
 
 A task checks in with you when its spending since your last message to it passes the check-in amount, $5 by default. Nod stops before its next step. It states the cost and what continuing would do, then asks whether to keep going. It includes a completed result only when that helps your decision and you can inspect the result.
@@ -88,9 +105,9 @@ A task checks in with you when its spending since your last message to it passes
 
 The count covers every turn of the task and its helpers, so a task that works in small steps over several days checks in too. Chat, schedules, and the background observer check in the same way. The observer counts across its turns until you answer its check-in.
 
-Trust checks, confirmation fact checks and the [decision check](/connect/models/#decision-checks) count toward the monthly limit. Those made during a running task, and its other model calls, also count toward its check-in. The approval-reply check runs before the task resumes. Each request counts once.
+Trust checks and the [decision check](/connect/models/#decision-checks) count toward the monthly limit. Those made during a running task, and its other model calls, also count toward its check-in. The approval-reply check runs before the task resumes. Each request counts once.
 
-An action that your words cover needs one authorization review. If it needs approval, Nod also calls the model to write and check the question. Reading your answer adds another check. A rejected question can need one new draft and fact check. Each extra conversation turn also uses the main model with its session context.
+An action that your words cover needs one authorization review. If it needs approval, the server formats the question from the saved action and arguments. Reading your answer adds another check. Each extra conversation turn also uses the main model with its session context.
 
 To reduce repeated questions, set [rules for what Nod can do directly](/trust/approvals/#your-rules). Nod can change from an app tool to the same service's website when the account and requested outcome stay the same. It also reuses saved procedures and writing style. Routine drafts do not require fresh style samples, and optional offers do not require extra schedule or history reads.
 

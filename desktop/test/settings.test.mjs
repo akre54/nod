@@ -821,6 +821,7 @@ async function runningDesktop(
         this.bounds = { ...bounds };
       }
       setBackgroundColor() {}
+      setTitleBarOverlay() {}
       destroy() {
         this.destroyed = true;
         this.visible = false;

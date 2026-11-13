@@ -274,6 +274,11 @@ export function createModelService(options: {
     keyStore: options.keyStore,
   });
   let analytics: CaptureAnalytics | undefined;
+  let requestBudget: ModelAccess['reserve'];
+  const reserve: NonNullable<ModelAccess['reserve']> = async (maximumUsd) => {
+    if (!requestBudget) throw new Error('The model request budget is not configured.');
+    return requestBudget(maximumUsd);
+  };
   function connectionChanged(
     provider: ModelProvider,
     method: ModelMethod,
@@ -369,15 +374,25 @@ export function createModelService(options: {
     if (value) remember(value);
     return value;
   }
-  function requestAccess(row: ModelRecord): Pick<ModelAccess, 'read' | 'prepareRequest'> {
-    if (row.provider !== 'google') return { read: () => read(row.id) };
+  function requestAccess(
+    row: ModelRecord,
+  ): Pick<ModelAccess, 'read' | 'prepareRequest' | 'reserve'> {
+    const access = {
+      read: () => read(row.id),
+      reserve,
+    };
+    if (row.provider !== 'google') return access;
     const tag = (value: ModelCredential | undefined) =>
       value && createHash('sha256').update(JSON.stringify(value)).digest('hex');
     return {
-      read: () => read(row.id),
+      ...access,
       async prepareRequest(modelId, automatic) {
         const credentialTag = tag(await read(row.id));
-        const pause = rows.find((item) => item.id === row.id)?.requestPauses?.[modelId];
+        const pauses = rows.find((item) => item.id === row.id)?.requestPauses;
+        const pause =
+          Object.values(pauses ?? {}).find(
+            (item) => item.kind === 'credits_depleted' && item.credentialTag === credentialTag,
+          ) ?? pauses?.[modelId];
         if (
           automatic &&
           pause &&
@@ -385,13 +400,12 @@ export function createModelService(options: {
           (pause.retryAt === null || pause.retryAt > Date.now())
         )
           throw new ConnectionError(
-            `${row.provider} reported ${pause.kind === 'zero_quota' ? 'zero quota' : 'a daily quota limit'} for ${modelId}. Automatic requests are paused. Check this connection in Settings > Models or ask again to make a new request.`,
+            `${row.provider} reported ${pause.kind === 'credits_depleted' ? 'depleted prepayment credits' : pause.kind === 'zero_quota' ? 'zero quota' : 'a daily quota limit'} for ${modelId}. Automatic requests are paused. Check this connection in Settings > Models or ask again to make a new request.`,
           );
         return async (error) => {
           if (!credentialTag || closed || (!error && automatic)) return;
           const failure = error ? modelQuotaFailure(error) : undefined;
           if (error && !failure) return;
-          if (!failure && !pause) return;
           try {
             await store.change((state) => {
               const saved = state.connections.find((item) => item.id === row.id);
@@ -406,7 +420,12 @@ export function createModelService(options: {
                       ? Date.now() + failure.retryAfterMs
                       : null,
                 };
-              else delete saved.requestPauses[modelId];
+              else {
+                delete saved.requestPauses[modelId];
+                for (const [id, item] of Object.entries(saved.requestPauses))
+                  if (item.kind === 'credits_depleted' && item.credentialTag === credentialTag)
+                    delete saved.requestPauses[id];
+              }
             });
             await reload();
           } catch (error) {
@@ -1145,6 +1164,10 @@ export function createModelService(options: {
         ...requestAccess(row),
         needsReconnect: (credential) => needsReconnect(row.id, { models: row.models, credential }),
       };
+    },
+    reserve,
+    setRequestBudget(reserve: NonNullable<ModelAccess['reserve']>) {
+      requestBudget = reserve;
     },
     async resolve(auxiliary = false): Promise<ModelAccess> {
       const selected = selection && { ...selection };

@@ -3,7 +3,7 @@ import type { Pool, PoolClient } from 'pg';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { Task, TaskDetail, TaskStatus } from '../shared/contracts.ts';
-import { actionTitle, approvalTitle, toolTitle } from './action-presentation.ts';
+import { approvalTitle, recordedAction, toolTitle } from './action-presentation.ts';
 import { taskPath } from '../shared/app-links.ts';
 import { taskNext } from '../shared/task-status.ts';
 import type { ChannelPresentation } from './channels.ts';
@@ -27,6 +27,7 @@ import { createPreferencesStore, deliveryTime, isQuietTime } from './preferences
 import { personalSecret } from './memory-tree.ts';
 import { texts as codeTexts } from './chat-verification.ts';
 import { waitingTurnSql, withdrawnSql } from './turn-chain.ts';
+import { resemblesTaskAcknowledgement } from '../shared/task-ack.ts';
 
 const now = z.string().trim().min(1);
 const waits = z.array(
@@ -198,7 +199,8 @@ export function createTasks(options: {
          LEFT JOIN LATERAL ${
            actions
              ? `(SELECT a.action,a.created_at FROM turns r JOIN app_actions a ON a.turn_id=r.id AND a.owner_id=r.owner_id
-               WHERE r.owner_id=t.owner_id AND r.task_id=t.id AND a.action<>'NOD_read_source'
+               WHERE r.owner_id=t.owner_id AND r.task_id=t.id
+                 AND (left(a.action,4)<>'NOD_' OR a.action='NOD_browser')
                  AND COALESCE(a.basis->>'kind','')<>'read'
                ORDER BY a.created_at DESC,a.id DESC LIMIT 1)`
              : '(SELECT NULL::text AS action,NULL::timestamptz AS created_at)'
@@ -402,6 +404,8 @@ export function createTasks(options: {
     raw: unknown,
     sourceMessageId?: string | null,
     capture?: CaptureAnalytics,
+    priorMessageId?: string,
+    priorHandoff = false,
   ) {
     const request = input.parse(raw);
     if (request.action === 'list') return { tasks: await read(client) };
@@ -465,9 +469,23 @@ export function createTasks(options: {
       const independent = current.proactive || current.session_id === turn.threadId;
       if (independent && !current.proactive && !sourceMessageId)
         throw failure('A new task needs an owner request.');
+      const prior =
+        priorMessageId && sourceMessageId
+          ? (
+              await client.query<{ id: string; text: string }>(
+                `SELECT m.id,m.text FROM messages m WHERE m.id=$1 AND m.owner_id=$2 AND m.thread_id=$3
+                 AND m.turn_id=$4 AND m.role='assistant' AND m.hidden_at IS NULL
+                 AND m.attachments='[]'::jsonb AND m.presentation IS NULL AND m.answer_choices IS NULL
+                 AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.owner_id=m.owner_id AND t.message_id=m.id)`,
+                [priorMessageId, ownerId, turn.threadId, turn.turnId],
+              )
+            ).rows[0]
+          : undefined;
       const messageId = current.proactive
         ? null
-        : await insertAssistantMessage(client, turn, request.message);
+        : prior && resemblesTaskAcknowledgement(prior.text, request.message, priorHandoff)
+          ? prior.id
+          : await insertAssistantMessage(client, turn, request.message);
       const sessionId = independent ? id : current.session_id;
       await client.query(
         `INSERT INTO tasks(id,owner_id,turn_id,session_id,source_message_id,message_id,title,done_when,brief,now_text,steps,waiting_for,next_check,applied_revision,activity_key)
@@ -757,7 +775,7 @@ export function createTasks(options: {
          WHERE u.task_id=$1 AND u.owner_id=$2 AND e.type IN ('step','tool_complete','tool_failed')
            AND NOT (e.type='tool_complete' AND e.summary='apps')
          UNION ALL
-         SELECT a.id,'action',a.action,NULL,NULL,NULL,a.created_at
+         SELECT a.id,'action',a.action,a.target,NULL,NULL,a.created_at
          FROM app_actions a JOIN turns u ON u.id=a.turn_id
          WHERE u.task_id=$1 AND u.owner_id=$2 AND a.owner_id=$2
          UNION ALL
@@ -769,8 +787,8 @@ export function createTasks(options: {
         )
       ).rows.map((event) => {
         if (event.type === 'action') {
-          const { app, label } = actionTitle(event.summary);
-          return { ...event, type: 'tool_complete', summary: app ? `${app}: ${label}` : label };
+          const { label, target } = recordedAction(event.summary, event.site);
+          return { ...event, type: 'tool_complete', summary: label, site: target ?? null };
         }
         return event.type === 'message' || event.type === 'step'
           ? event
@@ -858,13 +876,19 @@ export function createTasks(options: {
     };
   }
 
-  async function execute(turn: TurnRef, raw: unknown, sourceMessageId: string | null) {
+  async function execute(
+    turn: TurnRef,
+    raw: unknown,
+    sourceMessageId: string | null,
+    priorMessageId?: string,
+    priorHandoff?: boolean,
+  ) {
     const capture = snapshotAnalytics(options.analytics);
     const result = await transaction(async (client) => {
       await lockThread(client);
       return withTurnLock(
         turn.turnId,
-        () => act(client, turn, raw, sourceMessageId, capture),
+        () => act(client, turn, raw, sourceMessageId, capture, priorMessageId, priorHandoff),
         client,
       );
     }, pool);
