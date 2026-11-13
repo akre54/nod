@@ -153,6 +153,7 @@ import { createIntegrations } from './integrations.ts';
 import { gmailDraftTarget, gmailMessageTarget } from './action-presentation.ts';
 import {
   createErrorRedactor,
+  createCommandRedactor,
   createRedactor,
   createTextRedactor,
   environmentSecrets,
@@ -858,6 +859,7 @@ async function initializeApplication(
     computer,
     workspace,
     redactError: createErrorRedactor(secrets),
+    redactCommand: createCommandRedactor(secrets),
     keepWarm: async (threadId) =>
       !(await ledger.reachedLimit()) && (await activeThread(pool, ownerId)).id === threadId,
     observe: (turnId, event) => {

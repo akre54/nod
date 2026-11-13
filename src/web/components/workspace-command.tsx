@@ -21,6 +21,7 @@ export function WorkspaceCommandLine({ command, onOpen }: { command: Command; on
       type="button"
       className="workspace-command-line"
       onClick={onOpen}
+      data-state={command.state}
       data-analytics-private
     >
       <code title={command.command}>{command.command}</code>

@@ -58,6 +58,10 @@
 .workspace-command-result span {
   color: var(--muted-foreground);
 }
+.workspace-command-line[data-state='interrupted'] .workspace-command-status,
+.workspace-command-result[data-state='interrupted'] {
+  color: var(--warning);
+}
 .workspace-command-code,
 .workspace-command-output {
   margin: 0;

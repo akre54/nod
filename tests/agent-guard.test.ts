@@ -44,6 +44,8 @@ import { appToolArgs, type AppTool } from '../src/server/app-reads.ts';
 import { withoutSchemaPatterns } from '../src/shared/json-schema.ts';
 import { sourceReadSchema } from '../src/shared/proactivity.ts';
 import { memoryObjectStore } from './fixtures/object-store.ts';
+import { createCommandRedactor, createErrorRedactor } from '../src/server/redaction.ts';
+import type { WorkspaceCommandRecord } from '../src/shared/execution.ts';
 
 async function fixture(
   run: (
@@ -212,6 +214,38 @@ test('answer choices remain ordinary questions with runtime-owned IDs and bounde
     await call(tools, 'ask_user', { question: 'What should the report cover?' });
   });
   assert.equal(plain.result.answerChoices, undefined);
+});
+
+test('command output removes whole secrets before taking a bounded tail', async () => {
+  const secret = 'synthetic-boundary-private-value';
+  const output = `prefix ${secret} password=${'x'.repeat(64_000 - 10 - Math.floor(secret.length / 2))}`;
+  const records: WorkspaceCommandRecord[] = [];
+  await fixture(
+    async (_tools, emit, options) => {
+      for (const text of [
+        output,
+        `${'x'.repeat(100_000)}\n${secret}\nfinal-line`,
+        JSON.stringify({ name: 'password', value: 'synthetic-assigned-private-value' }),
+      ])
+        await options.runTool('bash', { command: `echo ${secret}` }, async () => ({
+          content: [{ type: 'text', text }],
+          exitCode: 0,
+        }));
+      emit({ type: 'final', text: 'Done' });
+    },
+    {
+      emit: async (_type, _summary, event) => {
+        if (event?.command) records.push(event.command);
+      },
+    },
+    { redactCommand: createCommandRedactor([secret]), redactError: createErrorRedactor([secret]) },
+  );
+  assert.equal(records[1]?.output, 'prefix [redacted] password=[redacted]');
+  assert.equal(records[3]?.output?.length, 16_000);
+  assert.match(records[3]!.output!, /^\[Earlier output omitted\]/);
+  assert.match(records[3]!.output!, /\[redacted\]\nfinal-line$/);
+  assert.equal(JSON.stringify(records).includes(secret.slice(-12)), false);
+  assert.equal(records[5]?.output, '{"name":"password","value":"[redacted]"}');
 });
 
 test('live status stays out of chat replies and removes known secrets', async () => {

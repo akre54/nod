@@ -107,7 +107,7 @@ function TaskCommands({ id }: { id: string }) {
     <section className="task-commands" aria-label="Workspace commands">
       <p className="task-commands-where">
         <LockKeyhole size={14} aria-hidden="true" />
-        Nod runs these in its isolated workspace, not on your computer. You can watch, not type.
+        Nod runs these in its isolated workspace. You can view them here.
       </p>
       {data.error ? (
         <Notice>{data.error}</Notice>

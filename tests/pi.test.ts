@@ -37,7 +37,7 @@ import type { DecisionQuestion } from '../src/ports/decisions.ts';
 import type { ProviderUsageEvent } from '../src/ports/provider-usage.ts';
 import { createSandbox } from '../src/providers/pi/sandbox.ts';
 import { createAgentRuntime } from '../src/runtime/index.ts';
-import { createErrorRedactor } from '../src/server/redaction.ts';
+import { createCommandRedactor } from '../src/server/redaction.ts';
 import type { WorkspaceCommandRecord } from '../src/shared/execution.ts';
 import { Type } from '@sinclair/typebox';
 import { fakeComputer, fakeWorkspace, fakeExecution } from './runtime-fixtures.ts';
@@ -2060,7 +2060,7 @@ test('the owner command stream records exit status and output without known secr
     { command: `echo ${secret}; echo password=synthetic-assigned-value; exit 3` },
     { command: `echo late-${secret}; sleep 5`, timeout: 1 },
   ];
-  const run = async (redactError?: (text: string) => string) => {
+  const run = async (redactCommand?: (text: string) => string) => {
     let step = 0;
     const events: Array<{ type: string; command?: WorkspaceCommandRecord }> = [];
     const runtime = createAgentRuntime({
@@ -2104,7 +2104,7 @@ test('the owner command stream records exit status and output without known secr
       }),
       computer: fakeComputer(),
       workspace: fakeWorkspace({ open: () => workspace }),
-      redactError,
+      redactCommand,
     });
     try {
       await runtime.runTurn({
@@ -2120,7 +2120,7 @@ test('the owner command stream records exit status and output without known secr
     }
     return events.filter((event) => event.command);
   };
-  const records = await run(createErrorRedactor([secret]));
+  const records = await run(createCommandRedactor([secret]));
   assert.deepEqual(
     records.map(({ type, command }) => [type, command?.command, command?.exitCode]),
     [

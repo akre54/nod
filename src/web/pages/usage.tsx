@@ -425,10 +425,17 @@ function TrustLog({
   const [range, setRange] = useState<[number, number]>([0, stepOverscan * 2]);
   const [error, setError] = useState('');
   const [commandId, setCommandId] = useState<string | null>(null);
-  const loading = useRef(new Set<number>());
+  const loading = useRef(new Map<number, AbortController>());
   const list = useRef<HTMLOListElement>(null);
   useEffect(() => {
+    const pending = loading.current;
+    for (const controller of pending.values()) controller.abort();
+    pending.clear();
     setPages((current) => (current.size ? new Map() : current));
+    return () => {
+      for (const controller of pending.values()) controller.abort();
+      pending.clear();
+    };
   }, [first.data]);
   useEffect(() => {
     const target = list.current;
@@ -467,15 +474,23 @@ function TrustLog({
     const to = Math.floor(Math.max(range[1] - 1, 0) / stepPage);
     for (let page = Math.max(from, 1); page <= to; page++) {
       if (pages.has(page) || loading.current.has(page)) continue;
-      loading.current.add(page);
-      api<StepPage>(`${path}?offset=${page * stepPage}`)
+      const controller = new AbortController();
+      loading.current.set(page, controller);
+      api<StepPage>(`${path}?offset=${page * stepPage}`, { signal: controller.signal })
         .then(
-          (result) => setPages((current) => new Map(current).set(page, result.steps)),
-          (cause) => setError(errorMessage(cause)),
+          (result) => {
+            if (!controller.signal.aborted)
+              setPages((current) => new Map(current).set(page, result.steps));
+          },
+          (cause) => {
+            if (!controller.signal.aborted) setError(errorMessage(cause));
+          },
         )
-        .finally(() => loading.current.delete(page));
+        .finally(() => {
+          if (loading.current.get(page) === controller) loading.current.delete(page);
+        });
     }
-  }, [error, pages, path, range, total]);
+  }, [error, first.data, pages, path, range, total]);
   const stepAt = (index: number) =>
     index < stepPage
       ? first.data?.steps[index]

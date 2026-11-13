@@ -140,8 +140,7 @@ const commandOutputChars = 16_000;
 const omittedOutput = '[Earlier output omitted]\n';
 
 function commandOutput(redact: (text: string) => string, text: string) {
-  const start = Math.max(0, text.length - 64_000);
-  const safe = redact(start ? text.slice(text.indexOf('\n', start) + 1 || start) : text);
+  const safe = redact(text);
   return safe.length > commandOutputChars
     ? `${omittedOutput}${safe.slice(-(commandOutputChars - omittedOutput.length))}`
     : safe;
@@ -180,6 +179,7 @@ export function createAgentRuntime(dependencies: {
   skills?: SkillLibrary;
   documentation?: Documentation;
   redactError?(text: string): string;
+  redactCommand?(text: string): string;
   observe?(turnId: string, event: RuntimeObservation): void;
   keepWarm?(threadId: string): Promise<boolean>;
   prepareMemory?(
@@ -474,7 +474,7 @@ export function createAgentRuntime(dependencies: {
           name === 'browser' && typeof (params as { action?: unknown })?.action === 'string'
             ? `${label} ${(params as { action: string }).action}`
             : label;
-        const redactCommand = name === 'bash' ? dependencies.redactError : undefined;
+        const redactCommand = name === 'bash' ? dependencies.redactCommand : undefined;
         const commandLine = (params as { command?: unknown } | null)?.command;
         const command =
           redactCommand && typeof commandLine === 'string'
