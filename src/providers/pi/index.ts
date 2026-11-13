@@ -579,14 +579,20 @@ export function createPiAgent(options: {
             const result = await input.runTool(
               definition.name,
               params,
-              () =>
-                id.includes('/')
+              async () => {
+                const output = await (id.includes('/')
                   ? definition.execute(id, params, signal, onUpdate, context)
                   : boundedOutput(
                       definition.name,
                       () => definition.execute(id, params, signal, onUpdate, context),
                       signal,
-                    ),
+                    ));
+                const exitCode = (output.structuredContent as { exit_code?: unknown } | undefined)
+                  ?.exit_code;
+                return definition.name === 'bash' && Number.isInteger(exitCode)
+                  ? { ...output, exitCode: exitCode as number }
+                  : output;
+              },
               { nested: id.includes('/') },
             );
             return { ...result, details: result.details ?? {} };

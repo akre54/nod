@@ -7,10 +7,17 @@ export interface ExecutionScope {
   browserId: string;
 }
 
+export interface WorkspaceCommandRecord {
+  command?: string;
+  exitCode?: number;
+  output?: string;
+}
+
 export interface ExecutionEvent {
   execution: ExecutionScope;
   callId?: string;
   site?: string;
+  command?: WorkspaceCommandRecord;
 }
 
 export interface UsageDetails {

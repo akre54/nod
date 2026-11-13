@@ -319,6 +319,16 @@ export interface TaskDetail {
     createdAt: string;
   }>;
 }
+export interface WorkspaceCommand {
+  id: string;
+  command: string;
+  state: 'running' | 'finished' | 'failed' | 'interrupted';
+  exitCode: number | null;
+  output: string;
+  helper: boolean;
+  startedAt: string;
+  finishedAt: string | null;
+}
 export interface Schedule {
   id: string;
   title: string;

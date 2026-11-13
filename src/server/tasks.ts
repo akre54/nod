@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import type { Pool, PoolClient } from 'pg';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import type { Task, TaskDetail, TaskStatus } from '../shared/contracts.ts';
+import type { Task, TaskDetail, TaskStatus, WorkspaceCommand } from '../shared/contracts.ts';
 import { actionTitle, toolTitle } from './action-presentation.ts';
 import type { ChannelPresentation } from './channels.ts';
 import { classifyVerificationReply } from '../shared/verification-code.ts';
@@ -732,6 +732,59 @@ export function createTasks(options: {
           : { ...event, summary: toolTitle(event.summary) };
       });
       return { task, events };
+    });
+    app.get<{ Params: { id: string } }>('/api/tasks/:id/commands', async (request) => {
+      const id = z.uuid().parse(request.params.id);
+      const task = await pool.query('SELECT 1 FROM tasks WHERE id=$1 AND owner_id=$2', [
+        id,
+        ownerId,
+      ]);
+      if (!task.rowCount) throw failure('Task not found.', 404);
+      const { rows } = await pool.query<{
+        id: string;
+        command: string;
+        ended: string | null;
+        result: { exitCode?: number; output?: string } | null;
+        running: boolean;
+        helper: boolean;
+        startedAt: Date;
+        finishedAt: Date | null;
+      }>(
+        `SELECT * FROM (
+           SELECT s.id,s.command->>'command' AS command,e.type AS ended,e.command AS result,
+             u.status='running' AS running,s.parent_run_id IS NOT NULL AS helper,
+             s.created_at AS "startedAt",e.created_at AS "finishedAt"
+           FROM turn_events s JOIN turns u ON u.id=s.turn_id
+           LEFT JOIN LATERAL (
+             SELECT c.type,c.command,c.created_at FROM turn_events c
+             WHERE c.turn_id=s.turn_id AND c.call_id=s.call_id AND c.type IN ('tool_complete','tool_failed')
+             ORDER BY c.created_at LIMIT 1
+           ) e ON true
+           WHERE u.task_id=$1 AND u.owner_id=$2 AND s.type='tool_start'
+             AND s.call_id IS NOT NULL AND s.command->>'command' IS NOT NULL
+           ORDER BY s.created_at DESC,s.id DESC LIMIT 200
+         ) recent ORDER BY "startedAt",id`,
+        [id, ownerId],
+      );
+      return {
+        commands: rows.map((row): WorkspaceCommand => ({
+          id: row.id,
+          command: row.command,
+          state:
+            row.ended === 'tool_complete'
+              ? 'finished'
+              : row.ended === 'tool_failed'
+                ? 'failed'
+                : row.running
+                  ? 'running'
+                  : 'interrupted',
+          exitCode: typeof row.result?.exitCode === 'number' ? row.result.exitCode : null,
+          output: typeof row.result?.output === 'string' ? row.result.output : '',
+          helper: row.helper,
+          startedAt: row.startedAt.toISOString(),
+          finishedAt: row.finishedAt?.toISOString() ?? null,
+        })),
+      };
     });
     app.post<{ Params: { id: string } }>('/api/tasks/:id/stop', async (request) => {
       const capture = snapshotAnalytics(options.analytics);

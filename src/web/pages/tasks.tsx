@@ -11,10 +11,17 @@ import {
   Globe2,
   Hourglass,
   LoaderCircle,
+  LockKeyhole,
   MessageCircle,
   MessageSquare,
 } from '../components/icons';
-import type { Activity, Schedule, Task, TaskDetail } from '../../shared/contracts';
+import type {
+  Activity,
+  Schedule,
+  Task,
+  TaskDetail,
+  WorkspaceCommand,
+} from '../../shared/contracts';
 import { taskHeadline, taskLabels } from '../../shared/task-status';
 import { InlineName } from '../components/inline-name';
 import { pageDataCache } from '../lib/page-data-cache';
@@ -91,6 +98,61 @@ function TaskActivity({ id }: { id: string }) {
   );
 }
 
+function commandStatus(command: WorkspaceCommand) {
+  if (command.state === 'running') return { Icon: LoaderCircle, text: 'May still be running' };
+  if (command.state === 'interrupted')
+    return { Icon: CircleSlash, text: 'Ended before it finished' };
+  if (command.state === 'failed') return { Icon: CircleAlert, text: 'Ended without an exit code' };
+  if (command.exitCode === null) return { Icon: CircleCheck, text: 'Finished' };
+  return {
+    Icon: command.exitCode ? CircleAlert : CircleCheck,
+    text: `Exit code ${command.exitCode}`,
+  };
+}
+
+function TaskCommands({ id }: { id: string }) {
+  const data = usePageData<{ commands: WorkspaceCommand[] }>(`/api/tasks/${id}/commands`);
+  const commands = data.data?.commands ?? [];
+  return (
+    <section className="task-commands" aria-label="Workspace commands">
+      <p className="task-commands-where">
+        <LockKeyhole size={14} aria-hidden="true" />
+        Nod runs these in its isolated workspace, not on your computer. You can watch, not type.
+      </p>
+      {data.error ? (
+        <Notice>Could not load commands.</Notice>
+      ) : !data.data ? (
+        <Loading label="Loading commands…" />
+      ) : !commands.length ? (
+        <p className="task-preview-meta">No commands yet.</p>
+      ) : (
+        <ol role="list">
+          {commands.map((command) => {
+            const { Icon, text } = commandStatus(command);
+            return (
+              <li key={command.id} data-state={command.state} data-exit={command.exitCode ?? ''}>
+                <pre className="task-command-line">
+                  <span aria-hidden="true">$ </span>
+                  {command.command}
+                </pre>
+                {command.output && <pre className="task-command-output">{command.output}</pre>}
+                <p className="task-command-status">
+                  <Icon
+                    size={14}
+                    aria-hidden="true"
+                    className={command.state === 'running' ? 'spin' : undefined}
+                  />
+                  {command.helper ? `Helper · ${text}` : text}
+                </p>
+              </li>
+            );
+          })}
+        </ol>
+      )}
+    </section>
+  );
+}
+
 export function TaskCard({
   task,
   live,
@@ -130,6 +192,7 @@ export function TaskCard({
     return () => window.removeEventListener('nod:open-task', open);
   }, [inChat, task.id]);
   const [showActivity, setShowActivity] = useState(false);
+  const [showCommands, setShowCommands] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [error, setError] = useState('');
   const format = useDateFormat();
@@ -340,6 +403,17 @@ export function TaskCard({
               >
                 {showActivity ? 'Hide activity' : 'Show activity'}
               </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-expanded={showCommands}
+                onClick={() => {
+                  if (!showCommands) captureAnalytics('task_action', { action: 'show_commands' });
+                  setShowCommands(!showCommands);
+                }}
+              >
+                {showCommands ? 'Hide commands' : 'Show commands'}
+              </Button>
               {!closed(task) && (
                 <Button
                   variant="ghost"
@@ -364,6 +438,7 @@ export function TaskCard({
             </div>
             {error && <Notice>{error}</Notice>}
             {showActivity && <TaskActivity id={task.id} />}
+            {showCommands && <TaskCommands id={task.id} />}
             {task.status === 'done' && <ScheduleTask taskId={task.id} onCreated={onScheduled} />}
           </div>
         </div>

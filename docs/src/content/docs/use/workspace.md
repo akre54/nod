@@ -47,6 +47,26 @@ flowchart LR
 The workspace can reach the internet. Code that Nod runs there can download files and call websites.
 :::
 
+## Watch Nod's commands
+
+You can watch the commands a task runs in the workspace. Open the task's preview in chat and select **Show commands**.
+
+Each entry shows the command, the end of its output, and how it ended:
+
+| Status                         | What it means                                                          |
+| ------------------------------ | ---------------------------------------------------------------------- |
+| **Exit code 0**                | The command finished without an error                                  |
+| **Exit code** and a number     | The command finished with an error. The output usually says why        |
+| **Ended without an exit code** | The command timed out or was cancelled                                 |
+| **May still be running**       | The task is still working and the command hasn't reported back         |
+| **Ended before it finished**   | The task stopped, for example after **Stop**, before the command ended |
+
+Commands from a task's helpers start with **Helper**. The list shows the latest 200 commands and the last 16,000 characters of each output.
+
+The view is read-only. It shows only commands from the workspace, never from your computer, and you can't type commands there. To stop a command, stop the task.
+
+Before an entry is saved, Nod removes known secrets from the command and its output, such as provider keys, tokens and values assigned to names like `password`. It can't recognize every secret, so a value Nod doesn't know about can still appear.
+
 ## Give Nod files
 
 - **Attach them in chat.** Each file can be 90 MB or smaller. Nod gets a copy in the workspace and sees images directly.

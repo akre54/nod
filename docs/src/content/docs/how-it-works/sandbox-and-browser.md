@@ -75,6 +75,8 @@ Every command goes through a small supervisor inside the container, in [`src/pro
 
 Up to 1 MiB of output reaches Pi. Pi shows the model the tail, and codemode scripts get the whole output and the exit code. Larger output keeps its first and last 512 KiB and names the complete log in the workspace.
 
+For the task's command view, the runtime also saves each `bash` command with its exit code and the last 16,000 characters of what Pi received. It removes known secrets first with the same redactor as tool errors, and records nothing when no redactor is set. The record sits on the call's `tool_start` and `tool_complete` or `tool_failed` rows in `turn_events`, and only the owner's task route reads it. See [Watch Nod's commands](/use/workspace/#watch-nods-commands).
+
 Pi writes truncated output, codemode files and images, and extracted web PDFs to the server's temp folder. The runtime moves each file into the workspace's `.nod/outputs` folder and rewrites its path before the result is recorded. See [`src/providers/pi/sandbox.ts`](https://github.com/n8n-io/nod/blob/main/src/providers/pi/sandbox.ts).
 
 ## Connected CLIs

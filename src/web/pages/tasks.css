@@ -422,3 +422,49 @@
   color: var(--muted-foreground);
   font-size: 12px;
 }
+.task-commands {
+  display: grid;
+  gap: 8px;
+  font-size: var(--text-control);
+}
+.task-commands-where {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  color: var(--text-secondary);
+}
+.task-commands ol {
+  display: grid;
+  gap: 12px;
+  max-height: 24rem;
+  overflow: auto;
+  margin: 0;
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--surface-inset);
+  list-style: none;
+}
+.task-command-line,
+.task-command-output {
+  margin: 0;
+  font-family: var(--font-mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.task-command-output {
+  max-height: 12rem;
+  overflow: auto;
+  color: var(--text-secondary);
+}
+.task-command-status {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 4px 0 0;
+  color: var(--muted-foreground);
+}
+.task-commands [data-state='failed'] svg,
+.task-commands [data-state='finished']:not([data-exit='0'], [data-exit='']) svg {
+  color: var(--error);
+}
