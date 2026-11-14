@@ -3,15 +3,27 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import type { FastifyInstance } from 'fastify';
 import type { Pool, PoolClient } from 'pg';
 import { z } from 'zod';
+import type { Nodes } from 'mdast';
+import { unified } from 'unified';
+import remarkParse from 'remark-parse';
+import remarkGfm from 'remark-gfm';
 import type { Agent, AgentSessionOptions } from '../ports/agent.ts';
 import type { ExecutionScope } from '../shared/execution.ts';
 import type { ProviderUsageEvent, UsageTelemetry } from '../ports/provider-usage.ts';
 import type { MemoryCurator } from '../ports/memory-curator.ts';
 import type { DecisionModel } from '../ports/decisions.ts';
 import type { SpeechProvider } from '../ports/speech.ts';
-import type { TrustAction, TrustEntry, TrustOutside, TrustView } from '../shared/trust.ts';
+import type {
+  TrustAction,
+  TrustEntry,
+  TrustOutside,
+  TrustStep,
+  TrustView,
+} from '../shared/trust.ts';
+import { trustStepPage as stepPage } from '../shared/trust.ts';
 import { becauseOf, type TrustBasis } from './trust-basis.ts';
-import { actionTitle } from './action-presentation.ts';
+import { recordedAction, toolTitle } from './action-presentation.ts';
+import { workspaceCommandsSql, workspaceCommand } from './workspace-commands.ts';
 import { formattingLocale, localeRegion, timeZoneRegion } from '../shared/date-locale.ts';
 import type { UsageReport } from './usage-report.ts';
 import { afterCommit, transaction } from './transaction.ts';
@@ -23,6 +35,7 @@ export const spendingLimitText = (monthlyUsd: number) =>
   `This month’s $${Number.isInteger(monthlyUsd) ? monthlyUsd : monthlyUsd.toFixed(2)} spending limit is reached.`;
 const defaultTaskUsd = 5;
 const newOwnerMonthlyUsd = 200;
+const defaultPreparationUsd = 5;
 const usd = z
   .number()
   .min(1)
@@ -31,26 +44,67 @@ const usd = z
       Number.isSafeInteger(Math.round(value * 100)) && Math.round(value * 100) / 100 === value,
   )
   .nullable();
+export const activityRange = z
+  .object({
+    from: z.iso.date().optional(),
+    to: z.iso.date().optional(),
+    session: z.uuid().optional(),
+  })
+  .strict();
+export type ActivityRange = z.infer<typeof activityRange>;
 export const limitsInput = z
-  .object({ monthlyUsd: usd.optional(), taskUsd: usd.optional() })
+  .object({
+    monthlyUsd: usd.optional(),
+    taskUsd: usd.optional(),
+    preparationUsd: usd.unwrap().optional(),
+  })
   .strict()
   .refine((value) => Object.keys(value).length > 0, 'Choose a limit to change.');
 
 const zone = `COALESCE((SELECT time_zone FROM preferences WHERE owner_id=$1),'UTC')`;
 const monthStart = `(date_trunc('month', now() AT TIME ZONE ${zone}) AT TIME ZONE ${zone})`;
-const spentThisMonth = `COALESCE((SELECT sum(cost_usd::numeric) FROM model_usage WHERE owner_id=$1 AND created_at>=${monthStart}),0)::float8`;
+const spentThisMonth = `COALESCE((SELECT sum(cost_usd::text::numeric) FROM model_usage WHERE owner_id=$1 AND created_at>=${monthStart}),0)::float8`;
 const pageSize = 30;
 const planUsage = `(cost_usd IS NULL AND (details->>'estimateUsd')::float8>0)`;
 const unpricedUsage = `(details->>'status'='succeeded' AND COALESCE(cost_usd,(details->>'estimateUsd')::float8,0)=0)`;
 const cost = (value: number | null | undefined) =>
   typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+const titleMarkdown = unified().use(remarkParse).use(remarkGfm);
+
+function visibleText(node: Nodes): string {
+  if (node.type === 'html') return '';
+  if (node.type === 'image') return node.alt ?? '';
+  if (node.type === 'break') return '\n';
+  if ('value' in node) return node.value;
+  if ('children' in node)
+    return node.children
+      .map(visibleText)
+      .join(
+        node.type === 'tableRow'
+          ? ' | '
+          : ['root', 'blockquote', 'list', 'listItem', 'table'].includes(node.type)
+            ? '\n'
+            : '',
+      );
+  return '';
+}
+
+function messageTitle(value: string | null) {
+  const excerpt = value?.trim().slice(0, 2_000);
+  return excerpt
+    ? (visibleText(titleMarkdown.parse(excerpt)).trim().split('\n', 1)[0]?.trim().slice(0, 120) ??
+        '')
+    : '';
+}
 
 function describe(row: Record<string, any>): Pick<TrustEntry, 'title' | 'source'> {
   const id: string = row.source_id ?? '';
   const first = (text: string | null) => text?.trim().split('\n')[0]?.slice(0, 120);
   const task = row.task as { title: string; started: boolean } | null;
-  if (row.source === 'user') return { source: 'chat', title: first(row.text) || 'Your message' };
-  if (row.source === 'task') return { source: 'task', title: first(row.text) || 'Task work' };
+  if (row.source === 'user')
+    return { source: 'chat', title: messageTitle(row.text) || 'Your message' };
+  if (row.source === 'task')
+    return { source: 'task', title: messageTitle(row.text) || 'Task work' };
   if (row.source === 'schedule')
     return { source: 'schedule', title: first(row.schedule) || 'Scheduled task' };
   if (id.startsWith('task-check:'))
@@ -66,9 +120,7 @@ function describe(row: Record<string, any>): Pick<TrustEntry, 'title' | 'source'
   if (id.startsWith('proactivity:'))
     return {
       source: 'check',
-      title: row.screened
-        ? 'Checked sources, nothing new to prepare'
-        : 'Checked sources and prepared work',
+      title: row.screened ? 'Checked source changes' : 'Assessed source changes',
     };
   if (id.startsWith('activity-check:'))
     return { source: 'check', title: 'Checked a connected app' };
@@ -77,7 +129,101 @@ function describe(row: Record<string, any>): Pick<TrustEntry, 'title' | 'source'
   return { source: 'event', title: 'Woke for an email or app event' };
 }
 
-function modelUsed(usage: ProviderUsageEvent): Parameters<CaptureAnalytics>[0] {
+function reasonOf(basis: TrustBasis | null, said: boolean, whole: boolean | null) {
+  const reason = becauseOf(basis, said);
+  return reason?.kind === 'message' && whole ? { ...reason, whole: true as const } : reason;
+}
+
+const modelKinds: Record<string, string> = {
+  review: 'Check',
+  memory: 'Memory',
+  task_classification: 'Sorting',
+  tasks: 'Planning',
+};
+
+const tokens = (value: unknown) => {
+  const count = typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+  return count >= 1000 ? `${(count / 1000).toFixed(1).replace(/\.0$/, '')}k` : String(count);
+};
+
+function presentStep(row: Record<string, any>): TrustStep {
+  const at = row.at.toISOString();
+  const helper = row.helper ? { helper: true as const } : {};
+  if (row.kind === 'command') {
+    const command: TrustStep['command'] = row.command;
+    return {
+      at,
+      kind: 'tool',
+      title: 'Workspace command',
+      command,
+      ...(command?.state === 'failed' || (command?.exitCode != null && command.exitCode !== 0)
+        ? { failed: true as const }
+        : {}),
+      ...helper,
+    };
+  }
+  if (row.kind === 'model') {
+    const usage = row.usage ?? {};
+    const input =
+      (Number(usage.inputTokens) || 0) +
+      (Number(usage.cacheReadTokens) || 0) +
+      (Number(usage.cacheWriteTokens) || 0);
+    const output = Number(usage.outputTokens) || 0;
+    const plan = row.cost === null && Number(usage.estimateUsd) > 0 ? 'ChatGPT plan' : '';
+    return {
+      at,
+      kind: 'model',
+      title: [modelKinds[usage.category], usage.model || 'Model'].filter(Boolean).join(' · '),
+      ...(input || output || plan
+        ? {
+            detail: [input || output ? `${tokens(input)} in · ${tokens(output)} out` : '', plan]
+              .filter(Boolean)
+              .join(' · '),
+          }
+        : {}),
+      ...(row.cost > 0 ? { costUsd: row.cost } : {}),
+      ...(usage.status === 'failed' ? { failed: true as const } : {}),
+      ...helper,
+    };
+  }
+  if (row.kind === 'action') {
+    const because = reasonOf(row.basis, row.said, row.whole);
+    const { label, target } = recordedAction(row.summary, row.detail);
+    return {
+      at,
+      kind: 'action',
+      title: label,
+      ...(target ? { detail: target } : {}),
+      ...(because ? { because } : {}),
+      ...helper,
+    };
+  }
+  if (row.kind === 'reply')
+    return {
+      at,
+      kind: 'reply',
+      title: 'Replied',
+      detail: String(row.summary)
+        .split('\n')[0]!
+        .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+        .replaceAll('**', ''),
+    };
+  if (row.type === 'step' || row.type === 'thought')
+    return { at, kind: 'note', title: String(row.summary).slice(0, 500), ...helper };
+  return {
+    at,
+    kind: 'tool',
+    title: toolTitle(String(row.summary)),
+    ...(row.detail ? { detail: String(row.detail) } : {}),
+    ...(row.type === 'tool_failed' ? { failed: true as const } : {}),
+    ...helper,
+  };
+}
+
+function modelUsed(
+  usage: ProviderUsageEvent,
+  execution?: (ExecutionScope & Pick<AgentSessionOptions, 'restricted'>) | null,
+): Parameters<CaptureAnalytics>[0] {
   const tokens = (value: number | undefined) =>
     typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
   const charged = cost(usage.costUsd);
@@ -93,6 +239,25 @@ function modelUsed(usage: ProviderUsageEvent): Parameters<CaptureAnalytics>[0] {
     properties: {
       ...analyticsModel(usage.provider, usage.model),
       purpose: usage.category,
+      request_kind:
+        usage.category !== 'agent'
+          ? usage.category
+          : usage.operation === 'compaction' || usage.operation === 'cache_warm'
+            ? usage.operation
+            : usage.operation !== 'request'
+              ? 'auxiliary'
+              : execution?.parentRunId
+                ? 'helper'
+                : execution?.restricted
+                  ? 'observer'
+                  : execution
+                    ? execution.sessionId === execution.threadId
+                      ? 'chat'
+                      : 'task'
+                    : 'unclassified',
+      ...(Number.isSafeInteger(usage.attempt) && usage.attempt! > 0 && usage.attempt! <= 4
+        ? { attempt: usage.attempt }
+        : {}),
       outcome: usage.status,
       input_tokens:
         tokens(usage.inputTokens) + tokens(usage.cacheReadTokens) + tokens(usage.cacheWriteTokens),
@@ -122,6 +287,8 @@ export function createLedger({
 }) {
   const activeTurn = new AsyncLocalStorage<{ id: string; automatic: boolean }>();
   const pastLimit = new AsyncLocalStorage<true>();
+  const preparation = new AsyncLocalStorage<{ id: string; closed?: boolean }>();
+  let preparationDeclined: { month: number; maximumUsd: number } | undefined;
   const activeExecution = new AsyncLocalStorage<
     ExecutionScope & Pick<AgentSessionOptions, 'onEvent'>
   >();
@@ -144,13 +311,28 @@ export function createLedger({
       action text NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
     );
     ALTER TABLE app_actions ADD COLUMN IF NOT EXISTS basis jsonb;
+    ALTER TABLE app_actions ADD COLUMN IF NOT EXISTS target text;
+    ALTER TABLE app_actions ADD COLUMN IF NOT EXISTS parent_run_id uuid;
     CREATE INDEX IF NOT EXISTS app_actions_owner_time ON app_actions(owner_id,created_at);
     CREATE INDEX IF NOT EXISTS app_actions_turn ON app_actions(turn_id);
     CREATE TABLE IF NOT EXISTS spending_limits (
       owner_id text PRIMARY KEY, monthly_usd double precision CHECK (monthly_usd > 0)
     );
     ALTER TABLE spending_limits ADD COLUMN IF NOT EXISTS task_usd double precision
-      DEFAULT ${defaultTaskUsd} CHECK (task_usd > 0);`);
+      DEFAULT ${defaultTaskUsd} CHECK (task_usd > 0);
+    ALTER TABLE spending_limits ADD COLUMN IF NOT EXISTS preparation_usd double precision
+      DEFAULT ${defaultPreparationUsd} CHECK (preparation_usd > 0);
+    CREATE TABLE IF NOT EXISTS preparation_reservations (
+      owner_id text NOT NULL, id uuid NOT NULL, month timestamptz NOT NULL,
+      maximum_usd numeric NOT NULL CHECK (maximum_usd >= 0),
+      PRIMARY KEY(owner_id,id,month)
+    );
+    DO $$ BEGIN
+      IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid='preparation_reservations'::regclass
+        AND attname='maximum_usd' AND atttypid='double precision'::regtype AND NOT attisdropped) THEN
+        ALTER TABLE preparation_reservations ALTER COLUMN maximum_usd TYPE numeric USING maximum_usd::text::numeric;
+      END IF;
+    END $$;`);
   }
 
   function save(sql: string, values: unknown[]) {
@@ -179,6 +361,8 @@ export function createLedger({
     execution: ExecutionScope | null | undefined = activeExecution.getStore(),
   ) {
     const { id, costUsd, turnId, ...details } = usage;
+    if (preparation.getStore())
+      Object.assign(details, { preparation: true, preparationId: preparation.getStore()!.id });
     const attributedTurn =
       execution === null
         ? null
@@ -196,24 +380,146 @@ export function createLedger({
       JSON.stringify(details),
     ];
     const pending = pool.query(usageSql, values).then(
-      () => {
+      async () => {
         pendingUsage.delete(id);
+        const scope = preparation.getStore();
+        if (scope?.closed) await releasePreparation(scope.id);
       },
       (error) => logFailure('ledger_usage_failed', error, { turnId: attributedTurn }),
     );
     pendingUsage.set(id, { values, pending });
-    analytics?.(modelUsed(usage));
+    analytics?.(modelUsed(usage, execution));
     telemetry?.record({ ...usage, turnId: attributedTurn ?? undefined });
   }
 
+  async function preparationLimit(database: Pick<PoolClient, 'query'> = pool) {
+    const { rows } = await database.query(
+      `WITH budget AS (SELECT COALESCE((SELECT preparation_usd FROM spending_limits WHERE owner_id=$1),${defaultPreparationUsd})::text::numeric AS maximum, ${monthStart} AS month,
+        COALESCE((SELECT sum(COALESCE(cost_usd::text::numeric,(details->>'estimateUsd')::numeric,0)) FROM model_usage
+          WHERE owner_id=$1 AND created_at>=${monthStart} AND details->>'preparation'='true'),0) AS spent,
+        COALESCE((SELECT sum(GREATEST(0,r.maximum_usd-COALESCE((SELECT sum(COALESCE(m.cost_usd::text::numeric,(m.details->>'estimateUsd')::numeric,0))
+          FROM model_usage m WHERE m.owner_id=$1 AND m.details->>'preparationId'=r.id::text AND m.created_at>=r.month),0)))
+          FROM preparation_reservations r WHERE r.owner_id=$1 AND r.month=${monthStart}),0) AS reserved)
+        SELECT maximum::float8,spent::float8,reserved::float8,
+          spent+reserved>=maximum OR (COALESCE(month=$2::timestamptz,false) AND spent+reserved+$3::numeric>maximum) AS reached
+        FROM budget`,
+      [
+        ownerId,
+        preparationDeclined ? new Date(preparationDeclined.month) : null,
+        preparationDeclined?.maximumUsd ?? 0,
+      ],
+    );
+    return {
+      monthlyUsd: rows[0].maximum as number,
+      spentUsd: rows[0].spent as number,
+      reservedUsd: rows[0].reserved as number,
+      reached: rows[0].reached as boolean,
+    };
+  }
+
+  async function reserve(maximum: number | null | (() => number | null)) {
+    const scope = preparation.getStore();
+    if (!scope) return async () => {};
+    if (scope.closed) throw new Error('This automatic preparation has stopped.');
+    const maximumUsd = typeof maximum === 'function' ? maximum() : maximum;
+    if (maximumUsd === null || !Number.isFinite(maximumUsd) || maximumUsd < 0)
+      throw new Error('Automatic preparation stopped because this model has no cost estimate.');
+    await flushUsage();
+    let month: Date | undefined;
+    await transaction(async (client) => {
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [
+        `preparation-budget:${ownerId}`,
+      ]);
+      await client.query(
+        `DELETE FROM preparation_reservations WHERE owner_id=$1 AND month<${monthStart}`,
+        [ownerId],
+      );
+      const { rows } = await client.query(
+        `WITH budget AS (SELECT COALESCE((SELECT preparation_usd FROM spending_limits WHERE owner_id=$1),${defaultPreparationUsd})::text::numeric AS maximum,
+          ${monthStart} AS month,
+          COALESCE((SELECT proactive_paused FROM preferences WHERE owner_id=$1),true) AS paused,
+          (COALESCE((SELECT sum(COALESCE(m.cost_usd::text::numeric,(m.details->>'estimateUsd')::numeric,0)) FROM model_usage m
+            WHERE m.owner_id=$1 AND m.created_at>=${monthStart} AND m.details->>'preparation'='true'
+              AND NOT EXISTS(SELECT 1 FROM preparation_reservations r WHERE r.owner_id=$1 AND r.id::text=m.details->>'preparationId' AND r.month=${monthStart})),0)
+          + COALESCE((SELECT sum(GREATEST(r.maximum_usd,COALESCE((SELECT sum(COALESCE(m.cost_usd::text::numeric,(m.details->>'estimateUsd')::numeric,0))
+            FROM model_usage m WHERE m.owner_id=$1 AND m.details->>'preparationId'=r.id::text AND m.created_at>=r.month),0)))
+            FROM preparation_reservations r WHERE r.owner_id=$1 AND r.month=${monthStart}),0)) AS committed)
+          SELECT maximum::float8,month,paused,committed>=maximum OR committed+$2::numeric>maximum AS exceeded FROM budget`,
+        [ownerId, maximumUsd],
+      );
+      if (scope.closed) throw new Error('This automatic preparation has stopped.');
+      if (rows[0].paused && activeTurn.getStore()?.automatic !== false)
+        throw new Error('Automatic preparation is paused.');
+      month = rows[0].month;
+      if (rows[0].exceeded) {
+        preparationDeclined = { month: rows[0].month.getTime(), maximumUsd };
+        throw new Error(
+          `The next model request does not fit the $${rows[0].maximum} monthly preparation allowance. Change the preparation limit in Usage to continue.`,
+        );
+      }
+      preparationDeclined = undefined;
+      await client.query(
+        `INSERT INTO preparation_reservations(owner_id,id,month,maximum_usd) VALUES($1,$2,$3,$4)
+          ON CONFLICT(owner_id,id,month) DO UPDATE SET maximum_usd=preparation_reservations.maximum_usd+EXCLUDED.maximum_usd`,
+        [ownerId, scope.id, rows[0].month, maximumUsd],
+      );
+    }, pool);
+    let settled = false;
+    const settle = async (spentUsd: number | null) => {
+      if (settled || spentUsd === null || !Number.isFinite(spentUsd) || spentUsd < 0) return;
+      settled = true;
+      await pool
+        .query(
+          'UPDATE preparation_reservations SET maximum_usd=GREATEST(0,maximum_usd+$4::numeric-$5::numeric) WHERE owner_id=$1 AND id=$2 AND month=$3',
+          [ownerId, scope.id, month, spentUsd, maximumUsd],
+        )
+        .catch((error) => logFailure('preparation_reservation_settle', error));
+      if (scope.closed) await releasePreparation(scope.id);
+    };
+    if (scope.closed) {
+      await settle(0);
+      throw new Error('This automatic preparation has stopped.');
+    }
+    return settle;
+  }
+
+  async function releasePreparation(id: string) {
+    await pool
+      .query(
+        `DELETE FROM preparation_reservations r WHERE r.owner_id=$1 AND r.id=$2
+        AND r.maximum_usd<=COALESCE((SELECT sum(COALESCE(m.cost_usd::text::numeric,(m.details->>'estimateUsd')::numeric,0))
+          FROM model_usage m WHERE m.owner_id=$1 AND m.details->>'preparationId'=$2::text
+          AND m.created_at>=r.month),0)`,
+        [ownerId, id],
+      )
+      .catch((error) => logFailure('preparation_reservation_release', error));
+  }
+
+  async function withPreparation<T>(id: string, run: () => Promise<T>): Promise<T> {
+    const scope = { id, closed: false };
+    return preparation.run(scope, async () => {
+      try {
+        return await run();
+      } finally {
+        scope.closed = true;
+        try {
+          await flushUsage();
+        } finally {
+          await releasePreparation(id);
+        }
+      }
+    });
+  }
   function agent(base: Agent): Agent {
     return {
       ...base,
       open: async (session) => {
         if (await limitReached()) throw new Error(spendingLimitReached);
+        let attempt = 1;
         const opened = await base.open({
           ...session,
           onEvent(event) {
+            if (event.type === 'retry') attempt = event.attempt + 1;
             if (event.type === 'model_usage') {
               const { type: _, costSource, totalTokens: __, createdAt: ___, ...value } = event;
               record(
@@ -222,12 +528,14 @@ export function createLedger({
                   turnId: session.turnId,
                   category: 'agent',
                   operation: 'request',
+                  attempt,
                   status: value.status ?? 'succeeded',
                   durationMs: Math.max(0, Date.now() - Date.parse(event.createdAt)) || 0,
                   pricing: costSource,
                 },
                 session,
               );
+              if (value.status !== 'failed') attempt = 1;
             }
             if (event.type === 'provider_usage')
               record({ ...event.usage, turnId: session.turnId }, session);
@@ -237,6 +545,7 @@ export function createLedger({
         return {
           ...opened,
           async prompt(...args) {
+            attempt = 1;
             try {
               await activeExecution.run(session, () => opened.prompt(...args));
             } finally {
@@ -328,11 +637,18 @@ export function createLedger({
     };
   }
 
-  function action(turnId: string, name: string, basis: TrustBasis) {
+  function action(turnId: string, name: string, basis: TrustBasis, target?: string) {
     return save(
-      `INSERT INTO app_actions(owner_id,turn_id,action,basis)
-       SELECT $1,id,$3,$4 FROM turns WHERE id=$2 AND owner_id=$1`,
-      [ownerId, turnId, name.slice(0, 200), JSON.stringify(basis)],
+      `INSERT INTO app_actions(owner_id,turn_id,action,basis,target,parent_run_id)
+       SELECT $1,id,$3,$4,$5,$6 FROM turns WHERE id=$2 AND owner_id=$1`,
+      [
+        ownerId,
+        turnId,
+        name.slice(0, 200),
+        JSON.stringify(basis),
+        target?.slice(0, 300) ?? null,
+        activeExecution.getStore()?.parentRunId ?? null,
+      ],
     );
   }
 
@@ -356,6 +672,10 @@ export function createLedger({
         return base.defaultVoice;
       },
       async synthesize(text, signal, onUsage, options) {
+        if (preparation.getStore())
+          throw new Error(
+            'Automatic preparation cannot reserve the cost of speech generation. Ask for the audio in chat.',
+          );
         if (await limitReached()) throw new Error(spendingLimitReached);
         try {
           return await base.synthesize(
@@ -483,9 +803,24 @@ export function createLedger({
     return rows[0]?.cost ?? null;
   }
 
-  async function entries(before?: { at: string; id: string }, session?: string) {
+  async function select({
+    before,
+    after,
+    session,
+    start,
+    end,
+    limit,
+  }: {
+    before?: { at: string; id: string };
+    after?: { at: string; id: string } | null;
+    session?: string;
+    start?: Date | null;
+    end?: Date | null;
+    limit: number | null;
+  }) {
     const { rows } = await pool.query(
       `SELECT u.id,u.source,u.source_id,u.channel,u.status,u.error,u.created_at,
+         to_char(u.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor,
          (SELECT m.id FROM messages m JOIN threads th ON th.id=m.thread_id
            WHERE m.owner_id=$1 AND th.owner_id=$1 AND th.archived_at IS NULL AND m.hidden_at IS NULL
              AND m.thread_id=u.thread_id AND ((m.turn_id=u.id AND m.role='assistant') OR m.id=u.message_id)
@@ -495,7 +830,8 @@ export function createLedger({
          (SELECT json_build_object('title',t.title,'started',t.activity_key IS NOT NULL) FROM tasks t
            WHERE t.owner_id=$1 AND t.session_id=u.session_id LIMIT 1) AS task,
          EXISTS(SELECT 1 FROM turn_events e WHERE e.turn_id=u.id AND e.type='source_screened') AS screened,
-         (SELECT json_agg(json_build_object('action',a.action,'basis',a.basis,'said',m.id IS NOT NULL) ORDER BY a.created_at)
+         (SELECT json_agg(json_build_object('action',a.action,'target',a.target,'basis',a.basis,'said',m.id IS NOT NULL,
+             'whole',regexp_replace(lower(m.text),'[^[:alnum:]]+','','g')=regexp_replace(lower(a.basis->>'quote'),'[^[:alnum:]]+','','g')) ORDER BY a.created_at)
            FROM app_actions a LEFT JOIN messages m ON a.basis->>'kind'='message'
              AND m.owner_id=$1 AND m.id=(a.basis->>'messageId')::uuid
            WHERE a.turn_id=u.id AND a.owner_id=$1) AS actions
@@ -509,11 +845,24 @@ export function createLedger({
          FROM model_usage WHERE turn_id=u.id AND owner_id=$1) c ON true
        WHERE u.owner_id=$1 AND ($2::timestamptz IS NULL OR (u.created_at,u.id)<($2,$3::uuid))
          AND ($4::uuid IS NULL OR u.session_id=$4)
+         AND ($5::timestamptz IS NULL OR u.created_at>=$5) AND ($6::timestamptz IS NULL OR u.created_at<$6)
+         AND ($8::timestamptz IS NULL OR (u.created_at,u.id)>($8,$9::uuid))
          AND (c.used>0 OR EXISTS(SELECT 1 FROM app_actions a WHERE a.turn_id=u.id AND a.owner_id=$1))
-       ORDER BY u.created_at DESC,u.id DESC LIMIT ${pageSize + 1}`,
-      [ownerId, before?.at ?? null, before?.id ?? null, session ?? null],
+       ORDER BY u.created_at ${after === undefined ? 'DESC' : 'ASC'},u.id ${after === undefined ? 'DESC' : 'ASC'} LIMIT $7`,
+      [
+        ownerId,
+        before?.at ?? null,
+        before?.id ?? null,
+        session ?? null,
+        start ?? null,
+        end ?? null,
+        limit,
+        after?.at ?? null,
+        after?.id ?? null,
+      ],
     );
-    const page = rows.slice(0, pageSize).map((row): TrustEntry => ({
+    const cursors = rows.map((row) => ({ at: String(row.cursor), id: String(row.id) }));
+    const entries = rows.map((row): TrustEntry => ({
       id: row.id,
       messageId: row.message_id ?? null,
       at: row.created_at.toISOString(),
@@ -535,18 +884,128 @@ export function createLedger({
           ),
       ),
       actions: (row.actions ?? []).map(
-        (item: { action: string; basis: TrustBasis | null; said: boolean }): TrustAction => {
-          const { app, label } = actionTitle(item.action);
-          const because = becauseOf(item.basis, item.said);
-          return { label: app ? `${app}: ${label}` : label, ...(because ? { because } : {}) };
+        (item: {
+          action: string;
+          target: string | null;
+          basis: TrustBasis | null;
+          said: boolean;
+          whole: boolean | null;
+        }): TrustAction => {
+          const because = reasonOf(item.basis, item.said, item.whole);
+          return {
+            ...recordedAction(item.action, item.target),
+            ...(because ? { because } : {}),
+            ...(item.basis?.kind === 'read' ? { read: true as const } : {}),
+          };
         },
       ),
     }));
-    const last = page.at(-1);
+    return { entries, cursors };
+  }
+
+  async function entries(before?: { at: string; id: string }, session?: string) {
+    const { entries: rows, cursors } = await select({ before, session, limit: pageSize + 1 });
+    const page = rows.slice(0, pageSize);
     return {
       entries: page,
-      next: rows.length > pageSize && last ? { at: last.at, id: last.id } : null,
+      next: rows.length > pageSize ? (cursors[pageSize - 1] ?? null) : null,
     };
+  }
+
+  const stepUnion = `         SELECT e.turn_id,e.created_at AS at,'event' AS kind,e.type,e.summary,e.site AS detail,NULL::jsonb AS basis,
+           false AS said,false AS whole,NULL::jsonb AS usage,NULL::float8 AS cost,e.parent_run_id IS NOT NULL AS helper,e.id::text AS id,NULL::jsonb AS command
+         FROM turn_events e JOIN turns u ON u.id=e.turn_id AND u.owner_id=$1
+         WHERE e.turn_id=ANY($2::uuid[]) AND e.type IN ('step','thought','tool_complete','tool_failed')
+           AND e.command IS NULL
+           AND NOT (e.type<>'step' AND e.type<>'thought' AND e.summary IN ('apps','files'))
+         UNION ALL
+         SELECT a.turn_id,a.created_at,'action',NULL,a.action,a.target,a.basis,m.id IS NOT NULL,
+           COALESCE(regexp_replace(lower(m.text),'[^[:alnum:]]+','','g')=regexp_replace(lower(a.basis->>'quote'),'[^[:alnum:]]+','','g'),false),
+           NULL,NULL,a.parent_run_id IS NOT NULL,a.id::text,NULL
+         FROM app_actions a LEFT JOIN messages m ON a.basis->>'kind'='message'
+           AND m.owner_id=$1 AND m.id=(a.basis->>'messageId')::uuid
+         WHERE a.owner_id=$1 AND a.turn_id=ANY($2::uuid[])
+         UNION ALL
+         SELECT turn_id,created_at,'model',NULL,NULL,NULL,NULL,false,false,details,cost_usd,parent_run_id IS NOT NULL,id,NULL
+         FROM model_usage WHERE owner_id=$1 AND turn_id=ANY($2::uuid[])
+         UNION ALL
+         SELECT turn_id,created_at,'reply',NULL,left(text,300),NULL,NULL,false,false,NULL,NULL,false,id::text,NULL
+         FROM messages WHERE owner_id=$1 AND turn_id=ANY($2::uuid[]) AND role='assistant' AND hidden_at IS NULL AND text<>''
+         UNION ALL
+         SELECT turn_id,"startedAt",'command',NULL,NULL,NULL,NULL,false,false,NULL,NULL,helper,id::text,
+           jsonb_build_object('id',id,'command',command,'state',state,'exitCode',result->'exitCode') ||
+             CASE WHEN $3::boolean THEN jsonb_build_object('output',COALESCE(result->>'output','')) ELSE '{}'::jsonb END
+         FROM (${workspaceCommandsSql}) commands WHERE owner_id=$1 AND turn_id=ANY($2::uuid[])`;
+
+  async function steps(turnIds: string[], page?: { offset: number; limit: number; output?: true }) {
+    const { rows } = await pool.query(
+      `SELECT * FROM (${stepUnion}) s ORDER BY array_position($2::uuid[],s.turn_id),s.at,s.id OFFSET $4 LIMIT $5`,
+      [ownerId, turnIds, page?.output === true, page?.offset ?? 0, page ? page.limit : null],
+    );
+    const grouped = new Map<string, TrustStep[]>();
+    for (const row of rows) {
+      const list = grouped.get(row.turn_id);
+      if (list) list.push(presentStep(row));
+      else grouped.set(row.turn_id, [presentStep(row)]);
+    }
+    return grouped;
+  }
+
+  async function stepCount(turnId: string) {
+    const { rows } = await pool.query<{ total: number }>(
+      `SELECT count(*)::int AS total FROM (${stepUnion}) s`,
+      [ownerId, [turnId], false],
+    );
+    return rows[0]?.total ?? 0;
+  }
+
+  async function bounds(range: ActivityRange) {
+    const row = (
+      await pool.query<{
+        zone: string;
+        locale: string | null;
+        start_at: Date | null;
+        end_at: Date | null;
+      }>(
+        `SELECT ${zone} AS zone,(SELECT locale FROM preferences WHERE owner_id=$1),
+           ($2::date::timestamp AT TIME ZONE ${zone}) AS start_at,
+           (($3::date+1)::timestamp AT TIME ZONE ${zone}) AS end_at`,
+        [ownerId, range.from ?? null, range.to ?? range.from ?? null],
+      )
+    ).rows[0]!;
+    return {
+      session: range.session,
+      timeZone: row.zone,
+      locale: formattingLocale(localeRegion(row.locale) ?? timeZoneRegion(row.zone)),
+      start: row.start_at,
+      end: row.end_at,
+    };
+  }
+
+  async function within(range: ActivityRange, limit: number) {
+    const span = await bounds(range);
+    const { entries } = await select({
+      session: span.session,
+      start: span.start,
+      end: span.end,
+      limit: limit + 1,
+    });
+    return { ...span, entries: entries.slice(0, limit), complete: entries.length <= limit };
+  }
+
+  async function chunk(
+    span: Awaited<ReturnType<typeof bounds>>,
+    after: { at: string; id: string } | null,
+    size: number,
+  ) {
+    const { entries, cursors } = await select({
+      session: span.session,
+      start: span.start,
+      end: span.end,
+      after,
+      limit: size,
+    });
+    return { entries, next: cursors.at(-1) ?? null };
   }
 
   async function read(): Promise<TrustView> {
@@ -641,6 +1100,7 @@ export function createLedger({
         outside: [...outside].map(([kind, costUsd]) => ({ kind, costUsd })),
       },
       ...current,
+      preparation: await preparationLimit(),
       ...page,
     };
   }
@@ -688,6 +1148,28 @@ export function createLedger({
         query.session,
       );
     });
+    app.get<{ Params: { id: string } }>('/api/trust/entries/:id/steps', async (request) => {
+      const id = z.uuid().parse(request.params.id);
+      const { offset } = z
+        .object({ offset: z.coerce.number().int().min(0).default(0) })
+        .strict()
+        .parse(request.query);
+      const [found, total] = await Promise.all([
+        steps([id], { offset, limit: stepPage }),
+        stepCount(id),
+      ]);
+      return { steps: found.get(id) ?? [], total };
+    });
+    app.get<{ Params: { id: string } }>('/api/trust/commands/:id', async (request) => {
+      const id = z.uuid().parse(request.params.id);
+      const { rows } = await pool.query(
+        `SELECT * FROM (${workspaceCommandsSql}) commands WHERE id=$1 AND owner_id=$2`,
+        [id, ownerId],
+      );
+      if (!rows[0])
+        throw Object.assign(new Error('Workspace command not found.'), { statusCode: 404 });
+      return { command: workspaceCommand(rows[0]) };
+    });
     app.put('/api/trust/limit', (request) => setLimits(request.body));
   }
 
@@ -695,19 +1177,23 @@ export function createLedger({
     const body = limitsInput.parse(input);
     const capture = snapshotAnalytics(analytics);
     const write = async (client: PoolClient) => {
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [
+        `preparation-budget:${ownerId}`,
+      ]);
       await client.query(
         'INSERT INTO spending_limits(owner_id,monthly_usd) VALUES($1,NULL) ON CONFLICT DO NOTHING',
         [ownerId],
       );
       const before = (
         await client.query(
-          'SELECT monthly_usd,task_usd FROM spending_limits WHERE owner_id=$1 FOR UPDATE',
+          'SELECT monthly_usd,task_usd,preparation_usd FROM spending_limits WHERE owner_id=$1 FOR UPDATE',
           [ownerId],
         )
       ).rows[0];
       for (const [key, column] of [
         ['monthlyUsd', 'monthly_usd'],
         ['taskUsd', 'task_usd'],
+        ['preparationUsd', 'preparation_usd'],
       ] as const)
         if (body[key] !== undefined)
           await client.query(`UPDATE spending_limits SET ${column}=$2 WHERE owner_id=$1`, [
@@ -715,18 +1201,20 @@ export function createLedger({
             body[key],
           ]);
       const after = (
-        await client.query('SELECT monthly_usd,task_usd FROM spending_limits WHERE owner_id=$1', [
-          ownerId,
-        ])
+        await client.query(
+          'SELECT monthly_usd,task_usd,preparation_usd FROM spending_limits WHERE owner_id=$1',
+          [ownerId],
+        )
       ).rows[0];
       await client.query(
-        `DELETE FROM spending_limits WHERE owner_id=$1 AND monthly_usd IS NULL AND task_usd=${defaultTaskUsd}`,
+        `DELETE FROM spending_limits WHERE owner_id=$1 AND monthly_usd IS NULL AND task_usd=${defaultTaskUsd} AND preparation_usd=${defaultPreparationUsd}`,
         [ownerId],
       );
       afterCommit(client, () =>
         captureSettingChanges(capture, actor, before, after, {
           monthly_usd: 'monthly_spending_limit',
           task_usd: 'task_spending_limit',
+          preparation_usd: 'preparation_spending_limit',
         }),
       );
     };
@@ -740,6 +1228,9 @@ export function createLedger({
 
   return {
     initialize,
+    reserve,
+    withPreparation,
+    preparationLimit,
     flush: flushUsage,
     agent,
     curator,
@@ -764,6 +1255,10 @@ export function createLedger({
       run: () => T,
     ) => activeExecution.run(execution, run),
     read,
+    within,
+    bounds,
+    chunk,
+    steps,
     report,
     registerRoutes,
   };

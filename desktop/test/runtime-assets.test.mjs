@@ -32,6 +32,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { create } from 'tar';
 import { copyBundleSource, copyEngineDependencies } from '../scripts/engine-dependencies.mjs';
+import { copyEngineSource } from '../scripts/engine-source.mjs';
 import { copySpeechSources } from '../scripts/speech-sources.mjs';
 import {
   assetHash,
@@ -43,16 +44,23 @@ import {
 } from '../runtime/assets.mjs';
 import {
   automaticRelease,
+  attachReleaseVideo,
   checkRelease,
   checkReleasePlan,
   isReleaseMerge,
   prepareRelease,
+  publicReleaseNotes,
+  releaseVideo,
+  releaseVideoDigest,
 } from '../../.github/scripts/prepare-desktop-release.mjs';
 import { bindRecovery, recoveryContext } from '../../.github/scripts/desktop-release-recovery.mjs';
 import { run, verifyDiskImage, verifyRuntimeRelease } from '../scripts/release-tools.mjs';
 import { draftServerRelease } from '../../.github/scripts/server-release.mjs';
 import { imageIdentities } from '../../deployment/self-host/image-identities.mjs';
 import { packageLinuxBundle } from '../scripts/linux-release.mjs';
+
+const syntheticVideoUrl =
+  'https://github.com/user-attachments/assets/11111111-1111-4111-8111-111111111111';
 
 test('server release helpers load without desktop build dependencies', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'nod-server-release-import-'));
@@ -442,7 +450,8 @@ test('release gate rejects malformed metadata, uncommitted notes and source drif
   await assert.rejects(prepareRelease(f.root, '0.1.0-alpha'));
   for (const highlights of ['', '   ', 'x'.repeat(8193), null])
     await assert.rejects(prepareRelease(f.root, '0.1.0', highlights), /release highlights/);
-  await prepareRelease(f.root, '0.1.0');
+  await prepareRelease(f.root, '0.1.0', '## Synthetic update\n\nUpdates now finish correctly.');
+  await attachReleaseVideo(f.root, syntheticVideoUrl);
   const prepared = f.commit();
   const notes = join(f.root, 'desktop/CHANGELOG.md');
   await writeFile(notes, '# Replaced notes\n');
@@ -459,6 +468,57 @@ test('release gate rejects malformed metadata, uncommitted notes and source drif
   await writeFile(join(f.root, 'desktop/main.mjs'), 'export const late = true;\n');
   f.commit();
   await assert.rejects(checkRelease(f.root, '0.1.0'));
+});
+
+test('release videos are optional and attached videos stay bound to the reviewed release', async (t) => {
+  const f = await releaseRepository(t);
+  const highlights = '## Fewer interruptions\n\nUpdates now finish correctly.';
+  await prepareRelease(f.root, '0.1.0', highlights);
+  f.commit();
+  const withoutVideo = await checkRelease(f.root, '0.1.0');
+  assert(publicReleaseNotes(withoutVideo, withoutVideo.notes).startsWith(highlights + '\n\n'));
+  const manifestPath = join(f.root, 'desktop/release.json');
+  const pending = await readFile(manifestPath, 'utf8');
+  for (const url of [
+    'http://github.com/user-attachments/assets/11111111-1111-4111-8111-111111111111',
+    'https://github.com/owner/repo/releases/download/nod-v0.1.0/video.mp4',
+    syntheticVideoUrl + '?token=synthetic',
+    syntheticVideoUrl + '\nUnreviewed text',
+    syntheticVideoUrl.replace('github.com', 'user:password@github.com'),
+  ]) {
+    await assert.rejects(attachReleaseVideo(f.root, url), /GitHub attachment URL/);
+    assert.equal(await readFile(manifestPath, 'utf8'), pending);
+  }
+  const script = fileURLToPath(
+    new URL('../../.github/scripts/prepare-desktop-release.mjs', import.meta.url),
+  );
+  await promisify(execFile)(process.execPath, [script, '--video', syntheticVideoUrl], {
+    cwd: f.root,
+  });
+  await assert.rejects(checkRelease(f.root, '0.1.0'), /Commit desktop\/release.json/);
+  f.commit();
+  const release = await checkRelease(f.root, '0.1.0');
+  const notes = publicReleaseNotes(release, release.notes);
+  assert(notes.startsWith(`${syntheticVideoUrl}\n\n${highlights}\n\n`));
+  for (const changed of [
+    { version: '0.1.1' },
+    { source: '0'.repeat(40) },
+    { highlights: highlights + '\nAnother fix.' },
+  ])
+    assert.throws(() => releaseVideo({ ...release, ...changed }), /does not match/);
+  const legacy = { ...release };
+  delete legacy.video;
+  await writeFile(
+    manifestPath,
+    JSON.stringify(legacy, (key, value) => (key === 'notes' ? undefined : value)),
+  );
+  f.commit();
+  await promisify(execFile)(process.execPath, [script, '--check'], { cwd: f.root });
+  f.git('tag', 'nod-v0.1.0');
+  await writeFile(join(f.root, 'desktop/main.mjs'), 'export const improved = true;\n');
+  f.commit();
+  const next = await prepareRelease(f.root, '0.1.1', highlights);
+  assert.equal(next.video, null);
 });
 
 test('release publication requires the exact merge of an owned release PR', () => {
@@ -490,6 +550,7 @@ test('automatic patches release unchanged source and bind generated notes across
   const releases = [{ tag_name: 'nod-v0.1.0', draft: false }];
   const highlights = '## Synthetic update\n\nTry the updated installer.';
   const plan = automaticRelease(f.root, releases, 'synthetic/nod', highlights);
+  plan.video = { url: syntheticVideoUrl, releaseSha256: releaseVideoDigest(plan) };
   assert.equal(plan.version, '0.1.1');
   assert.equal(plan.source, source);
   assert.equal(plan.previousTag, 'nod-v0.1.0');
@@ -502,6 +563,7 @@ test('automatic patches release unchanged source and bind generated notes across
   assert.deepEqual(await checkReleasePlan(f.root, plan.version, path, digest), plan);
   const legacy = { ...plan };
   delete legacy.highlights;
+  delete legacy.video;
   const legacyBytes = JSON.stringify(legacy);
   await writeFile(path, legacyBytes);
   assert.deepEqual(
@@ -571,12 +633,25 @@ test('automatic patches resume the matching draft and never reuse an occupied or
 });
 
 test('release recovery binds normal and automatic builds to their original run and refresh', async (t) => {
-  for (const automatic of [false, true])
+  for (const [automatic, legacy] of [
+    [false, false],
+    [true, false],
+    [false, true],
+    [true, true],
+  ])
     await t.test(
-      automatic ? 'automatic private release' : 'normal public release',
+      `${automatic ? 'automatic private release' : 'normal public release'}${legacy ? ' without video metadata' : ''}`,
       async (scope) => {
         const f = await releaseRepository(scope);
-        await prepareRelease(f.root, '0.1.0');
+        const highlights = '## Synthetic fixes\n\nUpdates now finish correctly.';
+        await prepareRelease(f.root, '0.1.0', highlights);
+        if (legacy) {
+          const path = join(f.root, 'desktop/release.json');
+          const manifest = JSON.parse(await readFile(path, 'utf8'));
+          delete manifest.video;
+          delete manifest.highlights;
+          await writeFile(path, JSON.stringify(manifest));
+        } else await attachReleaseVideo(f.root, syntheticVideoUrl);
         let source = f.commit();
         let version = '0.1.0';
         let planBytes;
@@ -585,11 +660,15 @@ test('release recovery binds normal and automatic builds to their original run a
           await writeFile(join(f.root, 'desktop/main.mjs'), 'export const next = true;\n');
           source = f.commit();
           version = '0.1.1';
-          planBytes = Buffer.from(
-            JSON.stringify(
-              automaticRelease(f.root, [{ tag_name: 'nod-v0.1.0', draft: false }], 'synthetic/nod'),
-            ) + '\n',
+          const plan = automaticRelease(
+            f.root,
+            [{ tag_name: 'nod-v0.1.0', draft: false }],
+            'synthetic/nod',
+            legacy ? undefined : highlights,
           );
+          if (legacy) delete plan.video;
+          else plan.video = { url: syntheticVideoUrl, releaseSha256: releaseVideoDigest(plan) };
+          planBytes = Buffer.from(JSON.stringify(plan) + '\n');
         }
         const artifacts = join(f.root, '.local/desktop-release-artifacts');
         const updateSourceUrl = automatic
@@ -869,7 +948,9 @@ async function releaseFixture(
     diskName = 'nod-arm64.dmg',
     updateSourceUrl,
     automatic = false,
-    highlights,
+    highlights = '## Synthetic update\n\nTry the updated installer.',
+    legacy = false,
+    video = true,
   } = {},
 ) {
   const f = await releaseRepository(t);
@@ -914,6 +995,13 @@ async function releaseFixture(
   }
   f.commit();
   await prepareRelease(root, '0.1.0', highlights);
+  if (legacy) {
+    const manifestPath = join(root, 'desktop/release.json');
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+    delete manifest.video;
+    delete manifest.highlights;
+    await writeFile(manifestPath, JSON.stringify(manifest));
+  } else if (video) await attachReleaseVideo(root, syntheticVideoUrl);
   let source = f.commit();
   const baseline = source;
   if (automatic) {
@@ -1204,6 +1292,14 @@ globalThis.fetch = async (url, options = {}) => {
         NOD_PUBLISH_RELEASE: String(requestPublish),
         NOD_AUTOMATIC_RELEASE: String(automatic),
         NOD_RELEASE_HIGHLIGHTS: highlights ?? '## Synthetic update\n\nTry the updated installer.',
+        NOD_RELEASE_VIDEO: JSON.stringify({
+          url: syntheticVideoUrl,
+          releaseSha256: releaseVideoDigest({
+            version: automatic ? '0.1.1' : '0.1.0',
+            source,
+            highlights,
+          }),
+        }),
         ...(updateSourceUrl ? { NOD_DESKTOP_UPDATE_SOURCE_URL: updateSourceUrl } : {}),
         ...environment,
       },
@@ -1271,10 +1367,10 @@ test('release publication uses the reviewed highlights instead of an environment
   await f.invoke('draft', true, { NOD_RELEASE_HIGHLIGHTS: 'Unreviewed replacement' });
   const published = (await f.readState()).releases[f.appTag];
   assert.equal(published.draft, false);
-  assert(published.body.startsWith(highlights + '\n\n'));
+  assert(published.body.startsWith(`${syntheticVideoUrl}\n\n${highlights}\n\n`));
   assert(!published.body.includes('Unreviewed replacement'));
   assert(published.body.includes(`Source: https://github.com/synthetic/nod/commit/${f.source}`));
-  const legacy = await releaseFixture(t, { publish: true });
+  const legacy = await releaseFixture(t, { publish: true, legacy: true });
   await legacy.invoke('draft');
   const legacyBody = (await legacy.readState()).releases[legacy.appTag].body;
   const legacyNotes = (await checkRelease(legacy.root, legacy.metadata.version)).notes.trimEnd();
@@ -1312,11 +1408,33 @@ test('private releases require provenance when attestations are enabled', async 
   assert.equal((await f.readState()).created, 1);
 });
 
+test('releases publish text notes when the release video is unavailable', async (t) => {
+  for (const automatic of [false, true]) {
+    const f = await releaseFixture(t, { automatic, plan: true, publish: true, video: false });
+    const plan = JSON.parse((await f.invoke('plan', true, { NOD_RELEASE_VIDEO: '' })).stdout);
+    const environment = plan.metadata_sha256
+      ? {
+          NOD_RELEASE_PLAN: join(f.root, '.local/desktop-release-plan.json'),
+          NOD_RELEASE_PLAN_SHA256: plan.metadata_sha256,
+        }
+      : {};
+    await f.invoke('draft', true, environment);
+    const published = (await f.readState()).releases[f.appTag];
+    assert.equal(published.draft, false);
+    assert(published.body.startsWith('## Synthetic update\n\nTry the updated installer.\n\n'));
+    assert(!published.body.includes(syntheticVideoUrl));
+  }
+});
+
 test('automatic delivery requires current exact-main CI and publishes only its checked metadata', async (t) => {
   const f = await releaseFixture(t, { automatic: true, plan: true, publish: true });
   await assert.rejects(
     f.invoke('plan', true, { NOD_RELEASE_HIGHLIGHTS: '' }),
     /release highlights/,
+  );
+  await assert.rejects(
+    f.invoke('plan', true, { NOD_RELEASE_HIGHLIGHTS: 'Changed highlights' }),
+    /release video does not match/,
   );
   const initial = await f.readState();
   const successful = initial.runs[0];
@@ -1359,7 +1477,21 @@ test('automatic delivery requires current exact-main CI and publishes only its c
   assert.deepEqual(published.releases['nod-v0.1.0'], initial.releases['nod-v0.1.0']);
   f.git('tag', f.appTag);
   await assert.rejects(f.invoke('plan', true, { APPLE_CONFIGURED: 'false' }));
-  const repeated = JSON.parse((await f.invoke('plan')).stdout);
+  await assert.rejects(f.invoke('plan'), /release video does not match/);
+  const repeated = JSON.parse(
+    (
+      await f.invoke('plan', true, {
+        NOD_RELEASE_VIDEO: JSON.stringify({
+          url: syntheticVideoUrl,
+          releaseSha256: releaseVideoDigest({
+            version: '0.1.2',
+            source: f.source,
+            highlights: '## Synthetic update\n\nTry the updated installer.',
+          }),
+        }),
+      })
+    ).stdout,
+  );
   assert.equal(repeated.release_needed, 'true');
   assert.equal(repeated.version, '0.1.2');
   assert.equal(repeated.runtime_reused, 'true');
@@ -1888,7 +2020,9 @@ test('all four checked bundles publish together as one regular Nod release', asy
     assert.equal(completed.created, 1);
     assert.equal(completed.releases[f.appTag].draft, false);
     assert.equal(completed.releases[f.appTag].prerelease, false);
-    assert(completed.releases[f.appTag].body.startsWith(highlights + '\n\n'));
+    assert(
+      completed.releases[f.appTag].body.startsWith(`${syntheticVideoUrl}\n\n${highlights}\n\n`),
+    );
     assert.deepEqual(
       completed.calls.filter((call) => call.includes('--draft=false')).map((call) => call[2]),
       Array(isPublic ? 2 : 4).fill(f.appTag),
@@ -2029,6 +2163,44 @@ test('bundle copy includes explicit release assets under .local while excluding 
   ]);
 });
 
+test('engine source includes its own documentation without site dependencies or media', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'nod-engine-docs-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, 'source');
+  const target = join(root, 'engine');
+  const page = 'docs/src/content/docs/trust/privacy.md';
+  for (const path of [
+    'src/server/index.ts',
+    page,
+    'docs/package.json',
+    'docs/src/assets/fixture.png',
+    'dist/web/index.html',
+    'LICENSE',
+    'NOTICE',
+    'desktop/main/engine.mjs',
+    'desktop/main/system-certificates.mjs',
+    'desktop/main/onepassword.mjs',
+    'desktop/runtime/index.mjs',
+    'desktop/runtime/assets.mjs',
+    'desktop/runtime/guest-config.mjs',
+  ]) {
+    await mkdir(dirname(join(source, path)), { recursive: true });
+    await writeFile(join(source, path), 'Synthetic engine fixture');
+  }
+  await writeFile(
+    join(source, 'package.json'),
+    JSON.stringify({ name: 'fixture', dependencies: {} }),
+  );
+  await copyEngineSource({ root: source, target });
+  assert.equal(await readFile(join(target, page), 'utf8'), 'Synthetic engine fixture');
+  assert.equal(
+    await readFile(join(target, 'desktop/main/system-certificates.mjs'), 'utf8'),
+    'Synthetic engine fixture',
+  );
+  await assert.rejects(access(join(target, 'docs/package.json')));
+  await assert.rejects(access(join(target, 'docs/src/assets/fixture.png')));
+});
+
 test('engine source imports only production dependencies outside the development server', async () => {
   const { builtinModules } = await import('node:module');
   const repository = fileURLToPath(new URL('../../', import.meta.url));
@@ -2036,6 +2208,7 @@ test('engine source imports only production dependencies outside the development
   const allowed = new Set([...Object.keys(manifest.dependencies), ...builtinModules]);
   const files = [
     join(repository, 'desktop/main/engine.mjs'),
+    join(repository, 'desktop/main/system-certificates.mjs'),
     join(repository, 'desktop/main/onepassword.mjs'),
   ];
   const walk = async (directory) => {

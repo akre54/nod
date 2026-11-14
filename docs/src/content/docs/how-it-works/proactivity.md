@@ -13,36 +13,46 @@ Saved work starts observation when at least one saved task exists. An empty loca
 
 ## From a change to a nudge
 
-App events, periodic source checks, and due matters feed one observer for your active conversation. It keeps its context only while the model's cache is warm and the context is no larger than compaction would keep. Otherwise it starts fresh, since saved matters carry its state. Each check's request puts what rarely changes first: its instructions, then your rules and the source list, then recent chat, with saved matters, the new batch and the time last. When it starts fresh less than an hour after the previous check, the stable part stays in the model's one-hour cache on Anthropic models, so a check pays mainly for what is new. The server reads changed sources first and ends the batch without your selected model when nothing changed or the connection's smaller model finds no concrete open need. This also applies to app results read through known tools. A record of a saved matter, an unread page or a failed read always goes to the full check. The full check starts with what the server already read, as untrusted data, so it does not read those sources again. They update a saved source queue. A single observer turn reads the due batch. Events received during a turn stay saved for its next turn. App events that arrive together start one check, and a check also takes any source due within the next 15 minutes. The source read also returns the app reports it checks, up to the last ten for that source. The small model sees those reports as untrusted data. This lets it compare the current record with a reported change, such as a meeting's old and new time. A new report with no changed record goes to the full check. The full check also gets the reports. Reports received during a read stay pending for the next check, without a longer wait. A restricted worker reads current facts and relevant memory, checks the need, then prepares and saves the result. Server code then decides whether a message can go out now.
+App events, source change tokens, and due matters feed one observer for your active conversation. While Nod runs, each installation checks for due work every five minutes at its own stable minute. Supported app events and completed turns can prompt earlier checks. Code checks the signals before any model request. An unchanged source with no due matter starts no monitoring model call. There is no periodic model search through every connected app. During quiet hours, new routine source assessments and background email checks wait. An assessment already in progress can finish. Changes collect for batches of up to 10 sources after quiet hours end. New changes are not assessed during that wait. A known high-impact matter with strong evidence and a deadline before quiet hours end can still get a check.
+
+For app events with enough detail, one small model checks the whole batch before Nod reads the app. A notice that lacks detail reaches the observer.
+
+For sources with native readers, the server reads a bounded batch through the normal Trust check. It collects source pages before the model assessment, within 12 page reads and a 96 KB soft input bound. Each source gets a share of the read allowance. Saved cursors keep the remaining pages for later checks. It compares record versions with the last successful assessment. One small model checks the changed records together. It skips only clearly routine activity. Possible needs and uncertain cases reach the observer. There is no separate model assessment for each record. Source content stays untrusted data. Failed reads remain unknown and do not start a larger model. A later check can retry them.
+
+The observer reads current facts and relevant memory, then saves useful work. It keeps its context while the provider cache is warm. Saved matters carry the state between sessions. Events that arrive during a read stay pending for the next check.
+
+The observer uses your selected model for useful work. The batch check uses the existing small classification model. It returns only whether the observer must inspect the batch. It cannot prepare work or grant permission. Due matters and changes to cited records bypass this check. Without that model, changed batches reach the selected model directly. An invalid decision reaches the observer. A failed request leaves the batch pending. Oversized or incomplete batches reach the observer directly. Work that needs normal tools starts a separate task. Both stages share the preparation allowance. Server code controls permission, freshness, and delivery.
 
 ```mermaid
 flowchart TD
-  signal[Changed source or due matter]:::muted --> read[Read current facts]:::go
-  read --> prepare[Prepare the complete result]:::accent
-  prepare --> fresh{{Evidence still current?}}
-  fresh -- no --> read
-  fresh -- yes --> saved[(Private work)]
+  signal[Source change]:::muted --> check{{Possible need?}}
+  check -- no --> quiet[Stay quiet]:::muted
+  check -- yes or uncertain --> read[Selected model prepares work]:::accent
+  due[Due matter or changed evidence] --> read
+  read --> saved[(Current private work)]
   saved --> allowed{{Message allowed now?}}
   allowed -- yes --> nudge[Nudge]:::go
-  allowed -- no --> quiet[Stays private]:::muted
+  allowed -- no --> quiet
 ```
 
 If nothing useful remains, Nod stays quiet. It never reports routine checks or repeats a nudge because you didn't reply.
 
 ## What it reads
 
-Every connected account is a source. No setup or opt-in is needed.
+Turn on **Automatic preparation** in **Settings → Notifications**. New profiles start with it off. Existing saved choices stay unchanged.
 
 | Source                                                               | How Nod reads it                                                     | When it looks                                                       |
 | -------------------------------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------- |
 | Gmail                                                                | Conversations from the last 30 days, with exact versions per thread  | On new mail, checked every 15 minutes                               |
 | Google Calendar                                                      | Events in the primary calendar from yesterday through the next month | When the calendar changes, checked every 30 minutes without a model |
 | Work Nod saved for you                                               | Task state, results and waiting conditions                           | When a task changes                                                 |
-| Every other app, including MCP and HTTP connections you added to Nod | The account's own read tools, the same ones Nod uses in chat         | Every 30 minutes, up to ten due accounts per run                    |
+| Every other app, including MCP and HTTP connections you added to Nod | The account's own read tools, the same ones Nod uses in chat         | On a supported app event; no periodic model check                   |
 
 The saved-work change check covers a task's title, completion condition, state, result, waiting condition and next check, so step-by-step progress doesn't start a new assessment.
 
 For an app without its own reader, the worker searches that account's tools, picks one and fills its arguments. The server checks the arguments against the tool's schema, then Trust's read-only check must classify the call as a read. Anything that would create, change, send or delete, a draft included, never runs.
+
+An HTTP 429 rate limit or 5xx service failure leaves the source state unknown, including a failure while reading one record. The observer does not call that source again during the same check. A later check can try again. Invalid arguments and expired page cursors can still be repaired within the current check. Read errors keep the HTTP status and available service reason after secret removal.
 
 All sources use the same observer. An instruction such as "forward Ana's invoices to accounting" starts a separate task for that action. The task uses the normal tools and Trust check. Its question or approval wait leaves the observer free to process later activity.
 
@@ -51,6 +61,8 @@ An upgrade cancels queued account checks from the old event path. The observer r
 ## Keep judgment and permission apart
 
 The model judges usefulness. The server enforces permission, freshness and delivery.
+
+If saved evidence cannot support prepared work, the error names the affected record and failed condition. Missing evidence, an earlier turn, a changed version or connection, an expired read, and an unavailable record remain separate failures. The model must read the affected record again before saving. These errors do not relax the evidence checks.
 
 | Question                           | What answers it                                                                 |
 | ---------------------------------- | ------------------------------------------------------------------------------- |
@@ -80,7 +92,7 @@ There's no message count. The worker offers only work worth an interruption, wei
 
 - **One saved identity.** Related reports reuse the same primary source record and matter key. The model must recognize that they describe the same matter. Different keys can still cause repeated nudges.
 - **Once per matter.** A matter nudges you again only when its evidence changes and the change matters, such as an earlier deadline or a new option.
-- **Quiet hours.** A nudge that comes up at night goes out when they end, unless it's high impact with strong evidence and its deadline comes first. The full check itself waits too: when the smaller model finds that a changed record needs work, it also decides whether it must reach you before quiet hours end. A changed record of a saved matter gets only that timing question. Only then does the full check run at night; otherwise the batch stays unread until quiet hours end. A saved matter that comes due at night waits for the end unless its deadline comes first. A task the observer starts at night begins when they end, so its questions and approvals wait.
+- **Quiet hours.** A nudge that comes up at night goes out when they end, unless it's high impact with strong evidence and its deadline comes first. Routine source assessments wait until quiet hours end. A check already in progress can finish, but its offer must pass these delivery rules. A saved matter that comes due at night waits for the end unless its deadline comes first. A task the observer starts at night begins when they end, so its questions and approvals wait.
 - **Snooze and pause.** A snoozed matter waits until its time. "Pause preparation" stops source checks, nudges, new tasks Nod would start, planned checks of tasks it started, and the email checks on new Gmail mail. Schedules and tasks you started keep running.
 
 "Fewer of these" or "that wasn't useful" becomes feedback the worker uses next time.
@@ -97,11 +109,15 @@ You answer in chat. `prepared_list` shows a draft, and reading it in a turn you 
 
 ## Cost
 
-Preparation has no budget of its own. Its model use counts toward your monthly spending limit in **Usage**, like everything else. Unchanged Gmail, Calendar and saved work start no model call. Apps without their own reader are checked every 30 minutes, backing off to every 4 hours while nothing changes, and cost a private run only when their results changed. A due matter is checked once at its time; that check decides when to look again. The stable part of each check stays cached between checks less than an hour apart, and during quiet hours only work that can't wait runs a full check. "Pause preparation" stops all of it, including the email checks on new Gmail mail and the planned checks of tasks Nod started.
+Automatic preparation has a $5 monthly allowance by default. Change it in **Usage**, or ask Nod to change it. It covers source reviews, email privacy checks, observer requests, and tasks the observer starts. Plan usage counts at its API-price estimate. Your own chat requests, schedules, and tasks have their normal limits.
 
-Source checks also count toward the observer's task check-in, before the full observer starts. At the limit, Nod stops new source reads and checks and asks whether to continue. A quiet result cannot skip this check-in.
+Before a model request, Nod reserves its estimated maximum cost under one owner lock. Parallel requests cannot spend the same remaining allowance. The final cost replaces the reservation. Pausing preparation blocks each new paid request, including in a check already running. If a request has no price, or does not fit, it does not run. An unfinished request keeps its reservation until its recorded cost covers it. Speech generation waits for a request from you because it has no advance cost bound.
 
-Nod reuses an assessment only after its turn succeeds. The owner context, rules, check instructions, source revision, record version and availability must match. A failed, cancelled or waiting turn gives no result to reuse. A due matter still gets its full check.
+A reservation uses conservative input and output bounds. Nod can stop before the displayed spending reaches the allowance. Provider pricing errors can still affect the final bill. This allowance is not a billing guarantee.
+
+Source checks also count toward the observer's task check-in. At that limit, Nod stops new work and asks whether to continue. A quiet result cannot skip the check-in.
+
+Nod reuses record versions only after the assessment turn succeeds. Rules, source revision, record version, and availability must match. Failed, cancelled, and waiting turns give no result to reuse. A due matter still gets a fresh check.
 
 ## Research behind the behavior
 
@@ -117,6 +133,8 @@ The model judges usefulness. Code checks source versions, tool access, owner con
 | [CaMeL, 2025](https://arxiv.org/abs/2503.18813)                                                                                                                   | Keep outside content separate from authority. The private worker has no connected-write tools.                     |
 | [PRISM, 2026](https://arxiv.org/abs/2602.01532)                                                                                                                   | Test the decision to interrupt separately from the quality of the prepared response.                               |
 | [PARE, 2026](https://arxiv.org/abs/2604.00842)                                                                                                                    | Test changing user state, failed tools, and repeated events. Re-read evidence before saving.                       |
+
+[Hermes cron pre-checks](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron#skipping-the-agent-entirely-wakeagent) use code to skip model requests when state has not changed. Nod applies that pattern to its source ports and keeps its normal Trust checks.
 
 These are design applications of research. Health intervention results don't establish the value of an assistant nudge, and Nod uses no fixed psychological score or sender-ranking rule. See [Proactivity evidence](/how-it-works/proactivity-evidence/) for what the evals measure.
 

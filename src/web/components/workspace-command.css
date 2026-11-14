@@ -1,0 +1,95 @@
+.workspace-command-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.workspace-command-line code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.workspace-command-line:hover code {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.workspace-command-line:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+.workspace-command-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  color: var(--muted-foreground);
+  white-space: nowrap;
+  font-size: 12px;
+}
+.workspace-command-line > svg {
+  flex-shrink: 0;
+  color: var(--muted-foreground);
+}
+.workspace-command-dialog {
+  width: min(760px, calc(100vw - 32px));
+}
+.workspace-command-dialog .workspace-command-result {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 12px;
+  font-size: 12px;
+}
+.workspace-command-result[data-state='failed'],
+.workspace-command-result[data-state='finished']:not([data-exit='0'], [data-exit='']) {
+  color: var(--error);
+}
+.workspace-command-result span {
+  color: var(--muted-foreground);
+}
+.workspace-command-line[data-state='interrupted'] .workspace-command-status,
+.workspace-command-result[data-state='interrupted'] {
+  color: var(--warning);
+}
+.workspace-command-code,
+.workspace-command-output {
+  margin: 0;
+  padding: 14px 16px;
+  border-radius: 6px;
+  background: var(--surface-subtle);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.workspace-command-output {
+  max-height: 44dvh;
+  overflow: auto;
+  color: var(--text-secondary);
+}
+.workspace-command-output-title {
+  margin: 20px 0 8px;
+  font-size: var(--text-control);
+  font-weight: 500;
+}
+.workspace-command-dialog .workspace-command-empty {
+  margin-bottom: 0;
+  font-size: var(--text-control);
+  color: var(--muted-foreground);
+}
+
+.is-failed .workspace-command-status {
+  color: var(--error);
+}

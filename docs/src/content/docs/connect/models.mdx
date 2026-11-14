@@ -58,6 +58,8 @@ If a model request stops your task, the failure message links to **Settings > Mo
 
 After Google reports a daily or zero quota, Nod pauses automatic requests for that model on that connection. This includes background checks, background helpers, and cache warming. The pause survives a restart. Other connections stay available. You can still ask again, replace the key, or select another model. Helpers required by your new request can also run. A successful request you start clears the pause. A provider retry delay permits another automatic attempt after that delay; it does not promise a quota reset. Without a delay, automatic work stays paused until recovery. Reloading the model list does not prove that quota is available.
 
+If Google explicitly reports depleted prepayment credits, Nod pauses automatic requests for every model on that connection. You can still start a request yourself. A successful request you start clears this credit pause. An ordinary rate limit does not establish a credit problem.
+
 To change to an available model, you can also tell Nod which model and service to use. This works in Nod, Telegram, and WhatsApp. Nod changes the saved selection for the next turn. Connecting a new service or signing in again still needs the private flow in the app.
 
 <Tabs syncKey="model-service">
@@ -242,13 +244,15 @@ For a context window below 65,536 tokens, Nod uses short instructions and loads 
 
 Nod reserves space for the reply and starts history compaction earlier. It keeps your current request and rules complete. If a request still does not fit, Nod asks for a shorter request or a model with a larger context window. Large images and tool schemas can need a larger window. Token estimates cannot guarantee that every provider accepts a request.
 
+Switching to a model with a smaller window can reduce the older context before the next reply. The full chat stays saved, and Nod can search it when it needs earlier details. If an unfinished request alone exceeds the new window, choose a model with more context or reset the conversation.
+
 The same server checks still decide app actions, sign-ins and payments. A smaller context window does not change those checks. Model ability still affects whether Nod can complete a task.
 
 To compare what each model declares with how it scores on computer use, tool selection and coding, see [Measure model capabilities](/contribute/evals/#measure-model-capabilities).
 
 ## Decision checks
 
-Nod can use a decision model to check action permission, read confirmation replies, and check emails that give account access. Your selected model writes and checks confirmation questions. Nod selects each checker before its request. A failed check never switches models.
+Nod can use a decision model to check action permission, read confirmation replies, and check emails that give account access. Your selected text model writes most confirmation questions and button labels in your conversation language. The same model checks its wording against the saved action and arguments in a separate request. For permanent Gmail deletion, Nod writes a fixed question and button label from verified target details in English, regardless of your conversation language, without a wording-model request. You can answer in any language. Nod selects each checker before its request. A failed check never switches models.
 
 ### Select the action checker
 
@@ -278,7 +282,7 @@ These keys can come from a connection other than your chat model. ChatGPT subscr
 NOD_TRUST_MODEL=decision
 ```
 
-There is no separate decision-model setting. Nod selects the model. Your selected chat model still writes and checks confirmation questions. This writing step is separate from action classification.
+There is no separate decision-model setting. Nod selects the model. The confirmation writer and wording check receive the proposed action and arguments, available target details and task or schedule context, and page-visible text for browser confirmations. Nod redacts known secrets and private links first. The action and reply classifiers still use the selected trust mode.
 
 The gate receives the complete action, owner messages and rules. It receives no tool results or page text. It must preserve exact targets and terms. The server obtains a permission quote from the selected owner source and checks it against the original words. Choosing a source cannot authorize an action by itself.
 

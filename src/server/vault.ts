@@ -1338,7 +1338,7 @@ export async function createVault(pool: Pool, options: VaultOptions) {
     await lockKey(client, `thread:${owner}`);
     const { rows } = await client.query<RequestRow>(
       `SELECT r.* FROM credential_requests r JOIN turns u ON u.id=r.turn_id AND u.owner_id=r.owner_id
-       WHERE r.token_hash=$1 AND r.owner_id=$2 AND ${condition} ${allowExpired ? '' : "AND (r.kind<>'method' OR r.flow_expires_at>now())"} AND ${waitingTurnSql('u', 'credentials')}
+       WHERE r.token_hash=$1 AND r.owner_id=$2 AND ${condition} ${allowExpired ? '' : "AND (r.kind<>'method' OR r.created_at>now()-interval '30 minutes')"} AND ${waitingTurnSql('u', 'credentials')}
        FOR UPDATE OF r`,
       [hash, owner],
     );
@@ -1352,10 +1352,34 @@ export async function createVault(pool: Pool, options: VaultOptions) {
     return row.status === 'pending' && row.current_step ? 'pending' : 'expired';
   }
 
+  async function requestStatuses(threadId: string, sessionId: string, turnIds: string[]) {
+    if (!turnIds.length) return [];
+    const { rows } = await pool.query<
+      RequestStatusRow & Pick<RequestRow, 'turn_id' | 'origin' | 'label' | 'kind'>
+    >(
+      `SELECT r.turn_id,r.origin,r.label,r.kind,r.status,v.status AS operation_status,
+        r.status='pending' AND (r.kind<>'method' OR r.created_at>now()-interval '30 minutes')
+        AND ${waitingTurnSql('u', 'credentials')} AS current_step
+       FROM credential_requests r JOIN turns u
+         ON u.id=r.turn_id AND u.owner_id=r.owner_id AND u.thread_id=r.thread_id
+       LEFT JOIN vault_uses v ON v.id=r.id AND v.owner_id=r.owner_id AND r.status='consumed'
+       WHERE r.owner_id=$1 AND r.thread_id=$2 AND u.session_id=$3 AND r.turn_id=ANY($4::uuid[])
+       ORDER BY r.created_at DESC,r.id DESC`,
+      [owner, threadId, sessionId, turnIds],
+    );
+    return rows.map((row) => ({
+      turnId: row.turn_id,
+      origin: row.origin,
+      label: row.label,
+      kind: row.kind,
+      status: requestStatus(row),
+    }));
+  }
+
   async function describe(token: string): Promise<CredentialRequest> {
     await forgetExpiredHolds();
     const { rows } = await pool.query<RequestRow & { current_step: boolean }>(
-      `SELECT r.*,v.status AS operation_status,r.status='pending' AND (r.kind<>'method' OR r.flow_expires_at>now()) AND EXISTS(SELECT 1 FROM turns u WHERE u.id=r.turn_id AND u.owner_id=r.owner_id
+      `SELECT r.*,v.status AS operation_status,r.status='pending' AND (r.kind<>'method' OR r.created_at>now()-interval '30 minutes') AND EXISTS(SELECT 1 FROM turns u WHERE u.id=r.turn_id AND u.owner_id=r.owner_id
         AND ${waitingTurnSql('u', 'credentials')}) AS current_step
        FROM credential_requests r LEFT JOIN vault_uses v
          ON v.id=r.id AND v.owner_id=r.owner_id AND r.status='consumed'
@@ -1992,7 +2016,7 @@ export async function createVault(pool: Pool, options: VaultOptions) {
       const request = await lockRequest(
         client,
         tokenHash(token),
-        "((r.status='consumed' AND EXISTS(SELECT 1 FROM vault_uses v WHERE v.id=r.id AND v.status='uncertain')) OR (r.status='pending' AND (r.failed_at IS NOT NULL OR (r.kind='method' AND r.flow_expires_at<=now()))))",
+        "((r.status='consumed' AND EXISTS(SELECT 1 FROM vault_uses v WHERE v.id=r.id AND v.status='uncertain')) OR (r.status='pending' AND (r.failed_at IS NOT NULL OR (r.kind='method' AND r.created_at<=now()-interval '30 minutes'))))",
         true,
       );
       if (!request)
@@ -2308,7 +2332,7 @@ export async function createVault(pool: Pool, options: VaultOptions) {
         '/api/credential-requests/:id/status',
         async (request) => {
           const { rows } = await pool.query<RequestStatusRow>(
-            `SELECT r.status,v.status AS operation_status,r.status='pending' AND (r.kind<>'method' OR r.flow_expires_at>now()) AND EXISTS(
+            `SELECT r.status,v.status AS operation_status,r.status='pending' AND (r.kind<>'method' OR r.created_at>now()-interval '30 minutes') AND EXISTS(
                SELECT 1 FROM turns u WHERE u.id=r.turn_id AND u.owner_id=r.owner_id
                AND ${waitingTurnSql('u', 'credentials')}) AS current_step
              FROM credential_requests r LEFT JOIN vault_uses v
@@ -2355,6 +2379,7 @@ export async function createVault(pool: Pool, options: VaultOptions) {
       authenticatorKey?: string;
     }) => save(owner, passwordInput.parse(input)),
     request,
+    requestStatuses,
     list,
     readCredential,
     fillSaved,

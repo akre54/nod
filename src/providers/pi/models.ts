@@ -7,6 +7,7 @@ import {
   createAssistantMessageEventStream,
   type Api,
   type AssistantMessage,
+  type Context,
   type Model,
   type CredentialStore,
 } from '@earendil-works/pi-ai';
@@ -1024,6 +1025,41 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
   };
 }
 
+function portableToolCallIds(messages: Context['messages'], model: string): Context['messages'] {
+  const portable = /^[A-Za-z0-9]{9}$/;
+  const used = new Set(
+    messages.flatMap((message) =>
+      message.role === 'assistant'
+        ? message.content.flatMap((part) =>
+            part.type === 'toolCall' && portable.test(part.id) ? [part.id] : [],
+          )
+        : [],
+    ),
+  );
+  const ids = new Map<string, string>();
+  return messages.map((message) => {
+    if (message.role === 'toolResult') {
+      const id = ids.get(message.toolCallId);
+      return id ? { ...message, toolCallId: id } : message;
+    }
+    if (message.role !== 'assistant') return message;
+    ids.clear();
+    if (message.model === model) return message;
+    return {
+      ...message,
+      content: message.content.map((part) => {
+        if (part.type !== 'toolCall' || portable.test(part.id)) return part;
+        let id = createHash('sha256').update(part.id).digest('hex').slice(0, 9);
+        for (let attempt = 1; used.has(id); attempt++)
+          id = createHash('sha256').update(`${attempt}:${part.id}`).digest('hex').slice(0, 9);
+        used.add(id);
+        ids.set(part.id, id);
+        return { ...part, id };
+      }),
+    };
+  });
+}
+
 export async function createPiModelRuntime(
   access: ModelAccess,
   {
@@ -1164,6 +1200,7 @@ export async function createPiModelRuntime(
     let status: number | undefined;
     let transportCause: string | undefined;
     let completeRequest: ((error?: string) => Promise<void>) | undefined;
+    let settleBudget: ((spentUsd: number | null) => Promise<void>) | undefined;
     const guardedFetch =
       access.provider === 'compatible' ||
       access.provider === 'radius' ||
@@ -1171,7 +1208,12 @@ export async function createPiModelRuntime(
       access.provider === 'cloudflare-ai-gateway' ||
       (access.provider === 'openai' && !subscription) ||
       Boolean(usage);
-    const upstream = stream(target, audio?.context ?? context, {
+    const sent = audio?.context ?? context;
+    const replay =
+      access.provider === 'compatible'
+        ? { ...sent, messages: portableToolCallIds(sent.messages, target.id) }
+        : sent;
+    const upstream = stream(target, replay, {
       ...options,
       maxTokens:
         options?.maxTokens && target.maxTokens > 0
@@ -1324,7 +1366,7 @@ export async function createPiModelRuntime(
         const available = budget.window - estimateModelTokens(body) - budget.margin;
         if (available < 128)
           throw new Error(
-            `This request does not fit ${target.id}'s ${budget.window}-token context. Use a model with a larger context or a shorter request.`,
+            `Context length exceeded: This request does not fit ${target.id}'s ${budget.window}-token context. Use a model with a larger context or a shorter request.`,
           );
         const output = Math.min(options?.maxTokens ?? budget.output, budget.output, available);
         for (const field of ['max_tokens', 'max_completion_tokens', 'max_output_tokens'])
@@ -1341,6 +1383,19 @@ export async function createPiModelRuntime(
         const prepared = audio?.active
           ? await audio.payload(body, options?.signal ?? AbortSignal.timeout(120000))
           : body;
+        settleBudget = await access.reserve?.(() => {
+          const prices = target.cost;
+          return prices &&
+            [prices.input, prices.output, prices.cacheRead, prices.cacheWrite].every(
+              (price) => Number.isFinite(price) && price >= 0,
+            ) &&
+            Math.max(prices.input, prices.output, prices.cacheRead, prices.cacheWrite) > 0
+            ? (Buffer.byteLength(JSON.stringify(prepared)) *
+                Math.max(prices.input * 2, prices.cacheWrite, prices.cacheRead) +
+                output * prices.output) /
+                1_000_000
+            : null;
+        });
         phase = 'payload';
         return prepared;
       },
@@ -1374,6 +1429,7 @@ export async function createPiModelRuntime(
         }
         if (event.type === 'done' || event.type === 'error') {
           const message = event.type === 'done' ? event.message : event.error;
+          await settleBudget?.(piUsageMetrics(message.usage).costUsd ?? null);
           requestFacts.set(message, {
             requestPhase: phase,
           });

@@ -1,7 +1,7 @@
 const installers = {
-  'darwin-arm64': { file: 'nod-arm64.dmg', label: 'Download for Mac' },
-  'darwin-x64': { file: 'nod-x64.dmg', label: 'Download for Mac' },
-  'win32-x64': { file: 'nod-Setup-x64.exe', label: 'Download for Windows' },
+  'darwin-arm64': { file: 'nod-arm64.dmg', label: 'Download for Mac', os: 'mac' },
+  'darwin-x64': { file: 'nod-x64.dmg', label: 'Download for Mac', os: 'mac' },
+  'win32-x64': { file: 'nod-Setup-x64.exe', label: 'Download for Windows', os: 'windows' },
   'linux-x64': { guide: '#linux', label: 'Install for Linux' },
   mobile: { label: 'Install on your computer' },
 };
@@ -43,7 +43,9 @@ export function startDownload() {
     for (const link of links) {
       if (installer.file) link.href = `${release}/${installer.file}`;
       if (installer.guide) link.href = new URL(installer.guide, link.href).href;
-      if (link.dataset.download === 'label') link.textContent = installer.label;
+      if (installer.os) link.dataset.os = installer.os;
+      if (link.dataset.download === 'label')
+        link.querySelector('[data-download-label]').textContent = installer.label;
     }
   });
 }

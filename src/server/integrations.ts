@@ -8,8 +8,10 @@ import { getDomain } from 'tldts';
 import type { AppSetupStatus, Connection, VaultLoginEntry } from '../shared/contracts.ts';
 import {
   IntegrationCatalogAccessDenied,
+  IntegrationCatalogFailure,
   IntegrationConnectionError,
   IntegrationInboxCursorExpired,
+  IntegrationInboxTransientError,
   IntegrationPermissionError,
   type ConnectedApp,
   type IntegrationProvider,
@@ -193,6 +195,13 @@ function browserService(origin: string) {
 }
 function failure(prefix: string, error: unknown) {
   return `${prefix}: ${error instanceof Error ? error.message : String(error)}`;
+}
+function requestFailure(prefix: string, error: unknown) {
+  const status = z.object({ status: z.number().int().min(100).max(599) }).safeParse(error);
+  return Object.assign(
+    new IntegrationError(failure(prefix, error), 502),
+    status.success ? { upstreamStatus: status.data.status } : {},
+  );
 }
 function messageIdentity(data: Record<string, unknown>, field: 'message' | 'thread') {
   const nested = data.message;
@@ -442,7 +451,8 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     } catch (error) {
       if (error instanceof IntegrationCatalogAccessDenied)
         throw new IntegrationError(error.message, 403);
-      if (error instanceof IntegrationConnectionError) throw error;
+      if (error instanceof IntegrationConnectionError || error instanceof IntegrationCatalogFailure)
+        throw error;
       logFailure('app_catalog_failed', error);
       throw new IntegrationError('The app catalog is unavailable. Try again later.', 502);
     }
@@ -1567,7 +1577,9 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
               current.account_id !== row.account_id ||
               (expectedBinding !== undefined && (await binding(row.id)) !== expectedBinding)
             )
-              throw new IntegrationError('The selected account changed.', 409);
+              throw Object.assign(new IntegrationError('The selected account changed.', 409), {
+                notRun: true,
+              });
             signal?.throwIfAborted();
             return session.execute(action, providerArgs, row.account_id!, signal);
           });
@@ -1582,10 +1594,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
           `${failure('The app request failed', error)} The selected ${known.slug} connection (${known.id}) lacks permissions for this action. Preserve this account and prepared work. Do not retry until permissions change. Ask before switching to browser sign-in unless the user already chose that recovery. The connection service's auth configuration must request the missing permission before reconnection can grant it; its operator may need to update it first. If the user chooses to reconnect, use manage_apps connect ${JSON.stringify({ service: known.slug, connectionId: known.id })}.`,
           403,
         );
-      throw new IntegrationError(
-        `${failure('The app request failed', error)} If the action name or arguments may be wrong, look them up with apps SEARCH_TOOLS.`,
-        502,
-      );
+      throw requestFailure('The app request failed', error);
     }
   }
 
@@ -1747,7 +1756,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
             : {}),
         };
       } catch (error) {
-        throw new IntegrationError(failure('App tool search failed', error), 502);
+        throw requestFailure('App tool search failed', error);
       }
     }
     return executeApproved(
@@ -2204,13 +2213,13 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
       await Promise.all(
         rows.map(async (row) => {
           let client: PoolClient | undefined;
+          const pollDeadline = AbortSignal.timeout(30_000);
+          const pollSignal = AbortSignal.any([stop.signal, pollDeadline]);
+          let pollFinished = false;
           try {
-            const result = await provider.pollInbox!(
-              row.account_id!,
-              row.inbox_cursor,
-              AbortSignal.any([stop.signal, AbortSignal.timeout(30_000)]),
-            );
-            stop.signal.throwIfAborted();
+            const result = await provider.pollInbox!(row.account_id!, row.inbox_cursor, pollSignal);
+            pollSignal.throwIfAborted();
+            pollFinished = true;
             const overviews = await Promise.all(
               result.messages.map((message) =>
                 eventOverview(
@@ -2233,7 +2242,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
             await client.query('BEGIN');
             const saved = await client.query(
               `UPDATE app_connections SET inbox_cursor=$1,inbox_checked_at=now(),inbox_failed=false,
-             inbox_poll_at=CASE WHEN $2 THEN now() ELSE inbox_poll_at END
+             inbox_poll_at=CASE WHEN $2 THEN now()+$10::integer * interval '1 millisecond' ELSE inbox_poll_at END
              WHERE id=$3 AND owner_id=$4 AND provider_id=$5 AND account_id=$6 AND watch_revision=$7 AND inbox_claim_id=$8
              AND watch_requested AND account_active AND NOT revoked
              AND ($9::text IS NULL OR configuration_id=$9) RETURNING id`,
@@ -2247,6 +2256,9 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
                 row.watch_revision,
                 row.inbox_claim_id,
                 provider.configurationId ?? null,
+                Number.isSafeInteger(result.retryAfterMs) && (result.retryAfterMs ?? 0) > 0
+                  ? Math.min(result.retryAfterMs!, 300_000)
+                  : 0,
               ],
             );
             if (saved.rowCount) {
@@ -2273,10 +2285,33 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
             if (saved.rowCount) options.refresh?.();
           } catch (error) {
             if (client) await client.query('ROLLBACK');
+            if (stop.signal.aborted) {
+              await (client ?? pool).query(
+                `UPDATE app_connections SET inbox_poll_at=now(),inbox_claim_id=NULL
+                 WHERE id=$1 AND owner_id=$2 AND provider_id=$3 AND account_id=$4 AND watch_revision=$5 AND inbox_claim_id=$6`,
+                [
+                  row.id,
+                  configuredOwner,
+                  providerId,
+                  row.account_id,
+                  row.watch_revision,
+                  row.inbox_claim_id,
+                ],
+              );
+              return;
+            }
+            const retryAfterMs =
+              error instanceof IntegrationInboxTransientError
+                ? error.retryAfterMs
+                : !pollFinished && pollDeadline.aborted
+                  ? 60_000
+                  : null;
             await (client ?? pool).query(
-              `WITH failed AS (UPDATE app_connections SET inbox_failed=true,inbox_reconnect_required=$7
+              `WITH failed AS (UPDATE app_connections SET inbox_failed=true,inbox_reconnect_required=$7,
+               inbox_poll_at=CASE WHEN $11::integer IS NULL THEN inbox_poll_at ELSE now()+$11::integer * interval '1 millisecond' END
                WHERE id=$1 AND owner_id=$2 AND provider_id=$3 AND account_id=$4 AND watch_revision=$5 AND inbox_claim_id=$6
-               AND watch_requested AND NOT revoked AND ($10::text IS NULL OR configuration_id=$10) RETURNING id)
+               AND watch_requested AND account_active AND NOT revoked
+               AND ($10::text IS NULL OR configuration_id=$10) RETURNING id)
                INSERT INTO integration_events (id,owner_id,summary,slug,account_id,provider_id,poll_connection_id)
                SELECT $8,$2,$9,'gmail',$4,$3,id FROM failed WHERE $7 ON CONFLICT(id) DO NOTHING`,
               [
@@ -2290,6 +2325,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
                 `${providerId}:inbox-expired:${row.id}:${row.watch_revision}`,
                 `Gmail inbox updates need reconnection because the saved history expired. Reconnect this account to resume future updates; the missing interval still needs a separate inbox review. Source connectionId: ${row.id}.`,
                 provider.configurationId ?? null,
+                retryAfterMs,
               ],
             );
             options.refresh?.();
@@ -2401,6 +2437,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
       scope.setErrorHandler((error, _request, reply) => {
         const status =
           error instanceof IntegrationError ||
+          error instanceof IntegrationCatalogFailure ||
           error instanceof IntegrationConnectionError ||
           error instanceof DiscoveredConnectionError ||
           error instanceof BrowserConnectionError
@@ -2408,11 +2445,15 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
             : error instanceof z.ZodError
               ? 400
               : 502;
-        if (status === 502 && !(error instanceof IntegrationError))
+        if (
+          status === 502 &&
+          !(error instanceof IntegrationError || error instanceof IntegrationCatalogFailure)
+        )
           logFailure('connection_failed', error);
         reply.code(status).send({
           error:
             error instanceof IntegrationError ||
+            error instanceof IntegrationCatalogFailure ||
             error instanceof IntegrationConnectionError ||
             error instanceof DiscoveredConnectionError ||
             error instanceof BrowserConnectionError

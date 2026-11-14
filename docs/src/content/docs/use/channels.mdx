@@ -9,7 +9,11 @@ import { Steps, TabItem, Tabs } from '@astrojs/starlight/components';
 
 You can chat with Nod from Telegram or WhatsApp. It's the same conversation, memory and tasks as in the Nod app.
 
+With the desktop app's local assistant, channels reply only while Nod runs on an awake computer with an internet connection and the channel connected. Closing the window keeps Nod running. Quitting Nod or sleeping the computer stops live replies. Messages sent while Nod is stopped may arrive after it restarts and reconnects, but Nod does not read old WhatsApp history. If no reply appears, send the message again.
+
 With a [self-hosted server](/deploy/self-host/), channels stay connected while the server runs. You can close the web or desktop app.
+
+If the desktop app runs Nod, quitting it stops Telegram and WhatsApp replies. The computer must stay awake. Reconnect cannot receive messages while Nod is stopped.
 
 Nod replies in the app you wrote from. A message from Telegram gets its answer on Telegram, and a schedule you set up there sends its results there too. Everything also shows in the chat in the Nod app.
 
@@ -71,7 +75,7 @@ Nod ignores groups, status updates, other senders and message history. In self-c
 
 The QR code updates automatically. When WhatsApp accepts the code, Nod hides it while the connection starts. If the code expires or Nod cannot check the connection, Nod hides it until a new check succeeds. Select **Start again** if setup does not continue.
 
-Closing an unfinished setup cancels that setup. Once connected, closing the panel keeps WhatsApp connected. Nod keeps the device credentials and Signal keys encrypted on your installation. Select **Disconnect** to remove them. You can also remove Nod from **Linked Devices** on your phone. To get a new link after a sign-out, select **Finish setup**, then **Start again**.
+Closing an unfinished setup cancels that setup. Once connected, closing the panel keeps WhatsApp connected. Nod keeps the device credentials and Signal keys encrypted on your installation. Select **Disconnect** to remove them. You can also remove Nod from **Linked Devices** on your phone. To get a new link after a sign-out, select **Reconnect**, then **Start again**.
 
 <details>
 <summary>Use the Meta Cloud API</summary>
@@ -138,6 +142,14 @@ Nod saves the WhatsApp device keys encrypted in its database. The keys stay on t
 
 After a restart or network loss, Nod uses the saved link to connect again. Replies that have not started sending wait while WhatsApp is disconnected. A send with an unclear result is not repeated automatically. This prevents duplicate messages; check Nod if a reply does not arrive.
 
+If messages stop, open **Channels** and select **Reconnect** for Telegram or WhatsApp. Nod restarts message delivery with the saved settings. It keeps your paired Telegram account and saved WhatsApp device keys. A saved Telegram webhook is registered again. Telegram polling errors show the service's status and reason on this page.
+
+**Reconnect** also works for server-managed channels. Their settings still come from the server environment. For WhatsApp, the connection panel opens after reconnecting. If WhatsApp has signed out the device, select **Start again** and scan a new code.
+
+Telegram can change its update numbers after seven days without messages. Nod stops using the saved update number after 24 hours without a received update. Telegram keeps pending updates for 24 hours.
+
+The Channels page checks status every five seconds while visible. During Telegram pairing, or with the WhatsApp connection panel open, it checks every two seconds. **Connecting** means WhatsApp is trying to reconnect. **Connection failed** shows a stopped connection and its reason. WhatsApp errors distinguish a signed-out device, a replaced connection, a rejected session or device version, an incorrect bot account, and local storage or message errors. The connection panel shows the same reason. Connection failures also enter the local diagnostic log, without WhatsApp phone numbers, QR codes, or device keys.
+
 ## Private steps happen in the Nod app
 
 Passwords, saved logins, app sign-ins and payment approvals never go through a chat app. When a task started on Telegram or WhatsApp needs one, Nod asks you to open Nod. Finish the step there, and the task carries on and replies in the chat app.
@@ -179,7 +191,7 @@ Nod still sends real messages for its opening line, useful milestones or partial
 Reactions work both ways, as they do in the [Nod app](/use/chat/#react-to-messages).
 
 - **Nod's reactions.** Nod sometimes reacts to your message with an emoji, such as ❤️ when you thank it or 🎉 for good news. A reaction comes on top of Nod's reply, never instead of it. On Telegram, Nod uses only Telegram's standard reactions.
-- **Your reactions.** React to any Nod message, and Nod saves the reaction and sends it as a reply to that message for Nod to interpret. A 👍 or 👎 on an action confirmation confirms or declines that exact action. Other reactions can answer questions; Nod asks for confirmation before acting outside chat. Your reactions also show in the Nod app, including reactions to later parts of a long reply. Removing a reaction does not undo a reply or action already sent.
+- **Your reactions.** React to any Nod message, and Nod saves the reaction for Nod to interpret as a response to that message. A 👍 or 👎 on an action confirmation confirms or declines that exact action. Other reactions can answer questions; Nod asks for confirmation before acting outside chat. Your reactions also show on the original message in the Nod app, including reactions to later parts of a long reply, without adding another chat bubble. Removing a reaction does not undo a response or action already sent.
 
 If a reaction send fails, its result can be unclear. Nod keeps the attempt and does not send it again. You can ask Nod to remove it. A failed removal keeps the previous reaction.
 

@@ -8,13 +8,13 @@ import { Vault } from '../src/web/pages/vault.tsx';
 import { Credentials } from '../src/web/pages/credentials.tsx';
 import { SetupActions } from '../src/web/components/setup-link.tsx';
 import { messageSetupLinks } from '../src/web/lib/message-links.ts';
-import { actionLink } from '../src/runtime/communication.ts';
+import { paymentInvitation } from '../src/runtime/communication.ts';
 import { PrivateEntryWorkspace, usePrivateEntry } from '../src/web/components/private-entry.tsx';
 import { pageDataCache } from '../src/web/lib/page-data-cache.ts';
 import { Composio } from '@composio/core';
 import Fastify, { type FastifyInstance } from 'fastify';
-import pg from 'pg';
-import type { CredentialKind } from '../src/ports/computer.ts';
+import pg, { DatabaseError } from 'pg';
+import { BrowserActionError, type CredentialKind } from '../src/ports/computer.ts';
 import type { IntegrationProvider, VerificationEmail } from '../src/ports/integrations.ts';
 import { readVerificationEmails } from '../src/providers/composio/verification-email.ts';
 import { registerLocalAccess } from '../src/server/access.ts';
@@ -43,6 +43,7 @@ import { createOnePassword, forkedOnePassword } from '../src/providers/onepasswo
 import { PasswordManagerError, type PasswordManager } from '../src/ports/password-manager.ts';
 import { createPayments } from '../src/server/payments.ts';
 import type { CardEntry } from '../src/ports/computer.ts';
+import { withFailureLog } from '../src/server/failure-log.ts';
 
 async function seedTurns(pool: pg.Pool) {
   await pool.query(
@@ -305,7 +306,7 @@ async function vaultFixture() {
 }
 
 test(
-  'a lost Vault claim acknowledgement and a failed uncertainty write never repeat browser work',
+  'interrupted Vault claims and private entry retain uncertainty without replay or secret diagnostics',
   { skip: !process.env.TEST_DATABASE_URL },
   async () => {
     const { createVaultUses, VaultUseError } = await import('../src/server/vault-use.ts');
@@ -324,7 +325,7 @@ test(
                       const result = await client.query(...args);
                       if (args[0] === 'COMMIT' && loseCommit) {
                         loseCommit = false;
-                        throw new Error('Synthetic lost commit acknowledgement');
+                        throw new DatabaseError('fixture-private-value', 0, 'error');
                       }
                       return result;
                     };
@@ -394,8 +395,18 @@ test(
           .status,
         'submitted',
       );
+      const failures: Array<{
+        event: string;
+        error: unknown;
+        context?: Record<string, unknown>;
+      }> = [];
+      const record = (event: string, error: unknown, context?: Record<string, unknown>) => {
+        failures.push({ event, error, context });
+      };
       loseCommit = true;
-      await assert.rejects(uses.run(use, operation), uncertain);
+      await withFailureLog(record, async () => {
+        await assert.rejects(uses.run(use, operation), uncertain);
+      });
       assert.equal(entries, 0);
       assert.equal(
         (await f.pool.query('SELECT status FROM vault_uses WHERE id=$1', [use.id])).rows[0].status,
@@ -436,6 +447,111 @@ test(
         (await f.pool.query('SELECT status FROM vault_uses WHERE id=$1', [failed.id])).rows[0]
           .status,
         'uncertain',
+      );
+      const interrupted = { ...use, id: randomUUID() };
+      let websiteSubmissions = 0;
+      await withFailureLog(record, async () => {
+        await assert.rejects(
+          uses.run(interrupted, {
+            perform: async () => {
+              websiteSubmissions++;
+              throw new BrowserActionError('browser_card_changed', 'fixture-private-value');
+            },
+          }),
+          uncertain,
+        );
+      });
+      assert.equal(websiteSubmissions, 1);
+      assert.equal(
+        (await f.pool.query('SELECT status FROM vault_uses WHERE id=$1', [interrupted.id])).rows[0]
+          .status,
+        'uncertain',
+      );
+      await assert.rejects(
+        uses.run(interrupted, { perform: operation.perform }),
+        (error: unknown) => error instanceof VaultUseError && error.statusCode === 409,
+      );
+      assert.equal(websiteSubmissions, 1);
+      for (const code of ['ECONNRESET', 'UND_ERR_SOCKET']) {
+        const disconnected = { ...use, id: randomUUID() };
+        await withFailureLog(record, async () => {
+          await assert.rejects(
+            uses.run(disconnected, {
+              perform: async () => {
+                throw Object.assign(new Error('fixture-private-value'), { code });
+              },
+            }),
+            uncertain,
+          );
+        });
+      }
+      const unfinished = { ...use, id: randomUUID() };
+      await withFailureLog(record, async () => {
+        await assert.rejects(
+          uses.run(unfinished, {
+            perform: async () => {
+              websiteSubmissions++;
+              return true;
+            },
+            complete: async () => {
+              throw new Error('fixture-private-value');
+            },
+          }),
+          uncertain,
+        );
+      });
+      assert.equal(websiteSubmissions, 2);
+      assert.equal(
+        (await f.pool.query('SELECT status FROM vault_uses WHERE id=$1', [unfinished.id])).rows[0]
+          .status,
+        'uncertain',
+      );
+      await assert.rejects(
+        uses.run(unfinished, { perform: operation.perform }),
+        (error: unknown) => error instanceof VaultUseError && error.statusCode === 409,
+      );
+      assert.equal(websiteSubmissions, 2);
+      const malformed = { ...use, id: randomUUID(), kind: 'fixture-private-value' };
+      await withFailureLog(record, async () => {
+        await assert.rejects(
+          uses.run(malformed, {
+            perform: async () => {
+              throw Object.assign(new BrowserActionError('browser_card_changed'), {
+                code: 'fixture-private-value',
+              });
+            },
+          }),
+          uncertain,
+        );
+      });
+      assert.deepEqual(
+        failures
+          .filter((failure) => failure.event === 'vault_private_operation_interrupted')
+          .map((failure) => failure.context),
+        [
+          { stage: 'claim', kind: 'password', cause: 'database' },
+          {
+            stage: 'entry',
+            kind: 'password',
+            cause: 'browser',
+            browserCode: 'browser_card_changed',
+          },
+          { stage: 'entry', kind: 'password', cause: 'transport' },
+          { stage: 'entry', kind: 'password', cause: 'transport' },
+          { stage: 'completion', kind: 'password', cause: 'operation' },
+          { stage: 'entry', kind: 'other', cause: 'browser' },
+        ],
+      );
+      assert.equal(
+        JSON.stringify(
+          failures.map(({ event, error, context }) => ({
+            event,
+            message: error instanceof Error ? error.message : String(error),
+            stack: error instanceof Error ? error.stack : undefined,
+            context,
+          })),
+        ).includes('fixture-private-value'),
+        false,
       );
     } finally {
       await f.close();
@@ -1691,6 +1807,7 @@ test(
       let failFill = false;
       let presentationFailure = false;
       let presentedText = 'Synthetic private payment step.';
+      let presentedAction = 'Approve payment';
       let duringPresentation = async () => {};
       const presentations: Array<{
         turn: { threadId: string; turnId: string };
@@ -1710,7 +1827,7 @@ test(
             presentations.push(structuredClone({ turn, input }));
             await duringPresentation();
             input.amount = '0.01';
-            return presentedText;
+            return { question: presentedText, action: presentedAction };
           },
           page: async () => ({ origin: new URL(url).origin, url }),
           destinations: async () => {
@@ -1787,6 +1904,9 @@ test(
       presentedText = '   ';
       await assert.rejects(payments.request(turn, order));
       presentedText = 'Synthetic private payment step.';
+      presentedAction = '   ';
+      await assert.rejects(payments.request(turn, order));
+      presentedAction = 'Approve payment';
       duringPresentation = async () => {
         await pool.query("UPDATE turns SET status='cancelled' WHERE id=$1", [turn.turnId]);
       };
@@ -1821,10 +1941,14 @@ test(
         parallel.turnId,
       ]);
       assert.equal(first.question, 'Synthetic private payment step.');
+      assert.equal(first.action, 'Approve payment');
       assert.equal(first.url, `/payments/${(await latest()).id}`);
-      assert.deepEqual(
-        messageSetupLinks(actionLink(first.url, first.question), 'http://localhost:4310'),
-        [{ href: first.url, setup: 'vault', label: first.question }],
+      const invitation = paymentInvitation(first.url, first.question, first.action);
+      assert.deepEqual(messageSetupLinks(invitation, 'http://localhost:4310'), [
+        { href: first.url, setup: 'vault', label: first.action },
+      ]);
+      assert.throws(() =>
+        paymentInvitation(`https://shop.fixture.test${first.url}`, first.question, first.action),
       );
       assert.equal(presentations.at(-1)!.input.amount, '43.20');
       assert.equal(
@@ -1866,7 +1990,7 @@ test(
         'https://pay.fixture.test',
         shop,
       ]);
-      assert.equal(presentations.at(-1)!.input.requires, 'desktop_private_form');
+      assert.equal(presentations.at(-1)!.input.requires, 'private_form');
       assert.equal(await reply('737'), 'submitted');
       assert.equal(fills.at(-1)?.card.securityCode, '737');
       assert.equal(fills.at(-1)?.destinations.number, 'https://pay.fixture.test');
@@ -3121,6 +3245,7 @@ test(
     });
     let submitted = 0;
     let entered = 0;
+    let retried = 0;
     let failed = false;
     let requestSignal: AbortSignal | null | undefined;
     const key = randomBytes(32);
@@ -3140,7 +3265,9 @@ test(
         return { status: 'submitted' as const };
       },
       resume: async () => {},
-      retry: async () => {},
+      retry: async () => {
+        retried++;
+      },
     });
     vault.registerRoutes(app);
     const request = await vault.request(turn, 'local-development', {
@@ -3295,6 +3422,7 @@ test(
     );
     assert.equal(view.document.querySelector('form'), null);
     assert.equal(view.document.querySelector('.success-mark'), null);
+    assert.equal(view.document.querySelector('.credential-card .notice'), null);
     assert.deepEqual(
       (
         await app.inject({
@@ -3304,6 +3432,9 @@ test(
       { status: 'uncertain' },
     );
     assert.equal(submitted, 2);
+    assert.equal(entered, 2);
+    await click('.credential-complete button');
+    await settle(() => retried === 1);
     assert.equal(entered, 2);
     await view.render(panel('/vault?add=card', 'card-owner'));
     await click('#open-private');
@@ -3365,7 +3496,7 @@ test(
     await click('#open-private');
     await settle(() => Boolean(view.document.querySelector('.notice')));
     assert.equal(view.document.querySelector('form'), null);
-    assert.equal(submitted, 3);
+    assert.equal(submitted, 4);
   },
 );
 
@@ -3613,8 +3744,9 @@ root=createRoot(document.getElementById('root'));
 await render();
 await waitFor(()=>document.querySelector('[data-step="email"]'));
 assert.ok(rendererReady>0,'The email screen must become visible before account discovery finishes');
-assert.equal(button('Skip for now').disabled,false);
-await act(async()=>button('Skip for now').click());
+const emailSkip=()=>document.querySelector('[data-step="email"] .ob-footer-end button:not(.ob-next)');
+assert.equal(emailSkip().disabled,false);
+await act(async()=>emailSkip().click());
 await waitFor(()=>document.querySelector('[data-step="about"]'));
 for(let at=0;at<10&&!document.querySelector('[data-step="privacy"]');at++){await act(async()=>{await new Promise(resolve=>setTimeout(resolve,1000))});if(button('Not now'))await act(async()=>button('Not now').click())}
 await waitFor(()=>document.querySelector('[data-step="privacy"]'));
@@ -3650,6 +3782,7 @@ test(
       'staged continuity',
       'uncertain selection',
       'expired retry',
+      'late method choice',
       'trust refusal',
     ])
       await t.test(scenario, async (t) => {
@@ -3776,7 +3909,7 @@ test(
           const expiredPath = `/api/credential-requests/${expired.url.split('/').at(-1)}`;
           const expiredRequest = await get(expiredPath);
           await pool.query(
-            "UPDATE credential_requests SET flow_expires_at=now()-interval '1 second' WHERE turn_id=$1",
+            "UPDATE credential_requests SET created_at=now()-interval '31 minutes',flow_expires_at=now()-interval '1 second' WHERE turn_id=$1",
             [expiredTurn.turnId],
           );
           assert.equal((await get(expiredPath)).status, 'expired');
@@ -3814,6 +3947,87 @@ test(
             retried.url.split('/').at(-1),
           );
           assert.equal(clicks, 0);
+          return;
+        }
+        if (scenario === 'late method choice') {
+          const firstTurn = await turns.turn();
+          const first = await vault.request(firstTurn, 'local-development', {
+            origin: currentOrigin,
+            label: 'Identity',
+            kind: 'method',
+            methods: [{ label: 'Continue', selector: '#continue' }],
+          });
+          await turns.wait(firstTurn);
+          const firstPath = `/api/credential-requests/${first.url.split('/').at(-1)}`;
+          const firstRequest = await get(firstPath);
+          assert.equal(
+            (
+              await app.inject({
+                method: 'POST',
+                url: `${firstPath}/method`,
+                payload: { methodId: firstRequest.methods![0].id },
+              })
+            ).statusCode,
+            200,
+          );
+          await pool.query(
+            "UPDATE credential_requests SET flow_expires_at=clock_timestamp()+interval '5 seconds' WHERE turn_id=$1",
+            [firstTurn.turnId],
+          );
+          const nextTurn = await turns.resume(firstTurn);
+          const next = await vault.request(nextTurn, 'local-development', {
+            origin: currentOrigin,
+            label: 'Identity',
+            kind: 'method',
+            methods: [{ label: 'Use password', selector: '#password' }],
+          });
+          await turns.wait(nextTurn);
+          const nextPath = `/api/credential-requests/${next.url.split('/').at(-1)}`;
+          const nextRequest = await get(nextPath);
+          assert.equal(nextRequest.status, 'pending');
+          const { rows } = await pool.query<{
+            first_flow_id: string;
+            next_flow_id: string;
+            first_deadline: Date;
+            next_deadline: Date;
+          }>(
+            `SELECT first.flow_id AS first_flow_id,next.flow_id AS next_flow_id,
+              first.flow_expires_at AS first_deadline,next.flow_expires_at AS next_deadline
+             FROM credential_requests first,credential_requests next
+             WHERE first.turn_id=$1 AND next.turn_id=$2`,
+            [firstTurn.turnId, nextTurn.turnId],
+          );
+          assert.equal(rows[0].next_flow_id, rows[0].first_flow_id);
+          assert.equal(rows[0].next_deadline.getTime(), rows[0].first_deadline.getTime());
+          const waitMs = rows[0].first_deadline.getTime() - Date.now() + 100;
+          assert.ok(waitMs > 0 && waitMs < 5_100);
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          assert.equal((await get(nextPath)).status, 'pending');
+          assert.equal(
+            (await app.inject({ method: 'GET', url: `${nextPath}/status` })).json().status,
+            'pending',
+          );
+          assert.deepEqual(
+            (await app.inject({ method: 'GET', url: `${firstPath}/flow` })).json(),
+            {},
+          );
+          assert.equal(
+            (await app.inject({ method: 'POST', url: `${nextPath}/retry`, payload: {} }))
+              .statusCode,
+            409,
+          );
+          assert.equal(
+            (
+              await app.inject({
+                method: 'POST',
+                url: `${nextPath}/method`,
+                payload: { methodId: nextRequest.methods![0].id },
+              })
+            ).statusCode,
+            200,
+          );
+          assert.equal(clicks, 2);
+          assert.equal(resumed, 2);
           return;
         }
         if (scenario === 'trust refusal') {

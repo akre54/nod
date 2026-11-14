@@ -246,6 +246,36 @@ test('map evidence accepts split and detail maps but rejects duplicate, wrong or
     assert.equal(await score(groups.map((group) => [...group])), false, reason);
 });
 
+test('eval preparation enables preparation only when the source supports its preference', async () => {
+  const { prepare } = await import('../src/setup.ts');
+  for (const preferences of [
+    { notificationRule: '' },
+    { notificationRule: '', proactivePaused: true },
+  ]) {
+    const writes: unknown[] = [];
+    const stack = {
+      request: async (path: string, request?: RequestInit) => {
+        assert.equal(path, '/api/preferences');
+        if (request?.method === 'GET') return Response.json(preferences);
+        assert.equal(request?.method, 'PATCH');
+        const body = JSON.parse(String(request?.body));
+        if (!('proactivePaused' in preferences)) assert.ok(!('proactivePaused' in body));
+        writes.push(body);
+        return Response.json({});
+      },
+    };
+    await prepare(stack as Stack, {}, 'Europe/Madrid');
+    assert.deepEqual(writes, [
+      {
+        timeZone: 'Europe/Madrid',
+        quietHoursEnabled: false,
+        notificationRule: '',
+        ...('proactivePaused' in preferences ? { proactivePaused: false } : {}),
+      },
+    ]);
+  }
+});
+
 test('the onboarding eval reports API failures before continuing setup or starting a task', async () => {
   for (const [method, path, status] of [
     ['POST', '/api/account/prepare', 503],
@@ -3987,4 +4017,48 @@ test('WhisperBench retains completed judge costs when a later judge fails', asyn
   );
   assert.equal(calls, 2);
   assert.ok(run.judgeCostUsd! > 0);
+});
+
+test('the proactive app check reads the tool name inside its input envelope', async () => {
+  const { default: definition } = await import('../src/scenarios/proactivity-app-tools.ts');
+  const world = definition.world({ now: Date.now }) as import('../src/scenario.ts').World & {
+    state: { turnId: string };
+  };
+  world.state.turnId = 'synthetic-source-turn';
+  const expectation = definition
+    .expect(world)
+    .find((item) => item.id === 'read-through-its-own-tools');
+  if (expectation?.kind !== 'check') throw new Error('Missing proactive app check');
+  const run = quietRun(world);
+  for (const [input, isError, turnId, pass] of [
+    [
+      { input: { sourceId: 'connections:fixture', tool: 'SLACK_FETCH_CONVERSATION_HISTORY' } },
+      false,
+      world.state.turnId,
+      true,
+    ],
+    [
+      { input: { sourceId: 'connections:fixture', query: 'Juniper' } },
+      false,
+      world.state.turnId,
+      false,
+    ],
+    [
+      { input: { sourceId: 'connections:fixture', tool: 'SLACK_FETCH_CONVERSATION_HISTORY' } },
+      true,
+      world.state.turnId,
+      false,
+    ],
+    [
+      { input: { sourceId: 'connections:fixture', tool: 'SLACK_FETCH_CONVERSATION_HISTORY' } },
+      false,
+      'other-turn',
+      false,
+    ],
+  ] as const) {
+    run.tools = [
+      { name: 'read_source', input, isError, turnId, output: 'Juniper quote', at: 0, lead: '' },
+    ];
+    assert.equal((await expectation.check(run)).pass, pass);
+  }
 });

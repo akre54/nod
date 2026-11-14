@@ -7,16 +7,24 @@ export interface ExecutionScope {
   browserId: string;
 }
 
+export interface WorkspaceCommandRecord {
+  command?: string;
+  exitCode?: number;
+  output?: string;
+}
+
 export interface ExecutionEvent {
   execution: ExecutionScope;
   callId?: string;
   site?: string;
+  command?: WorkspaceCommandRecord;
 }
 
 export interface UsageDetails {
   provider: string;
   category: 'agent' | 'memory' | 'review' | 'tasks' | 'task_classification';
   operation: string;
+  attempt?: number;
   model?: string;
   status: 'succeeded' | 'failed' | 'cancelled';
   durationMs: number;

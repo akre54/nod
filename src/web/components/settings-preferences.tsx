@@ -3,7 +3,7 @@ import type { AccountPreferences, AccountTheme } from '../../shared/account';
 import type { HourCycle } from '../../shared/contracts';
 import type { AccountControls } from './account-menu';
 import type { useDesktopSettings } from './desktop-settings';
-import { Check, Monitor, Moon, Sun } from './icons';
+import { Check, Minus, Monitor, Moon, Plus, Sun } from './icons';
 import { Button, Loading, Notice, Switch } from './ui';
 import { SearchPicker } from './search-picker';
 import { TimeZonePicker } from './time-zone-picker';
@@ -11,6 +11,7 @@ import { TimePicker } from './time-picker';
 import { useSettingsDraft } from './settings-drafts';
 import { usePageData } from '../hooks/use-page-data';
 import { errorMessage } from '../lib/api';
+import { desktopZoomAvailable, getDesktopZoomFactor, setDesktopZoomFactor } from '../lib/desktop';
 import { savePreferences } from '../lib/preferences';
 import { localeRegion } from '../../shared/date-locale';
 import { communityLinks, legalLinks } from '../../shared/onboarding';
@@ -26,7 +27,7 @@ import {
   usesTwelveHourClock,
 } from '../lib/date-format';
 
-const quietKeys = ['quietHoursEnabled', 'quietStart', 'quietEnd'] as const;
+const quietKeys = ['quietHoursEnabled', 'quietStart', 'quietEnd', 'proactivePaused'] as const;
 const clocks: Array<{ value: HourCycle; label: string }> = [
   { value: 'auto', label: 'Automatic' },
   { value: 'h12', label: '12-hour' },
@@ -40,6 +41,7 @@ const regionLabels = {
   list: 'Regions',
   empty: 'No regions found.',
 };
+const fontSizeSteps = [0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2];
 
 function ThemePreview({ theme }: { theme: AccountTheme }) {
   return (
@@ -60,6 +62,122 @@ function ThemePreview({ theme }: { theme: AccountTheme }) {
         </span>
       ))}
     </span>
+  );
+}
+
+function FontSizeControls() {
+  const id = useId();
+  const [factor, setFactor] = useState<number | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const pending = useRef(false);
+  const revision = useRef(0);
+  useEffect(() => {
+    let active = true;
+    const refresh = () => {
+      if (pending.current) return;
+      const current = ++revision.current;
+      void getDesktopZoomFactor().then(
+        (value) => {
+          if (active && revision.current === current) {
+            setFactor(value);
+            setError('');
+          }
+        },
+        (cause) => {
+          if (active && revision.current === current) {
+            setFactor(null);
+            setError(errorMessage(cause));
+          }
+        },
+      );
+    };
+    refresh();
+    window.addEventListener('resize', refresh);
+    window.addEventListener('focus', refresh);
+    return () => {
+      active = false;
+      window.removeEventListener('resize', refresh);
+      window.removeEventListener('focus', refresh);
+    };
+  }, []);
+  async function change(value: number) {
+    if (pending.current) return;
+    pending.current = true;
+    const current = ++revision.current;
+    setBusy(true);
+    setError('');
+    try {
+      const saved = await setDesktopZoomFactor(value);
+      if (revision.current === current) setFactor(saved);
+    } catch (cause) {
+      if (revision.current === current) {
+        setError(errorMessage(cause));
+        try {
+          const actual = await getDesktopZoomFactor();
+          if (revision.current === current) setFactor(actual);
+        } catch {
+          if (revision.current === current) setFactor(null);
+        }
+      }
+    } finally {
+      pending.current = false;
+      setBusy(false);
+    }
+  }
+  const percent = factor === null ? null : Math.round(factor * 100);
+  const smaller =
+    percent === null
+      ? undefined
+      : [...fontSizeSteps].reverse().find((value) => Math.round(value * 100) < percent);
+  const larger =
+    percent === null ? undefined : fontSizeSteps.find((value) => Math.round(value * 100) > percent);
+  return (
+    <>
+      <div className="account-preference-row account-font-size">
+        <span id={id}>Font size</span>
+        <div className="account-font-size-actions" role="group" aria-labelledby={id}>
+          <div className="settings-segmented account-font-size-stepper">
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              aria-label="Decrease font size"
+              disabled={busy || smaller === undefined}
+              onClick={() => {
+                if (smaller !== undefined) void change(smaller);
+              }}
+            >
+              <Minus size={16} aria-hidden="true" />
+            </Button>
+            <output aria-live="polite">{percent === null ? '—' : `${percent}%`}</output>
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              aria-label="Increase font size"
+              disabled={busy || larger === undefined}
+              onClick={() => {
+                if (larger !== undefined) void change(larger);
+              }}
+            >
+              <Plus size={16} aria-hidden="true" />
+            </Button>
+          </div>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            aria-label="Reset font size to 100%"
+            disabled={busy || factor === null || Math.abs(factor - 1) < 0.001}
+            onClick={() => void change(1)}
+          >
+            Reset
+          </Button>
+        </div>
+      </div>
+      {error && <Notice>{error}</Notice>}
+    </>
   );
 }
 
@@ -165,6 +283,7 @@ export function GeneralPreferences({
             );
           })}
         </div>
+        {desktop && desktopZoomAvailable() && <FontSizeControls />}
       </section>
       <section className="account-region" aria-labelledby={`${id}-date`}>
         <header className="settings-subheading">
@@ -326,6 +445,11 @@ export function QuietHours() {
       ? []
       : [
           {
+            label: 'Automatic preparation',
+            before: data.proactivePaused ? 'Off' : 'On',
+            after: draft.proactivePaused ? 'Off' : 'On',
+          },
+          {
             label: 'Quiet hours',
             before: data.quietHoursEnabled ? 'On' : 'Off',
             after: draft.quietHoursEnabled ? 'On' : 'Off',
@@ -398,40 +522,62 @@ export function QuietHours() {
       </Notice>
     );
   return (
-    <section className="account-region account-quiet-hours" aria-labelledby={`${id}-heading`}>
-      <div className="account-preference-row">
-        <span id={`${id}-heading`}>Quiet hours</span>
-        <Switch
-          checked={draft.quietHoursEnabled}
-          aria-labelledby={`${id}-heading`}
-          disabled={busy}
-          onCheckedChange={(quietHoursEnabled) => setDraft({ ...draft, quietHoursEnabled })}
-        />
-      </div>
-      <p className="field-hint">Pause routine notifications during these hours.</p>
-      <div className="account-quiet-times" data-cycle={usesTwelveHourClock(format) ? 'h12' : 'h23'}>
-        <TimePicker
-          id={`${id}-start`}
-          label="From"
-          format={format}
-          value={draft.quietStart}
-          savedValue={data.quietStart}
-          changed={draft.quietStart !== data.quietStart}
-          disabled={busy || !draft.quietHoursEnabled}
-          onChange={(quietStart) => setDraft({ ...draft, quietStart })}
-        />
-        <TimePicker
-          id={`${id}-end`}
-          label="Until"
-          format={format}
-          value={draft.quietEnd}
-          savedValue={data.quietEnd}
-          changed={draft.quietEnd !== data.quietEnd}
-          disabled={busy || !draft.quietHoursEnabled}
-          onChange={(quietEnd) => setDraft({ ...draft, quietEnd })}
-        />
-      </div>
-      {error && <Notice>{error}</Notice>}
-    </section>
+    <>
+      <section className="account-region" aria-labelledby={`${id}-preparation`}>
+        <div className="account-preference-row">
+          <span id={`${id}-preparation`}>Automatic preparation</span>
+          <Switch
+            checked={!draft.proactivePaused}
+            aria-labelledby={`${id}-preparation`}
+            disabled={busy}
+            onCheckedChange={(enabled) => setDraft({ ...draft, proactivePaused: !enabled })}
+          />
+        </div>
+        <p className="field-hint">
+          Prepare useful work from app changes. Spends from a $5 monthly allowance by default.
+          Change it in Usage. Turning this off also pauses automatic email checks.
+        </p>
+      </section>
+      <section className="account-region account-quiet-hours" aria-labelledby={`${id}-heading`}>
+        <div className="account-preference-row">
+          <span id={`${id}-heading`}>Quiet hours</span>
+          <Switch
+            checked={draft.quietHoursEnabled}
+            aria-labelledby={`${id}-heading`}
+            disabled={busy}
+            onCheckedChange={(quietHoursEnabled) => setDraft({ ...draft, quietHoursEnabled })}
+          />
+        </div>
+        <p className="field-hint">
+          Pause routine preparation and notifications during these hours.
+        </p>
+        <div
+          className="account-quiet-times"
+          data-cycle={usesTwelveHourClock(format) ? 'h12' : 'h23'}
+        >
+          <TimePicker
+            id={`${id}-start`}
+            label="From"
+            format={format}
+            value={draft.quietStart}
+            savedValue={data.quietStart}
+            changed={draft.quietStart !== data.quietStart}
+            disabled={busy || !draft.quietHoursEnabled}
+            onChange={(quietStart) => setDraft({ ...draft, quietStart })}
+          />
+          <TimePicker
+            id={`${id}-end`}
+            label="Until"
+            format={format}
+            value={draft.quietEnd}
+            savedValue={data.quietEnd}
+            changed={draft.quietEnd !== data.quietEnd}
+            disabled={busy || !draft.quietHoursEnabled}
+            onChange={(quietEnd) => setDraft({ ...draft, quietEnd })}
+          />
+        </div>
+        {error && <Notice>{error}</Notice>}
+      </section>
+    </>
   );
 }

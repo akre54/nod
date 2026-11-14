@@ -214,6 +214,17 @@ export const analyticsEvent = z.discriminatedUnion('event', [
           ]),
           duration_ms: duration,
           queue_duration_ms: duration.optional(),
+          result: z
+            .enum([
+              'reply',
+              'needs_owner',
+              'no_reply',
+              'failed',
+              'cancelled',
+              'interrupted',
+              'skipped',
+            ])
+            .optional(),
           waiting_reason: z.enum(['question', 'approval', 'credentials']).optional(),
           failure_reason: z.enum(['spending_limit', 'model', 'unknown']).optional(),
         })
@@ -256,6 +267,7 @@ export const analyticsEvent = z.discriminatedUnion('event', [
             'memory_sensitive',
             'monthly_spending_limit',
             'task_spending_limit',
+            'preparation_spending_limit',
             'model_selection',
             'model_effort',
           ]),
@@ -434,6 +446,23 @@ export const analyticsEvent = z.discriminatedUnion('event', [
           provider: analyticsModelProvider,
           model: analyticsModel.optional(),
           purpose: z.enum(['agent', 'memory', 'review', 'tasks', 'task_classification']),
+          request_kind: z
+            .enum([
+              'chat',
+              'task',
+              'observer',
+              'helper',
+              'compaction',
+              'cache_warm',
+              'auxiliary',
+              'memory',
+              'review',
+              'tasks',
+              'task_classification',
+              'unclassified',
+            ])
+            .optional(),
+          attempt: z.number().int().min(1).max(4).optional(),
           outcome: z.enum(['succeeded', 'failed', 'cancelled']),
           input_tokens: duration,
           output_tokens: duration,

@@ -2,6 +2,133 @@
 
 Releases from before the rename to Nod are the `desktop-v*` [GitHub releases](https://github.com/n8n-io/nod/releases).
 
+## 0.7.6 - 2026-11-13
+
+### Features
+
+- **desktop:** Add font size controls to appearance settings. [#868](https://github.com/n8n-io/nod/pull/868) (5b9e1b2)
+- **tasks:** Show workspace commands in Usage and CSV exports. [#830](https://github.com/n8n-io/nod/pull/830) (d978807)
+- **proactivity:** Skip idle work and batch changes through quiet hours. [commit](https://github.com/n8n-io/nod/commit/842becde0adeac0fcb3eabfb8b813deeb0efdffc) (842becd)
+
+### Fixes
+
+- **integrations:** Recover Gmail polling after transient proxy errors. [#875](https://github.com/n8n-io/nod/pull/875) (3ab2f07)
+- **composio:** Preserve catalog proxy failures (LAB-983). [#874](https://github.com/n8n-io/nod/pull/874) (76ecbb2)
+- Trust system certificates in desktop engine (LAB-983). [#873](https://github.com/n8n-io/nod/pull/873) (675886f)
+- **approvals:** Restore clear questions and action labels. [#864](https://github.com/n8n-io/nod/pull/864) (9b82c5f)
+- Fit onboarding window to screen and clean up chat UI. [#863](https://github.com/n8n-io/nod/pull/863) (a239b50)
+- **sign-in:** Keep fresh method choices open for 30 minutes. [#869](https://github.com/n8n-io/nod/pull/869) (5ac5f3d)
+- **proactivity:** Stagger periodic checks by installation. [#870](https://github.com/n8n-io/nod/pull/870) (3816f36)
+- **payments:** Clarify web approval and unblock unrelated chat. [#796](https://github.com/n8n-io/nod/pull/796) (cf362e5)
+
+### Documentation
+
+- Keep the cover shadow inside its frame and let the results heading wrap on phones. [commit](https://github.com/n8n-io/nod/commit/0889cc0283203149d34670a559fd6c92b6ac868e) (0889cc0)
+- Restore the results heading with the test run count. [commit](https://github.com/n8n-io/nod/commit/3f86e131519bee7ed1644e6d302adcc1fc756a0b) (3f86e13)
+- Match the README roadmap to the landing page. [commit](https://github.com/n8n-io/nod/commit/63ebe1b38166c5daeebab90e66e79f37b1d7090f) (63ebe1b)
+- Use the new hero collage, add a shadow to the video cover and expand the video on play. [commit](https://github.com/n8n-io/nod/commit/742c08ca0d418789dbbfc0c56cbea7beb34b2c8c) (742c08c)
+- Keep the video poster visible while loading and honour reduced motion in the FAQ. [commit](https://github.com/n8n-io/nod/commit/d076b181451308149338520e59e5cd4a9a56e871) (d076b18)
+- Tighten the landing page hero and give the video cover more room. [commit](https://github.com/n8n-io/nod/commit/360e59719c2fb9986bd8dc163de53ea09d33e90e) (360e597)
+- Centre the memory and results sections, reorder the landing page and tighten the hero. [commit](https://github.com/n8n-io/nod/commit/2a7f152a900a7a1c5ac6e34c51b090f2f49e99f1) (2a7f152)
+- Rework the landing page footer and hero tag, and shrink the headline. [commit](https://github.com/n8n-io/nod/commit/212ca0d00516aef0482a327ddcf914843a7cfefe) (212ca0d)
+- Restyle the landing page header, use an app screenshot as the video cover and move the closing button onto the dot grid. [commit](https://github.com/n8n-io/nod/commit/555ad4a3cfa224c7a3aab12dacc98a12bdeef1e6) (555ad4a)
+- Self-host the landing page demo video and rework the memory, stats and roadmap sections. [commit](https://github.com/n8n-io/nod/commit/cd9045f1c9660f33cf15b7e46b3c1db07a4f2727) (cd9045f)
+- Polish the landing page stats, roadmap icons, links and FAQ. [commit](https://github.com/n8n-io/nod/commit/b1bd0ff3fa960e6ef7c2dec47df35be40d0e6420) (b1bd0ff)
+- Rework the landing page stats, headings and hero spacing. [commit](https://github.com/n8n-io/nod/commit/3abe57ff88ca84f403779a2dfe3d9d706630adbe) (3abe57f)
+- Rework the landing page header, hero and section order. [commit](https://github.com/n8n-io/nod/commit/cd83994564948a413a0563fbbb1d5ed0389e5315) (cd83994)
+- Simplify the landing page and add platform icons. [commit](https://github.com/n8n-io/nod/commit/e5d801b96f2b93e06f28a878075460d6fa6149d5) (e5d801b)
+- Match the landing page dot grid to the n8n site. [commit](https://github.com/n8n-io/nod/commit/52a323fd58abec0799669ab27fee8f0c66149538) (52a323f)
+- Polish the landing page FAQ. [commit](https://github.com/n8n-io/nod/commit/5d95a5ce11b392a8c4f30e40128061999c2731c0) (5d95a5c)
+
+[Full changelog](https://github.com/n8n-io/nod/compare/nod-v0.7.5...3ab2f076766bff409567ce850a2cb18bc5628dbf)
+
+<details>
+<summary>Build details</summary>
+
+Source: `3ab2f076766bff409567ce850a2cb18bc5628dbf`
+Previous release: `nod-v0.7.5`
+
+</details>
+
+## 0.7.5 - 2026-11-13
+
+### Features
+
+- **analytics:** Separate execution results from model failures. [#852](https://github.com/n8n-io/nod/pull/852) (66b5420)
+- **docs:** Add an About n8n labs box to the landing page. [#844](https://github.com/n8n-io/nod/pull/844) (770a7d4)
+- **desktop:** Use Nod's own title bar on Windows. [commit](https://github.com/n8n-io/nod/commit/a521e8a6e67df7b03999dd2a896eff30f8726f96) (a521e8a)
+
+### Fixes
+
+- **pi:** Recover context overflows across models. [#843](https://github.com/n8n-io/nod/pull/843) (8c86251)
+- Configure e2e approval curators (LAB-899). [#791](https://github.com/n8n-io/nod/pull/791) (593b2b6)
+- **models:** Rewrite another model's tool call ids for OpenAI-compatible servers. [commit](https://github.com/n8n-io/nod/commit/847e3bbd1db93b1739feb71cdf8feae6419876db) (847e3bb)
+- **usage:** Show activity in computer time zone. [#801](https://github.com/n8n-io/nod/pull/801) (9346ce1)
+- **gmail:** Identify draft in cleanup approval (LAB-762). [#810](https://github.com/n8n-io/nod/pull/810) (02b2483)
+- **docs:** Add site security headers and disclosure file. [commit](https://github.com/n8n-io/nod/commit/d6207ed48d8b9f6dc4e7ab46297d1700ff59e2db) (d6207ed)
+
+### Performance
+
+- **memory:** Bound recall selection input. [#800](https://github.com/n8n-io/nod/pull/800) (5448656)
+
+<details>
+<summary>Maintenance (1 changes)</summary>
+
+- Add a feature video skill for pull requests and releases. [#853](https://github.com/n8n-io/nod/pull/853) (f193a06)
+
+</details>
+
+[Full changelog](https://github.com/n8n-io/nod/compare/nod-v0.7.4...3d4a3588fad454ed01ad620274f3a744ed8eb06b)
+
+<details>
+<summary>Build details</summary>
+
+Source: `3d4a3588fad454ed01ad620274f3a744ed8eb06b`
+Previous release: `nod-v0.7.4`
+
+</details>
+
+## 0.7.4 - 2026-11-13
+
+### Features
+
+- **usage:** Record everything Nod did, export it as CSV and answer from it. [#840](https://github.com/n8n-io/nod/pull/840) (1dcec5f)
+- **agent:** Answer any Nod question from bundled docs. [#839](https://github.com/n8n-io/nod/pull/839) (094f67a)
+- **schedules:** Add Run now. [#838](https://github.com/n8n-io/nod/pull/838) (440d204)
+
+### Fixes
+
+- **vault:** Clarify unknown sign-in recovery. [#804](https://github.com/n8n-io/nod/pull/804) (6f1cd18)
+- **trust:** Bind approval questions to exact actions. [#799](https://github.com/n8n-io/nod/pull/799) (9c87975)
+- **sign-in:** Surface expired form status to next turn. [#788](https://github.com/n8n-io/nod/pull/788) (95231b7)
+- **chat:** Explain overlong pasted messages. [#789](https://github.com/n8n-io/nod/pull/789) (af89389)
+- **tasks:** Avoid duplicate acknowledgements. [#790](https://github.com/n8n-io/nod/pull/790) (73007ed)
+- Cache stable scheduled request prefixes. [#786](https://github.com/n8n-io/nod/pull/786) (bc121f3)
+- **channels:** Clarify desktop WhatsApp availability. [#785](https://github.com/n8n-io/nod/pull/785) (fd63563)
+- **runtime:** Stop repeated failures and keep recovery causes. [#836](https://github.com/n8n-io/nod/pull/836) (a0c029d)
+- **channels:** Recover Telegram and WhatsApp connections. [commit](https://github.com/n8n-io/nod/commit/956ebb1a60374dc4f2041d13759a06fd13e2450d) (956ebb1)
+- **desktop:** Quote the Windows uninstall command correctly. [#834](https://github.com/n8n-io/nod/pull/834) (52947da)
+- **web:** Remove fixed from onboarding data sharing text. [#835](https://github.com/n8n-io/nod/pull/835) (6afb888)
+- **models:** Recover from request, access and quota failures. [#811](https://github.com/n8n-io/nod/pull/811) (65132ee)
+- **models:** Let local models answer after Pi's 5-minute request timeout. [#808](https://github.com/n8n-io/nod/pull/808) (e9d5813)
+- **chat:** Show what Nod is doing instead of filler words. [#802](https://github.com/n8n-io/nod/pull/802) (ecbb6cc)
+
+### Documentation
+
+- Say the computer restarted in the Keep Nod running table. [commit](https://github.com/n8n-io/nod/commit/78b299a51ce76c92d38cc8cbc483d2889950831e) (78b299a)
+- **setup:** List the Docker Buildx plugin as a source-install requirement. [#812](https://github.com/n8n-io/nod/pull/812) (915e4f1)
+- Explain that schedules wait for sign-in after a restart. [commit](https://github.com/n8n-io/nod/commit/0dd6f1c004ccadfc39694dcf33fceabf0d01df2e) (0dd6f1c)
+
+[Full changelog](https://github.com/n8n-io/nod/compare/nod-v0.7.3...6f1cd18a14128e296b9982da2eccdf69e40cf6f0)
+
+<details>
+<summary>Build details</summary>
+
+Source: `6f1cd18a14128e296b9982da2eccdf69e40cf6f0`
+Previous release: `nod-v0.7.3`
+
+</details>
+
 ## 0.7.3 - 2026-11-12
 
 ### Features

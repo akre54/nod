@@ -11,12 +11,20 @@ import {
   Globe2,
   Hourglass,
   LoaderCircle,
+  LockKeyhole,
   MessageCircle,
   MessageSquare,
 } from '../components/icons';
-import type { Activity, Schedule, Task, TaskDetail } from '../../shared/contracts';
+import type {
+  Activity,
+  Schedule,
+  Task,
+  TaskDetail,
+  WorkspaceCommand,
+} from '../../shared/contracts';
 import { taskHeadline, taskLabels } from '../../shared/task-status';
 import { InlineName } from '../components/inline-name';
+import { WorkspaceCommandDialog, WorkspaceCommandLine } from '../components/workspace-command';
 import { pageDataCache } from '../lib/page-data-cache';
 import { api } from '../lib/api';
 import { PageTitle } from '../components/page-title';
@@ -91,6 +99,44 @@ function TaskActivity({ id }: { id: string }) {
   );
 }
 
+function TaskCommands({ id }: { id: string }) {
+  const data = usePageData<{ commands: WorkspaceCommand[] }>(`/api/tasks/${id}/commands`);
+  const commands = data.data?.commands ?? [];
+  const [selected, setSelected] = useState<string | null>(null);
+  return (
+    <section className="task-commands" aria-label="Workspace commands">
+      <p className="task-commands-where">
+        <LockKeyhole size={14} aria-hidden="true" />
+        Nod runs these in its isolated workspace. You can view them here.
+      </p>
+      {data.error ? (
+        <Notice>{data.error}</Notice>
+      ) : !data.data ? (
+        <Loading label="Loading commands…" />
+      ) : !commands.length ? (
+        <p className="task-preview-meta">No commands yet.</p>
+      ) : (
+        <ol role="list">
+          {commands.map((command) => (
+            <li
+              key={command.id}
+              className={
+                command.state === 'failed' || (command.exitCode !== null && command.exitCode !== 0)
+                  ? 'is-failed'
+                  : undefined
+              }
+            >
+              {command.helper && <small>Helper</small>}
+              <WorkspaceCommandLine command={command} onOpen={() => setSelected(command.id)} />
+            </li>
+          ))}
+        </ol>
+      )}
+      {selected && <WorkspaceCommandDialog id={selected} onClose={() => setSelected(null)} />}
+    </section>
+  );
+}
+
 export function TaskCard({
   task,
   live,
@@ -130,6 +176,7 @@ export function TaskCard({
     return () => window.removeEventListener('nod:open-task', open);
   }, [inChat, task.id]);
   const [showActivity, setShowActivity] = useState(false);
+  const [showCommands, setShowCommands] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [error, setError] = useState('');
   const format = useDateFormat();
@@ -340,6 +387,17 @@ export function TaskCard({
               >
                 {showActivity ? 'Hide activity' : 'Show activity'}
               </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-expanded={showCommands}
+                onClick={() => {
+                  if (!showCommands) captureAnalytics('task_action', { action: 'show_commands' });
+                  setShowCommands(!showCommands);
+                }}
+              >
+                {showCommands ? 'Hide commands' : 'Show commands'}
+              </Button>
               {!closed(task) && (
                 <Button
                   variant="ghost"
@@ -364,6 +422,7 @@ export function TaskCard({
             </div>
             {error && <Notice>{error}</Notice>}
             {showActivity && <TaskActivity id={task.id} />}
+            {showCommands && <TaskCommands id={task.id} />}
             {task.status === 'done' && <ScheduleTask taskId={task.id} onCreated={onScheduled} />}
           </div>
         </div>
