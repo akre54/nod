@@ -1778,7 +1778,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
           discovered: discovered?.accounts ?? [],
           ...(failed
             ? {
-                incomplete: `Could not search ${providerId}. Matching tools may be missing; retry before concluding that no action exists.`,
+                incomplete: `${failure(`Could not search ${providerId}`, failed)} Matching tools may be missing.`,
               }
             : {}),
         };

@@ -2367,6 +2367,7 @@ async function initializeApplication(
             keptOut: await localFiles.keepOut(turn, String(args.path ?? ''), client),
           }));
         }
+        const readWork = (await turnOrigin(turn.turnId))?.source === 'user' ? 'read' : 'background';
         if (action === 'SEARCH_TOOLS') {
           await options.admit?.(false);
           const result = await integrations.execute(
@@ -2376,7 +2377,7 @@ async function initializeApplication(
             turn,
             options.signal,
             undefined,
-            'read',
+            readWork,
           );
           return result;
         }
@@ -2454,7 +2455,7 @@ async function initializeApplication(
               turn,
               options.signal,
               deleteBinding,
-              'read',
+              readWork,
             );
           } catch (error) {
             options.signal?.throwIfAborted();
@@ -2489,7 +2490,7 @@ async function initializeApplication(
               turn,
               options.signal,
               deleteBinding,
-              !verdict.confirm && verdict.basis.kind === 'read' ? 'read' : 'action',
+              !verdict.confirm && verdict.basis.kind === 'read' ? readWork : 'action',
             );
             await ledger.action(
               turn.turnId,

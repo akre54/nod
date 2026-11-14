@@ -85,13 +85,13 @@ Nod checks Gmail for new mail while it's running. The connection service doesn't
 
 ## When the connection service is busy
 
-All apps connected through the connection service share one allowance for your Nod install. When the service answers HTTP 429 (too many requests) or 503 (unavailable), Nod pauses background reads of all those apps. The pause lasts as long as the service's `Retry-After` header asks, up to 15 minutes. Without that header, it lasts one minute and doubles after each refusal, up to 30 minutes. A successful call ends it.
+All apps connected through the connection service share one allowance for your Nod install. When the service answers HTTP 429 (too many requests) or 503 (unavailable), Nod pauses background reads of all those apps. The pause lasts as long as the service's `Retry-After` header asks, up to 15 minutes. Without that header, it lasts one minute and doubles after each refusal, up to 30 minutes. A successful app request that starts after the latest refusal ends the pause.
 
 During the pause:
 
-- A read you ask for, in chat or a task, still tries once. If the service refuses it, the pause grows.
+- A read you ask for, in chat or a task you started, still tries once. If the service refuses it, the pause grows.
 - An action, such as sending an email, fails at once with the time the pause ends. Nod doesn't send it, so it can't run twice. Ask again after that time.
-- Background checks skip these apps and read them again later.
+- Background checks, scheduled reads and reads in tasks Nod starts skip these apps. They can try again later.
 
 Errors name the service's reason, such as `installation_busy`, and the HTTP status. MCP servers, APIs, CLIs and local files don't use the connection service, so the pause doesn't affect them.
 

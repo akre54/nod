@@ -8724,6 +8724,30 @@ test(
       path.tools?.map((tool) => tool.name),
       ['notion-search', 'notion-fetch'],
     );
+    const until = Date.now() + 120_000;
+    const backoff = provider.connectionBackoff;
+    provider.connectionBackoff = () => ({
+      until,
+      status: 429,
+      code: 'installation_busy' as const,
+    });
+    try {
+      const paused = (await integrations.execute(
+        owner,
+        'SEARCH_TOOLS',
+        { query: 'Notion page' },
+        undefined,
+        undefined,
+        undefined,
+        'background',
+      )) as { incomplete: string; discovered: unknown[] };
+      assert.match(paused.incomplete, /installation_busy, HTTP 429/);
+      assert.ok(paused.incomplete.includes(new Date(until).toISOString()));
+      assert.match(paused.incomplete, /Do not retry this source now/);
+      assert.ok(paused.discovered.length);
+    } finally {
+      provider.connectionBackoff = backoff;
+    }
     const read = await integrations.execute(owner, 'CONNECTED_MCP_CALL', {
       connectionId: connected.connectionId,
       pathId: path.id,

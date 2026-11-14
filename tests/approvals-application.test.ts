@@ -12,6 +12,7 @@ import pg from 'pg';
 import type { MemoryCurator } from '../src/ports/memory-curator.ts';
 import type { AgentToolResult } from '../src/ports/agent.ts';
 import type { MessagingTransport } from '../src/ports/messaging.ts';
+import type { IntegrationBackoff } from '../src/ports/integrations.ts';
 import { createIntegrationFixture } from '../scripts/e2e-fixtures.ts';
 import { fakeComputer, fakeWorkspace } from './runtime-fixtures.ts';
 import { accessCookie, accessKey } from '../src/server/access.ts';
@@ -164,6 +165,8 @@ test(
     let toolSearch: Record<string, unknown> | undefined;
     const readOnlyActions = new Set<string>();
     let appOutage = false;
+    let connectionWait: IntegrationBackoff | undefined;
+    let appSessions = 0;
     let appResult: unknown;
     let changeRulesOnDraftRead = false;
     let changedRulesDuringDraftRead = 0;
@@ -455,7 +458,9 @@ test(
         }),
         integrations: {
           ...integrationFixture.provider,
+          connectionBackoff: () => connectionWait,
           createSession: async (...args) => {
+            appSessions++;
             const session = await integrationFixture.provider.createSession(...args);
             session.upload = async (_action, file) => {
               uploads.push(Buffer.from(file.bytes).toString());
@@ -1035,6 +1040,66 @@ test(
             dialogOpen = false;
           }
           assert.equal(browserActs.filter((act) => act.action === 'accept_dialog').length, 1);
+        },
+      );
+
+      await t.test(
+        'connection service waits stop automatic app reads and preserve owner reads',
+        async () => {
+          connectionWait = { until: Date.now() + 120_000, status: 429, code: 'installation_busy' };
+          appResult = { id: 'synthetic-draft', message: { id: 'synthetic-message' } };
+          const calls = [
+            { action: 'SEARCH_TOOLS', args: { query: 'gmail' } },
+            { action: 'GMAIL_GET_DRAFT', args: { draft_id: 'synthetic-draft' } },
+          ];
+          try {
+            for (const source of ['event', 'schedule'] as const) {
+              const parent = await enqueueTurn('Synthetic automatic parent', {
+                source,
+                background: true,
+              });
+              await waitFor(parent, 'succeeded');
+              for (const call of calls) {
+                const before = appSessions;
+                const prompt = `Synthetic automatic app read ${randomUUID()}`;
+                plans.set(prompt, { tool: 'apps', ...call });
+                const turn = await enqueueTurn(prompt, {
+                  source: 'task',
+                  parentTurnId: parent,
+                  background: true,
+                });
+                await waitFor(turn, 'succeeded|failed');
+                const saved = (await pool.query('SELECT error FROM turns WHERE id=$1', [turn]))
+                  .rows[0];
+                assert.match(
+                  JSON.stringify(results.get(turn)) ?? saved.error,
+                  /installation_busy.*HTTP 429/,
+                );
+                assert.equal(appSessions, before);
+                assert.deepEqual(await approvalsFor(turn), []);
+              }
+            }
+            for (const call of calls) {
+              const before = appSessions;
+              const owner = await propose(call.action, call.args, 'apps');
+              assert.equal(appSessions, before + 1);
+              assert.deepEqual(await approvalsFor(owner), []);
+              if (call.action === 'GMAIL_GET_DRAFT') {
+                const prompt = `Synthetic owner task read ${randomUUID()}`;
+                plans.set(prompt, { tool: 'apps', ...call });
+                const task = await enqueueTurn(prompt, {
+                  source: 'task',
+                  parentTurnId: owner,
+                  background: true,
+                });
+                await waitFor(task, 'succeeded');
+                assert.equal(appSessions, before + 2);
+              }
+            }
+          } finally {
+            connectionWait = undefined;
+            appResult = undefined;
+          }
         },
       );
 
