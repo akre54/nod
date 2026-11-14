@@ -7,6 +7,7 @@ import type { Session } from './session.ts';
 export type Capability =
   | 'apps'
   | 'browser'
+  | 'computer-use'
   | 'vault'
   | 'files'
   | 'research'

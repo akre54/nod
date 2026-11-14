@@ -1026,6 +1026,16 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
 }
 
 function portableToolCallIds(messages: Context['messages'], model: string): Context['messages'] {
+  const portable = /^[A-Za-z0-9]{9}$/;
+  const used = new Set(
+    messages.flatMap((message) =>
+      message.role === 'assistant'
+        ? message.content.flatMap((part) =>
+            part.type === 'toolCall' && portable.test(part.id) ? [part.id] : [],
+          )
+        : [],
+    ),
+  );
   const ids = new Map<string, string>();
   return messages.map((message) => {
     if (message.role === 'toolResult') {
@@ -1038,8 +1048,11 @@ function portableToolCallIds(messages: Context['messages'], model: string): Cont
     return {
       ...message,
       content: message.content.map((part) => {
-        if (part.type !== 'toolCall' || /^[A-Za-z0-9]{9}$/.test(part.id)) return part;
-        const id = createHash('sha256').update(part.id).digest('hex').slice(0, 9);
+        if (part.type !== 'toolCall' || portable.test(part.id)) return part;
+        let id = createHash('sha256').update(part.id).digest('hex').slice(0, 9);
+        for (let attempt = 1; used.has(id); attempt++)
+          id = createHash('sha256').update(`${attempt}:${part.id}`).digest('hex').slice(0, 9);
+        used.add(id);
         ids.set(part.id, id);
         return { ...part, id };
       }),

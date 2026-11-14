@@ -56,6 +56,8 @@ import { grade } from '../src/grade.ts';
 import { criteria as productCriteria, standard } from '../src/product.ts';
 import { check, type Scenario } from '../src/scenario.ts';
 import { insights } from '../src/insights.ts';
+import { capabilityMatrix } from '../src/model-capabilities.ts';
+import { agentModels } from '../../src/shared/model-defaults.ts';
 import { cards, comparisonChart } from '../src/chart.ts';
 import { storyCard } from '../src/story.ts';
 import { facts, leaderboard } from '../src/writeup.ts';
@@ -1479,6 +1481,108 @@ test('model rankings ignore runs that are contaminated or only partly run', () =
   assert.equal(ranked.best?.run, good);
   assert.equal(insights([run(0.9, { contaminated: true })]).best, undefined);
   assert.equal(insights([missing]).best, undefined);
+});
+
+test('the capability matrix fills a capability only from the newest usable run that measured it', async () => {
+  const run = (
+    label: string,
+    model: string,
+    startedAt: string,
+    capabilities: Array<[string, number]>,
+    extra: Record<string, unknown> = {},
+  ) => ({
+    label,
+    summary: {
+      manifest: { label, model, startedAt },
+      coverage: { missing: [], incomplete: 0 },
+      contaminated: false,
+      capabilities: capabilities.map(([capability, passAt1]) => ({
+        capability,
+        passAt1,
+        scenarios: 3,
+      })),
+      ...extra,
+    } as never,
+  });
+  const model = `openai/${agentModels.openai}`;
+  const rows = await capabilityMatrix([
+    run('noisy', model, '2026-11-03', [['computer-use', 1]], { contaminated: true }),
+    run('partial', model, '2026-11-02', [['computer-use', 0.9]], {
+      coverage: { missing: ['computer-use-slider-drag.3'], incomplete: 0 },
+    }),
+    run('unfinished', model, '2026-11-02', [['computer-use', 0.8]], {
+      coverage: { missing: [], incomplete: 1 },
+    }),
+    run('apps-only', model, '2026-11-01', [['apps', 0.8]]),
+    run('older', model, '2026-10-20', [['computer-use', 0.2]]),
+    run('computer', model, '2026-10-30', [['computer-use', 0.5]]),
+    run('other', 'openai/not-in-the-catalog', '2026-10-30', [['files', 0.4]]),
+  ]);
+  const sol = rows.find((row) => row.model === model)!;
+  assert.deepEqual(sol.measured['Computer use'], { passAt1: 0.5, scenarios: 3, label: 'computer' });
+  assert.equal(sol.measured['Tool selection']?.label, 'apps-only');
+  assert.equal(sol.measured.Coding, null);
+  assert.equal(typeof sol.images, 'boolean');
+  const other = rows.find((row) => row.model === 'openai/not-in-the-catalog')!;
+  assert.equal(other.images, null);
+  assert.equal(other.contextWindow, null);
+  assert.equal(other.measured.Coding?.passAt1, 0.4);
+});
+
+test('the ferry capability score requires a correct pier verdict even when the reply names Pier 5', async () => {
+  const definition = scenarios.find((item) => item.id === 'computer-use-departures-board')!;
+  const world = definition.world({ now: Date.now });
+  for (const [said, correct] of [
+    ['The 19:05 ferry leaves from Pier 5.', true],
+    ['The 19:05 ferry leaves from Pier 4, not Pier 5.', false],
+    ['I cannot confirm whether the 19:05 ferry leaves from Pier 5.', false],
+  ] as const) {
+    const trace = {
+      ...quietRun(world),
+      task: definition.title,
+      final: said,
+      said,
+      turns: [{ id: 'turn', status: 'succeeded', background: false }],
+      messages: [{ role: 'assistant', text: said }],
+      transcript: () => `ASSISTANT: ${said}`,
+    } as Run;
+    const { checks, graderFault, judgeFault } = await grade({
+      definition,
+      world,
+      trace,
+      truth: definition.evidence!(trace, world),
+      skipJudges: false,
+      judge: {
+        complete: async (_system: string, input: string) =>
+          JSON.stringify({
+            verdicts: [...input.matchAll(/^- ([\w-]+):/gm)].map(([, id]) => ({
+              id,
+              applicable: true,
+              pass: id !== 'gives-the-current-pier' || correct,
+              reasoning: 'The reply must confirm Pier 5 for the 19:05 ferry.',
+            })),
+          }),
+      } as never,
+    });
+    assert.equal(graderFault, undefined);
+    assert.equal(judgeFault, undefined);
+    const summary = summarize({ ...manifest, repeat: 1, scenarioIds: [definition.id] }, [
+      attempt(
+        definition.id,
+        checks.every((item) => item.pass || !item.required) ? 'pass' : 'fail',
+        {
+          capabilities: definition.capabilities,
+          checks,
+        },
+      ),
+    ]);
+    const rows = await capabilityMatrix([{ label: manifest.label, summary }]);
+    assert.equal(
+      rows.find((row) => row.model === manifest.model)?.measured['Computer use']?.passAt1,
+      Number(correct),
+      said,
+    );
+  }
 });
 
 test('scenario API calls use authenticated local transport and refuse outside targets', async (t) => {

@@ -9186,6 +9186,78 @@ test('Ollama models with on or off thinking complete tasks without a named effor
   }
 });
 
+test('a rewritten tool call id never takes an id already in the conversation', async (t) => {
+  const original = globalThis.fetch;
+  t.after(() => (globalThis.fetch = original));
+  const taken = createHash('sha256').update('functions.browser:12').digest('hex').slice(0, 9);
+  const bodies: Array<{
+    messages: Array<{ tool_calls?: Array<{ id: string }>; tool_call_id?: string }>;
+  }> = [];
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    const path = new URL(request.url).pathname;
+    if (path === '/v1/models') return Response.json({ data: [{ id: 'devstral-small-2507' }] });
+    if (path !== '/v1/chat/completions') return new Response(null, { status: 404 });
+    bodies.push(await request.json());
+    return reply({ role: 'assistant', content: 'The synthetic page says hello.' });
+  };
+  const credential = { type: 'endpoint' as const, url: 'http://127.0.0.1:1/v1' };
+  const [definition] = await createPiModelBackend({ fetch: globalThis.fetch }).catalog(
+    'compatible',
+    'api_key',
+    credential,
+  );
+  assert.ok(definition);
+  const step = (id: string, timestamp: number): Context['messages'] => [
+    {
+      ...fauxAssistantMessage(''),
+      provider: 'compatible',
+      api: 'openai-completions',
+      model: 'moonshotai/Kimi-K2.6',
+      stopReason: 'toolUse',
+      content: [{ type: 'toolCall', id, name: 'browser', arguments: {} }],
+      timestamp,
+    },
+    {
+      role: 'toolResult',
+      toolCallId: id,
+      toolName: 'browser',
+      content: [{ type: 'text', text: 'Synthetic page text.' }],
+      isError: false,
+      timestamp,
+    },
+  ];
+  const { runtime, model } = await createPiModelRuntime({
+    provider: 'compatible',
+    method: 'api_key',
+    definition,
+    effort: 'off',
+    read: async () => credential,
+  });
+  const result = await runtime.completeSimple(
+    model,
+    {
+      messages: [
+        { role: 'user', content: 'Open the synthetic page.', timestamp: 1 },
+        ...step(taken, 2),
+        ...step('functions.browser:12', 3),
+        { role: 'user', content: 'What did it say?', timestamp: 4 },
+      ],
+    },
+    {},
+  );
+  assert.equal(result.stopReason, 'stop');
+  const replayed = bodies[0]!.messages;
+  const calls = replayed.flatMap(({ tool_calls }) => tool_calls?.map(({ id }) => id) ?? []);
+  assert.equal(calls[0], taken);
+  assert.match(calls[1]!, /^[A-Za-z0-9]{9}$/);
+  assert.notEqual(calls[1], taken);
+  assert.deepEqual(
+    replayed.flatMap(({ tool_call_id }) => tool_call_id ?? []),
+    calls,
+  );
+});
+
 test('invalid tool calls stop before another model request and a valid repair resets the limit', async (t) => {
   for (const [repair, toolName] of [
     [false, 'task'],

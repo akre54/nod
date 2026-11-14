@@ -33,7 +33,9 @@ import type { Agent, AgentEvent, AgentToolResult, RuntimeContext } from '../src/
 import { type DiscoveredOAuthState } from '../src/ports/discovered.ts';
 import {
   IntegrationCatalogAccessDenied,
+  IntegrationCatalogFailure,
   IntegrationConnectionError,
+  IntegrationInboxTransientError,
   IntegrationPermissionError,
   type IntegrationFile,
   type IntegrationProvider,
@@ -3380,6 +3382,37 @@ test(
     assert.deepEqual(Object.keys(missingAuthAccess.json()), ['error']);
     assert.match(missingAuthAccess.json().error, /connection service/);
     assert.doesNotMatch(missingAuthAccess.body, /synthetic-private-auth-response/);
+    failure = Object.assign(
+      new IntegrationCatalogFailure('rate_limit', 429, 'public_budget_exceeded'),
+      {
+        cause: new Error('synthetic-private-catalog-response'),
+      },
+    );
+    const limitedCatalog = await f.app.inject({ url: '/api/apps/catalog' });
+    assert.equal(limitedCatalog.statusCode, 429);
+    assert.deepEqual(Object.keys(limitedCatalog.json()), ['error']);
+    assert.match(limitedCatalog.json().error, /public_budget_exceeded/);
+    assert.match(limitedCatalog.json().error, /429/);
+    assert.doesNotMatch(limitedCatalog.body, /synthetic-private-catalog-response/);
+    await assert.rejects(
+      f.service.manageConnections('discover', undefined, undefined, undefined, undefined, 'gmail'),
+      (error: unknown) =>
+        error instanceof IntegrationCatalogFailure && error.code === 'public_budget_exceeded',
+    );
+    failure = new IntegrationCatalogFailure('unavailable', 503, 'security_service_unavailable');
+    const unavailableCatalog = await f.app.inject({ url: '/api/apps/catalog' });
+    assert.equal(unavailableCatalog.statusCode, 503);
+    assert.match(unavailableCatalog.json().error, /security_service_unavailable/);
+    assert.match(unavailableCatalog.json().error, /503/);
+    failure = new IntegrationCatalogFailure('unavailable', 502, 'invalid_provider_response');
+    const invalidProviderCatalog = await f.app.inject({ url: '/api/apps/catalog' });
+    assert.equal(invalidProviderCatalog.statusCode, 502);
+    assert.match(invalidProviderCatalog.json().error, /invalid_provider_response/);
+    assert.match(invalidProviderCatalog.json().error, /502/);
+    failure = new IntegrationCatalogAccessDenied('installation_revoked');
+    const revoked = await f.app.inject({ url: '/api/apps/catalog' });
+    assert.equal(revoked.statusCode, 403);
+    assert.match(revoked.json().error, /installation_revoked/);
     failure = new IntegrationCatalogAccessDenied();
     const denied = await f.app.inject({ url: '/api/apps/catalog' });
     assert.equal(denied.statusCode, 403);
@@ -5883,6 +5916,128 @@ test(
     ]);
     await f.service.drain();
     assert.equal(f.wakes.length, 4);
+  },
+);
+
+test(
+  'transient inbox failures retain completed receipts and retry before the normal interval',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    const f = await appsFixture(t);
+    f.provider.webhooksConfigured = false;
+    const selected = await f.connect('gmail');
+    const message = (id: string) => ({
+      id,
+      threadId: 'fixture-thread',
+      subject: 'Fixture update',
+      sender: 'sender@example.test',
+      receivedAt: '2026-01-01T00:00:00.000Z',
+    });
+    const cursors: Array<string | null> = [];
+    let unavailable = true;
+    f.provider.pollInbox = async (_account, cursor) => {
+      cursors.push(cursor);
+      if (cursor === null) return { cursor: 'baseline', hasMore: false, messages: [] };
+      if (cursor === 'baseline')
+        return {
+          cursor: 'remaining',
+          hasMore: true,
+          retryAfterMs: 60_000,
+          messages: [message('first')],
+        };
+      if (unavailable) throw new IntegrationInboxTransientError(503);
+      return {
+        cursor: 'complete',
+        hasMore: false,
+        messages: [message('first'), message('second')],
+      };
+    };
+    const row = async () =>
+      (
+        await f.pool.query<{
+          inbox_cursor: string | null;
+          inbox_poll_at: Date;
+          inbox_failed: boolean;
+          inbox_reconnect_required: boolean;
+        }>(
+          'SELECT inbox_cursor,inbox_poll_at,inbox_failed,inbox_reconnect_required FROM app_connections WHERE id=$1',
+          [selected.connectionId],
+        )
+      ).rows[0];
+    const assertShortRetry = (pollAt: Date) => {
+      const waitMs = pollAt.getTime() - Date.now();
+      assert.ok(waitMs > 30_000 && waitMs <= 65_000, `Retry in ${waitMs} ms`);
+    };
+    await f.service.pollInboxes();
+    await f.pool.query('UPDATE app_connections SET inbox_poll_at=NULL WHERE id=$1', [
+      selected.connectionId,
+    ]);
+    await f.service.pollInboxes();
+    assert.equal((await row()).inbox_cursor, 'remaining');
+    assert.equal((await row()).inbox_failed, false);
+    assertShortRetry((await row()).inbox_poll_at);
+    assert.equal((await f.pool.query('SELECT id FROM integration_events')).rowCount, 1);
+    await f.service.pollInboxes();
+    assert.deepEqual(cursors, [null, 'baseline']);
+    await f.pool.query('UPDATE app_connections SET inbox_poll_at=now() WHERE id=$1', [
+      selected.connectionId,
+    ]);
+    await f.service.pollInboxes();
+    assert.deepEqual(cursors, [null, 'baseline', 'remaining']);
+    assert.equal((await row()).inbox_cursor, 'remaining');
+    assert.equal((await row()).inbox_failed, true);
+    assert.equal((await row()).inbox_reconnect_required, false);
+    assertShortRetry((await row()).inbox_poll_at);
+    await f.service.pollInboxes();
+    assert.deepEqual(cursors, [null, 'baseline', 'remaining']);
+    unavailable = false;
+    await f.pool.query('UPDATE app_connections SET inbox_poll_at=now() WHERE id=$1', [
+      selected.connectionId,
+    ]);
+    await f.service.pollInboxes();
+    assert.equal((await row()).inbox_cursor, 'complete');
+    assert.equal((await row()).inbox_failed, false);
+    assert.equal((await f.pool.query('SELECT id FROM integration_events')).rowCount, 2);
+  },
+);
+
+test(
+  'shutdown releases a claimed inbox poll after the account becomes inactive',
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 15_000 },
+  async (t) => {
+    const f = await appsFixture(t);
+    f.provider.webhooksConfigured = false;
+    const selected = await f.connect('gmail');
+    let enter = () => {};
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    f.provider.pollInbox = async (_account, _cursor, signal) => {
+      enter();
+      return new Promise<never>((_resolve, reject) => {
+        if (signal.aborted) reject(signal.reason);
+        else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    };
+    const running = f.service.pollInboxes();
+    await entered;
+    await f.pool.query('UPDATE app_connections SET account_active=false WHERE id=$1', [
+      selected.connectionId,
+    ]);
+    await f.app.close();
+    await running;
+    const row = (
+      await f.pool.query<{
+        account_active: boolean;
+        inbox_claim_id: string | null;
+        inbox_poll_at: Date;
+      }>('SELECT account_active,inbox_claim_id,inbox_poll_at FROM app_connections WHERE id=$1', [
+        selected.connectionId,
+      ])
+    ).rows[0];
+    assert.equal(row.account_active, false);
+    assert.equal(row.inbox_claim_id, null);
+    assert.ok(row.inbox_poll_at.getTime() <= Date.now() + 5_000);
   },
 );
 
@@ -8993,14 +9148,18 @@ test('Composio failure envelopes reject with the provider error', async (t) => {
   await session.execute('GMAIL_SEND_EMAIL', {}, 'fixture-account');
 });
 
-test('Composio connection requests classify HTTP failures without repeating consent or exposing provider details', async (t) => {
+test('Composio catalog and connection requests classify HTTP failures without exposing provider details', async (t) => {
   const { createServer } = await import('node:http');
   const { IntegrationConnectionError } = await import('../src/ports/integrations.ts');
   let failure: { phase: string; status: number; code?: string } | undefined;
   let rejected = 0;
   const server = createServer(async (request, response) => {
     const path = new URL(request.url!, 'http://localhost').pathname;
-    const phase = path.endsWith('/tool_router/session') ? 'session' : undefined;
+    const phase = path.endsWith('/toolkits')
+      ? 'catalog'
+      : path.endsWith('/tool_router/session')
+        ? 'session'
+        : undefined;
     response.setHeader('content-type', 'application/json');
     if (failure && failure.phase === phase && phase) {
       rejected++;
@@ -9052,6 +9211,68 @@ test('Composio connection requests classify HTTP failures without repeating cons
       }),
     }),
   });
+  for (const [status, reason, code] of [
+    [429, 'rate_limit', 'public_budget_exceeded'],
+    [429, 'rate_limit', 'rate_limited'],
+    [429, 'rate_limit', 'provider_rate_limited'],
+    [503, 'unavailable', 'security_service_unavailable'],
+    [503, 'unavailable', 'provider_unavailable'],
+    [503, 'unavailable', 'invalid_limit_configuration'],
+    [502, 'unavailable', 'invalid_provider_response'],
+    [502, 'unavailable', 'unsafe_provider_response'],
+    [504, 'timeout', undefined],
+  ] as const) {
+    failure = { phase: 'catalog', status, code };
+    const before = rejected;
+    await assert.rejects(provider.listServices!(), (error: unknown) => {
+      assert.ok(error instanceof IntegrationCatalogFailure);
+      assert.equal(error.reason, reason);
+      assert.equal(error.status, status);
+      assert.equal(error.statusCode, status);
+      assert.equal(error.code, code);
+      assert.ok(error.message.includes(String(status)));
+      assert.doesNotMatch(String(error), /synthetic-private|fixture-key/);
+      assert.equal(error.cause, undefined);
+      return true;
+    });
+    assert.ok(rejected > before);
+  }
+  failure = { phase: 'catalog', status: 503, code: 'synthetic-private-provider-body' };
+  await assert.rejects(provider.listServices!(), (error: unknown) => {
+    assert.ok(error instanceof IntegrationCatalogFailure);
+    assert.equal(error.status, 503);
+    assert.equal(error.code, undefined);
+    assert.doesNotMatch(String(error), /synthetic-private|fixture-key/);
+    return true;
+  });
+  for (const code of [
+    'installation_enrollment_required',
+    'installation_revoked',
+    'browser_pairing_required',
+  ]) {
+    failure = { phase: 'catalog', status: 403, code };
+    await assert.rejects(provider.listServices!(), (error: unknown) => {
+      assert.ok(error instanceof IntegrationCatalogAccessDenied);
+      assert.equal(error.code, code);
+      assert.match(error.message, /HTTP 403/);
+      return true;
+    });
+  }
+  failure = { phase: 'catalog', status: 403 };
+  await assert.rejects(provider.listServices!(), IntegrationCatalogAccessDenied);
+  failure = undefined;
+  const timeout = t.mock.method(client.getClient().toolkits, 'list', async () => {
+    throw new APIConnectionTimeoutError();
+  });
+  await assert.rejects(provider.listServices!(), (error: unknown) => {
+    assert.ok(error instanceof IntegrationCatalogFailure);
+    assert.equal(error.reason, 'timeout');
+    assert.equal(error.statusCode, 504);
+    assert.equal(error.status, undefined);
+    return true;
+  });
+  timeout.mock.restore();
+  assert.ok((await provider.listServices!()).some((service) => service.slug === 'gmail'));
   const connect = async () => {
     const session = await provider.createSession('fixture-owner', {});
     return session.authorize('gmail', 'http://localhost:4310/api/apps/callback');
@@ -9546,6 +9767,29 @@ test(
           ['Tell Sam we take the quote', 'chat', 0.55],
         ],
       );
+      for (const [prompt, title] of [
+        ['Berlin time, 8am on monday&#x20;', 'Berlin time, 8am on monday'],
+        ['**Berlin time, 8am on monday&#x20;**', 'Berlin time, 8am on monday'],
+        ['Explain `&#x20;` and \\&#x20;', 'Explain &#x20; and &#x20;'],
+        ['```python\nprint("hello")\n```', 'print("hello")'],
+        ['# First line\nSecond line', 'First line'],
+        ['- First\n- Second', 'First'],
+        ['> First\n>\n> Second', 'First'],
+        [
+          '| Berlin time | 8am on Monday |\n| --- | --- |\n| Europe | Berlin |',
+          'Berlin time | 8am on Monday',
+        ],
+      ]) {
+        await pool.query('UPDATE turns SET prompt=$2 WHERE id=$1', [chat, prompt]);
+        const entry = (await app.inject('/api/trust'))
+          .json()
+          .entries.find((item: TrustEntry) => item.id === chat) as TrustEntry;
+        assert.equal(entry.title, title);
+      }
+      await pool.query('UPDATE turns SET prompt=$2 WHERE id=$1', [
+        chat,
+        'Tell Sam we take the quote',
+      ]);
       const chatEntry = (entries: TrustEntry[]) =>
         entries.find((entry) => entry.title === 'Tell Sam we take the quote')!;
       assert.ok(view.entries.every((entry: TrustEntry) => entry.messageId === null));
@@ -10556,6 +10800,178 @@ test('Composio inbox polling rejects cancellation and invalid metadata after par
   );
   assert.equal(unlabeled.hasMore, false);
   assert.equal(JSON.parse(unlabeled.cursor).historyId, '200');
+});
+
+test('Composio inbox polling retains completed messages when a later Gmail read is temporarily unavailable', async (t) => {
+  const diagnostics: string[] = [];
+  t.mock.method(console, 'warn', (value: string) => diagnostics.push(value));
+  let unavailable = true;
+  let historyReads = 0;
+  let failedMessageReads = 0;
+  const poll = inboxPollFixture(t, (input) => {
+    if (input.endpoint.endsWith('/history')) {
+      historyReads++;
+      return {
+        status: 200,
+        data: {
+          historyId: '200',
+          history: [{ messagesAdded: ['m0', 'm1'].map((id) => ({ message: { id } })) }],
+        },
+      };
+    }
+    const id = input.endpoint.split('/').at(-1)!;
+    if (id === 'm1') {
+      failedMessageReads++;
+      if (unavailable) return { status: 503, data: { error: 'service_unavailable' } };
+    }
+    return {
+      status: 200,
+      data: {
+        id,
+        threadId: `thread-${id}`,
+        internalDate: '1790769600000',
+        labelIds: ['INBOX'],
+        payload: { headers: [] },
+      },
+    };
+  });
+  const first = await poll(
+    'inbox-account',
+    JSON.stringify({ accountId: 'inbox-account', historyId: '100' }),
+    new AbortController().signal,
+  );
+  assert.deepEqual(
+    first.messages.map(({ id }) => id),
+    ['m0'],
+  );
+  assert.equal(first.hasMore, true);
+  assert.equal(first.retryAfterMs, 60_000);
+  assert.deepEqual(JSON.parse(first.cursor), {
+    accountId: 'inbox-account',
+    historyId: '100',
+    pending: ['m1'],
+    finalHistoryId: '200',
+  });
+  assert.equal(failedMessageReads, 3);
+  unavailable = false;
+  const second = await poll('inbox-account', first.cursor, new AbortController().signal);
+  assert.deepEqual(
+    second.messages.map(({ id }) => id),
+    ['m1'],
+  );
+  assert.equal(second.hasMore, false);
+  assert.equal(second.retryAfterMs, undefined);
+  assert.equal(JSON.parse(second.cursor).historyId, '200');
+  assert.equal(historyReads, 1);
+  assert.doesNotMatch(diagnostics.join(' '), /m0|m1|inbox-account/);
+});
+
+test('Composio inbox polling shares a bounded retry budget across Gmail reads', async (t) => {
+  let historyReads = 0;
+  let firstReads = 0;
+  let secondReads = 0;
+  const poll = inboxPollFixture(t, (input) => {
+    if (input.endpoint.endsWith('/history')) {
+      historyReads++;
+      if (historyReads === 1) return { status: 503, data: {} };
+      return {
+        status: 200,
+        data: {
+          historyId: '200',
+          history: [{ messagesAdded: ['m0', 'm1'].map((id) => ({ message: { id } })) }],
+        },
+      };
+    }
+    const id = input.endpoint.split('/').at(-1)!;
+    if (id === 'm0') {
+      firstReads++;
+      if (firstReads === 1) return { status: 503, data: {} };
+    } else {
+      secondReads++;
+      return { status: 503, data: {} };
+    }
+    return {
+      status: 200,
+      data: {
+        id,
+        threadId: `thread-${id}`,
+        internalDate: '1790769600000',
+        labelIds: ['INBOX'],
+        payload: { headers: [] },
+      },
+    };
+  });
+  const result = await poll(
+    'inbox-account',
+    JSON.stringify({ accountId: 'inbox-account', historyId: '100' }),
+    new AbortController().signal,
+  );
+  assert.deepEqual(
+    result.messages.map(({ id }) => id),
+    ['m0'],
+  );
+  assert.equal(result.retryAfterMs, 60_000);
+  assert.deepEqual([historyReads, firstReads, secondReads], [2, 2, 1]);
+});
+
+test('Composio inbox polling defers shared budget failures without retrying and cancels backoff', async (t) => {
+  let budgetRequests = 0;
+  const budgetPoll = inboxPollFixture(t, () => {
+    budgetRequests++;
+    throw APIError.generate(429, { error: 'public_budget_exceeded' }, undefined, new Headers());
+  });
+  await assert.rejects(
+    budgetPoll('inbox-account', null, new AbortController().signal),
+    (error: unknown) => {
+      assert.ok(error instanceof IntegrationInboxTransientError);
+      assert.equal(error.status, 429);
+      assert.equal(error.code, 'public_budget_exceeded');
+      assert.equal(error.retryAfterMs, 300_000);
+      return true;
+    },
+  );
+  assert.equal(budgetRequests, 1);
+
+  let unavailableRequests = 0;
+  const unavailablePoll = inboxPollFixture(t, () => {
+    unavailableRequests++;
+    if (unavailableRequests === 1)
+      throw APIError.generate(503, { error: 'service_unavailable' }, undefined, new Headers());
+    return { status: 200, data: { historyId: '200' } };
+  });
+  const recovered = await unavailablePoll('inbox-account', null, new AbortController().signal);
+  assert.equal(JSON.parse(recovered.cursor).historyId, '200');
+  assert.equal(unavailableRequests, 2);
+
+  const controller = new AbortController();
+  let cancelledRequests = 0;
+  const cancellationPoll = inboxPollFixture(t, () => {
+    cancelledRequests++;
+    setTimeout(() => controller.abort(), 25);
+    return { status: 503, data: {} };
+  });
+  await assert.rejects(cancellationPoll('inbox-account', null, controller.signal), {
+    name: 'AbortError',
+  });
+  assert.equal(cancelledRequests, 1);
+});
+
+test('Composio inbox polling reports a transient failure when no message can be read', async (t) => {
+  let reads = 0;
+  const poll = inboxPollFixture(t, () => {
+    reads++;
+    return { status: 503, data: {} };
+  });
+  await assert.rejects(
+    poll('inbox-account', null, new AbortController().signal),
+    (error: unknown) => {
+      assert.ok(error instanceof IntegrationInboxTransientError);
+      assert.equal(error.status, 503);
+      assert.equal(error.retryAfterMs, 60_000);
+      return true;
+    },
+  );
+  assert.equal(reads, 3);
 });
 
 test('Composio inbox polling reads past a message with a very long or very large header set', async (t) => {
