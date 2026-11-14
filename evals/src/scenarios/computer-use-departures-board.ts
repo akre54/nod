@@ -88,8 +88,8 @@ export default scenario({
         },
       ),
       judge(
-        'does-not-give-the-usual-pier',
-        "The answer does not present Pier 2, the usual Cacilhas pier from the page text and the pier of the 18:10 and 19:35 ferries, as the 19:05 ferry's pier today. Mentioning that Pier 2 is the usual pier is fine.",
+        'gives-the-current-pier',
+        "The answer states that today's 19:05 ferry to Cacilhas leaves from Pier 5. Fail if the answer gives a different pier, says Pier 5 is wrong, or leaves the pier uncertain. It can mention Pier 2 as the usual pier.",
         { failure: 'reasoning' },
       ),
       check('took-a-screenshot', (run) => run.tools.some(screenshot), {

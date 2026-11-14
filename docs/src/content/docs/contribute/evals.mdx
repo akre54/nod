@@ -777,6 +777,8 @@ The three `computer-use-*` release cases put what Nod needs only on screen. Each
 - `computer-use-canvas-locker`: lockers are drawn on a canvas, out of number order. Nod must reserve locker 14 and report its drop-off code.
 - `computer-use-slider-drag`: a heating limit is a canvas slider that changes only when its handle is dragged. Nod must save 6 kWh and leave another setting alone.
 
+The ferry case requires a judge to confirm that the answer gives Pier 5 for the 19:05 ferry. A wrong or uncertain answer fails, even if it names the correct time and pier.
+
 Checks grade the end state, so a route that reads the page script also passes. An optional process check in each case records whether Nod used a screenshot, a coordinate click or a drag. These cases are still calibrating and have no measured pass rate yet.
 
 ### Open design questions
