@@ -25,7 +25,7 @@ import type {
 } from '../../ports/messaging.ts';
 import type { ChannelLinkStatus } from '../../shared/contracts.ts';
 import { contactAttachment, locationAttachment } from './content.ts';
-import { whatsappText } from './format.ts';
+import { canDeliverWhatsAppLiteral, whatsappText } from './format.ts';
 import { contactCards, sharedLocation } from '../../shared/channel-content.ts';
 
 const silent: SocketConfig['logger'] = {
@@ -45,6 +45,26 @@ const numberOf = (jid: string | null | undefined) => {
 };
 const qrLifetimeMs = 60_000;
 
+export type WhatsAppDrop = {
+  reason:
+    | 'unsupported_chat'
+    | 'sender_unmatched'
+    | 'self_chat_mismatch'
+    | 'from_me'
+    | 'before_link'
+    | 'invalid_time'
+    | 'own_echo'
+    | 'missing_id'
+    | 'lid_lookup_failed'
+    | 'decrypt_failed'
+    | 'unsupported_type'
+    | 'resend_ignored'
+    | 'queue_full';
+  mode: 'bot' | 'own';
+  addressing: 'lid' | 'phone' | 'other';
+  suppressed: number;
+};
+
 type Socket = Pick<
   WASocket,
   'ev' | 'sendMessage' | 'sendPresenceUpdate' | 'logout' | 'end' | 'user' | 'signalRepository'
@@ -56,6 +76,7 @@ export function createWhatsAppLinkedTransport(options: {
   store: ChannelSessionStore;
   createSocket?: (configuration: Parameters<typeof makeWASocket>[0]) => Socket;
   download?: typeof downloadMediaMessage;
+  onDrop?: (drop: WhatsAppDrop) => void;
 }): MessagingTransport {
   let socket: Socket | undefined;
   let session: ChannelSession | undefined;
@@ -70,6 +91,8 @@ export function createWhatsAppLinkedTransport(options: {
   let expiry: ReturnType<typeof setTimeout> | undefined;
   let attempt = 0;
   let linkedAt = 0;
+  let allowedLid: string | undefined;
+  const revokedLids = new Set<string>();
   let state: ChannelLinkStatus = { state: 'connecting' };
   const lifetime = new AbortController();
   const pairingId = randomUUID();
@@ -78,6 +101,7 @@ export function createWhatsAppLinkedTransport(options: {
   const reactions: InboundReaction[] = [];
   let received = Promise.resolve();
   let queued = 0;
+  const drops = new Map<string, { at: number; suppressed: number }>();
   const channel: MessagingChannel = {
     id: 'whatsapp',
     status: 'setup_required',
@@ -88,10 +112,19 @@ export function createWhatsAppLinkedTransport(options: {
     available: false,
   };
 
-  function stop(next: ChannelLinkStatus['state']) {
+  function stop(next: ChannelLinkStatus['state'], error: string, cause?: unknown) {
+    const code = (cause as { code?: unknown } | undefined)?.code;
+    if (typeof code === 'string' && /^(?:[0-9A-Z]{5}|[A-Z][A-Z0-9_]{0,31})$/.test(code))
+      error += ` Error code: ${code}.`;
     halted = true;
     channel.available = false;
-    state = { state: next, accountHandle: state.accountHandle, accountName: state.accountName };
+    state = {
+      state: next,
+      accountHandle: state.accountHandle,
+      accountName: state.accountName,
+      error,
+    };
+    channel.error = error;
     clearTimeout(reconnect);
     clearTimeout(expiry);
     socket?.end(undefined);
@@ -101,8 +134,9 @@ export function createWhatsAppLinkedTransport(options: {
       if (closed || !session) throw new Error('The WhatsApp session is closed.');
       await session.set(values);
     });
-    writes = pending.catch(() => {
-      if (!closed) stop('failed');
+    writes = pending.catch((cause) => {
+      if (!closed && !halted)
+        stop('failed', 'Nod could not save the WhatsApp device keys. Select Reconnect.', cause);
     });
     return pending;
   }
@@ -134,27 +168,65 @@ export function createWhatsAppLinkedTransport(options: {
     state.accountName = auth.creds.me?.name?.slice(0, 200);
     return channel.status === 'configured';
   }
-  async function sender(message: WAMessage, current: Socket) {
+  function drop(reason: WhatsAppDrop['reason'], message?: WAMessage) {
+    const jid = message?.key.remoteJid ?? '';
+    const addressing = jid.endsWith('@lid')
+      ? 'lid'
+      : jid.endsWith('@s.whatsapp.net')
+        ? 'phone'
+        : 'other';
+    const key = `${reason}:${addressing}`;
+    const now = Date.now();
+    const last = drops.get(key);
+    if (last && now - last.at < 60_000) {
+      last.suppressed++;
+      return;
+    }
+    drops.set(key, { at: now, suppressed: 0 });
+    options.onDrop?.({
+      reason,
+      mode: options.mode === 'bot' ? 'bot' : 'own',
+      addressing,
+      suppressed: last?.suppressed ?? 0,
+    });
+  }
+  async function sender(
+    message: WAMessage,
+    current: Socket,
+  ): Promise<{ phone: string; jid: string } | WhatsAppDrop['reason']> {
     const jid = message.key.remoteJid;
     if (!jid || message.key.participant || !/^\d+(?::\d+)?@(s\.whatsapp\.net|lid)$/.test(jid))
-      return;
+      return 'unsupported_chat';
+    const normalizedJid = jidNormalizedUser(jid);
+    if (revokedLids.has(normalizedJid)) return 'sender_unmatched';
     let phone = numberOf(jid);
     if (!phone && jid.endsWith('@lid')) {
       phone =
         options.mode === 'self-chat'
-          ? jidNormalizedUser(jid) ===
-            jidNormalizedUser(auth.creds.me?.lid ?? current.user?.lid ?? '')
+          ? normalizedJid === jidNormalizedUser(auth.creds.me?.lid ?? current.user?.lid ?? '')
             ? ownNumber()
             : undefined
           : numberOf(message.key.remoteJidAlt);
       if (!phone && options.mode !== 'self-chat')
-        phone = numberOf(await current.signalRepository.lidMapping.getPNForLID(jid));
+        phone = numberOf(
+          await current.signalRepository.lidMapping.getPNForLID(jid).catch(() => null),
+        );
+      const allowedNumber = options.allowedNumber;
+      if (!phone && options.mode === 'bot' && allowedNumber) {
+        const lid = await current.signalRepository.lidMapping
+          .getLIDForPN(`${allowedNumber}@s.whatsapp.net`)
+          .catch(() => false as const);
+        if (lid === false) return 'lid_lookup_failed';
+        if (lid ? jidNormalizedUser(lid) === normalizedJid : normalizedJid === allowedLid)
+          phone = allowedNumber;
+      }
     }
-    if (!phone || !channel.allowedSenderIds.includes(phone)) return;
+    if (!phone || !channel.allowedSenderIds.includes(phone))
+      return options.mode === 'self-chat' ? 'self_chat_mismatch' : 'sender_unmatched';
     if (options.mode === 'self-chat') {
-      if (phone !== ownNumber() || !message.key.fromMe) return;
-    } else if (message.key.fromMe) return;
-    return { phone, jid: jidNormalizedUser(jid) };
+      if (phone !== ownNumber() || !message.key.fromMe) return 'self_chat_mismatch';
+    } else if (message.key.fromMe) return 'from_me';
+    return { phone, jid: normalizedJid };
   }
   function attachment(message: WAMessage): MessagingAttachment[] {
     const content = normalizeMessageContent(message.message);
@@ -267,18 +339,22 @@ export function createWhatsAppLinkedTransport(options: {
     if (closed || halted || socket !== current || !identity()) return;
     const id = message.key.id;
     const at = Number(message.messageTimestamp) * 1000;
-    if (
-      !id ||
-      sentIds.has(id) ||
-      !Number.isFinite(at) ||
-      at < linkedAt ||
-      at > Date.now() + 300_000
-    )
-      return;
+    if (!id) return drop('missing_id', message);
+    if (sentIds.has(id)) return drop('own_echo', message);
+    if (!Number.isFinite(at) || at > Date.now() + 300_000) return drop('invalid_time', message);
+    if (at < linkedAt) return drop('before_link', message);
     const source = await sender(message, current);
-    if (!source || closed || halted || socket !== current) return;
+    if (closed || halted || socket !== current) return;
+    if (typeof source === 'string') return drop(source, message);
+    if (revokedLids.has(source.jid)) return drop('sender_unmatched', message);
     const content = normalizeMessageContent(message.message);
-    if (!content) return;
+    if (!content)
+      return drop(
+        message.messageStubType === proto.WebMessageInfo.StubType.CIPHERTEXT
+          ? 'decrypt_failed'
+          : 'unsupported_type',
+        message,
+      );
     const reaction = content.reactionMessage;
     if (reaction?.key?.id) {
       if (reactions.length < 1000)
@@ -299,7 +375,8 @@ export function createWhatsAppLinkedTransport(options: {
       content.documentMessage?.caption ??
       '';
     const files = attachment(message);
-    if ((!text && !files.length) || incoming.length >= 1000) return;
+    if (!text && !files.length) return drop('unsupported_type', message);
+    if (incoming.length >= 1000) return drop('queue_full', message);
     const context =
       content.extendedTextMessage?.contextInfo ??
       content.imageMessage?.contextInfo ??
@@ -325,7 +402,14 @@ export function createWhatsAppLinkedTransport(options: {
   }
   function connect() {
     if (closed || halted) return;
-    state = { ...state, state: 'connecting', qr: undefined, expiresAt: undefined };
+    state = {
+      ...state,
+      state: 'connecting',
+      qr: undefined,
+      expiresAt: undefined,
+      error: undefined,
+    };
+    channel.error = undefined;
     const current = (options.createSocket ?? makeWASocket)({
       auth,
       logger: silent,
@@ -349,21 +433,40 @@ export function createWhatsAppLinkedTransport(options: {
       },
     });
     socket = current;
+    allowedLid = undefined;
+    if (options.mode === 'bot' && options.allowedNumber)
+      current.ev.on('lid-mapping.update', ({ lid, pn }) => {
+        if (closed || halted || socket !== current || !/^\d+(?::\d+)?@lid$/.test(lid)) return;
+        const phone = numberOf(pn);
+        if (!phone) return;
+        const jid = jidNormalizedUser(lid);
+        if (phone === options.allowedNumber) {
+          revokedLids.delete(jid);
+          allowedLid = jid;
+        } else {
+          revokedLids.add(jid);
+          if (allowedLid === jid) allowedLid = undefined;
+        }
+      });
     current.ev.on('creds.update', (update) => {
       if (closed || halted || socket !== current) return;
       Object.assign(auth.creds, update);
       void save({ creds: JSON.stringify(auth.creds, BufferJSON.replacer) }).catch(() => {});
     });
     current.ev.on('messages.upsert', (event) => {
-      if (closed || halted || socket !== current || event.requestId) return;
+      if (closed || halted || socket !== current) return;
+      if (event.requestId) return drop('resend_ignored', event.messages[0]);
       const messages = event.messages.slice(0, Math.max(0, 1000 - queued));
+      if (messages.length < event.messages.length)
+        drop('queue_full', event.messages[messages.length]);
       queued += messages.length;
       received = received
         .then(async () => {
           for (const message of messages) await intake(message, current);
         })
-        .catch(() => {
-          if (!closed) stop('failed');
+        .catch((cause) => {
+          if (!closed && !halted)
+            stop('failed', 'Nod could not read a WhatsApp message. Select Reconnect.', cause);
         })
         .finally(() => {
           queued -= messages.length;
@@ -382,13 +485,25 @@ export function createWhatsAppLinkedTransport(options: {
         };
       if (update.connection === 'open') {
         if (!identity()) {
-          stop('failed');
+          stop(
+            'failed',
+            ownNumber() === options.allowedNumber
+              ? 'The bot account uses your personal number. Link a different account, or choose Use my own number.'
+              : 'WhatsApp did not provide a usable account number. Select Reconnect.',
+          );
           return;
         }
         clearTimeout(expiry);
         attempt = 0;
-        state = { ...state, state: 'connected', qr: undefined, expiresAt: undefined };
+        state = {
+          ...state,
+          state: 'connected',
+          qr: undefined,
+          expiresAt: undefined,
+          error: undefined,
+        };
         channel.available = true;
+        channel.error = undefined;
         if (!linkedAt) {
           linkedAt = Date.now() - 2000;
           void save({ 'intake-start': String(linkedAt) }).catch(() => {});
@@ -401,21 +516,43 @@ export function createWhatsAppLinkedTransport(options: {
           update.lastDisconnect?.error as { output?: { statusCode?: number } } | undefined
         )?.output?.statusCode;
         if (code === DisconnectReason.loggedOut) {
-          stop('logged_out');
+          stop('logged_out', `WhatsApp signed out this device (${code}). Start again to link it.`);
           void clearSaved().catch(() => {
-            state = { state: 'failed' };
+            stop(
+              'failed',
+              'Nod could not remove the signed-out WhatsApp device keys. Select Reconnect.',
+            );
           });
         } else if (
           code === DisconnectReason.connectionReplaced ||
           code === DisconnectReason.badSession ||
           code === DisconnectReason.forbidden ||
           code === DisconnectReason.multideviceMismatch
-        )
-          stop('failed');
-        else {
+        ) {
+          const reason =
+            code === DisconnectReason.connectionReplaced
+              ? 'WhatsApp replaced this connection with another session'
+              : code === DisconnectReason.badSession
+                ? 'WhatsApp rejected the saved device session'
+                : code === DisconnectReason.forbidden
+                  ? 'WhatsApp refused this device'
+                  : 'WhatsApp rejected the device version';
+          stop(
+            'failed',
+            `${reason} (${code}). Select Reconnect. If it still fails, check Linked Devices in WhatsApp.`,
+          );
+        } else {
+          state.error = `WhatsApp disconnected${Number.isInteger(code) ? ` (${code})` : ''}. Nod is trying to reconnect.`;
+          channel.error = state.error;
           clearTimeout(reconnect);
           reconnect = setTimeout(
-            () => connect(),
+            () => {
+              try {
+                connect();
+              } catch (cause) {
+                stop('failed', 'Nod could not reconnect to WhatsApp. Select Reconnect.', cause);
+              }
+            },
             Math.min(60_000, 1000 * 2 ** Math.min(attempt++, 6)),
           );
           reconnect.unref();
@@ -465,16 +602,24 @@ export function createWhatsAppLinkedTransport(options: {
       if (!credentials) await save({ creds: JSON.stringify(auth.creds, BufferJSON.replacer) });
       if (!auth.creds.registered) {
         expiry = setTimeout(() => {
-          stop('expired');
+          stop('expired', 'The WhatsApp QR setup expired. Start again to get a new code.');
           void clearSaved().catch(() => {
-            state = { state: 'failed' };
+            stop(
+              'failed',
+              'Nod could not remove the expired WhatsApp device keys. Select Reconnect.',
+            );
           });
         }, 5 * 60_000);
         expiry.unref();
       }
       connect();
-    })().catch(() => {
-      if (!closed) stop('failed');
+    })().catch((cause) => {
+      if (!closed && !halted)
+        stop(
+          'failed',
+          'Nod could not start the saved WhatsApp connection. Select Reconnect.',
+          cause,
+        );
     });
     await starting;
   }
@@ -520,6 +665,9 @@ export function createWhatsAppLinkedTransport(options: {
       throw new Error('The WhatsApp target is unavailable.');
   };
   return {
+    canDeliverLiteral({ channelId, text, literal }) {
+      return channelId === 'whatsapp' && canDeliverWhatsAppLiteral(text, literal);
+    },
     get channels() {
       return [channel];
     },
@@ -622,13 +770,19 @@ export function createWhatsAppLinkedTransport(options: {
           );
           continue;
         }
+        const opus = 27 + (bytes[26] ?? 0);
         const media = file.mimeType.startsWith('image/')
           ? { image: bytes, mimetype: file.mimeType }
           : file.mimeType.startsWith('video/')
             ? { video: bytes, mimetype: file.mimeType }
-            : file.mimeType.startsWith('audio/')
-              ? { audio: bytes, mimetype: file.mimeType, ptt: file.mimeType === 'audio/ogg' }
-              : { document: bytes, mimetype: file.mimeType, fileName: file.name };
+            : file.mimeType.startsWith('audio/') &&
+                bytes.subarray(0, 4).toString('latin1') === 'OggS' &&
+                bytes.subarray(opus, opus + 8).toString('latin1') === 'OpusHead' &&
+                bytes[opus + 9] === 1
+              ? { audio: bytes, mimetype: 'audio/ogg; codecs=opus', ptt: true }
+              : /^audio\/(?:mpeg|mp4|aac|amr)\s*(?:;|$)/i.test(file.mimeType)
+                ? { audio: bytes, mimetype: file.mimeType }
+                : { document: bytes, mimetype: file.mimeType, fileName: file.name };
         ids.push(await send(input.threadId, { ...media, ...(caption ? { caption } : {}) }, quote));
       }
       if (unsent.length) {
@@ -636,7 +790,7 @@ export function createWhatsAppLinkedTransport(options: {
           for (const part of splitMessage(text))
             if (part.trim())
               ids.push(await send(input.threadId, { text: part, linkPreview: null }, quote));
-        const notice = await input.attachmentFailure?.(unsent);
+        const notice = await input.attachmentFailure?.(unsent.map((name) => ({ name })));
         for (const part of splitMessage(whatsappText(notice ?? '')))
           if (part.trim())
             ids.push(await send(input.threadId, { text: part, linkPreview: null }, quote));
@@ -670,6 +824,7 @@ export function createWhatsAppLinkedTransport(options: {
       }
       halted = true;
       channel.available = false;
+      channel.error = undefined;
       state = { state: 'failed' };
       clearTimeout(reconnect);
       clearTimeout(expiry);
@@ -693,7 +848,12 @@ export function createWhatsAppLinkedTransport(options: {
       } finally {
         socket?.end(undefined);
         await starting;
-        await clearSaved();
+        try {
+          await clearSaved();
+        } catch (cause) {
+          stop('failed', 'Nod could not remove the WhatsApp device keys.', cause);
+          throw cause;
+        }
         channel.available = false;
         channel.status = 'setup_required';
         state = { state: 'logged_out' };

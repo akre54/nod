@@ -3,6 +3,7 @@ import { createHash, createHmac, randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import type { Pool, PoolClient } from 'pg';
 import { z } from 'zod';
+import { parse as parseDomain } from 'tldts';
 import { openVaultValue, sealVaultValue } from './vault-crypto.ts';
 import { authenticatorCode } from './authenticator.ts';
 import { authenticatorKey } from '../shared/authenticator-key.ts';
@@ -142,6 +143,7 @@ type VaultUse = {
   reason: 'entered' | 'picked';
 };
 type VaultOptions = {
+  signal?: AbortSignal;
   analytics?: CaptureAnalytics;
   refresh?(): void;
   onUse?(use: VaultUse, client: PoolClient): Promise<void>;
@@ -156,7 +158,7 @@ type VaultOptions = {
   ): Promise<void>;
   resume(turnId: string, client: PoolClient): Promise<void>;
   retry(turnId: string): Promise<void>;
-  inject(input: CredentialInjection): Promise<CredentialSubmission | void>;
+  inject(input: CredentialInjection, signal?: AbortSignal): Promise<CredentialSubmission | void>;
   keyStore: CredentialKeyStore;
   requestKey: Buffer;
   page?(threadId: string, step?: BrowserAction): Promise<BrowserPage>;
@@ -169,6 +171,7 @@ type VaultOptions = {
   selectSignInMethod?(
     threadId: string,
     input: { origin: string; document: string; methodId: string },
+    signal?: AbortSignal,
   ): Promise<void>;
   emailCode?(input: EmailCodeRequest, signal: AbortSignal): Promise<PrivateEmailCode | undefined>;
   icon?(origin: string): Promise<SiteIcon | null>;
@@ -206,7 +209,7 @@ type RequestRow = {
   kind: CredentialRequest['kind'];
   token_hash: string;
   status: 'pending' | 'consumed' | 'superseded' | 'retried';
-  operation_status?: 'running' | 'submitted' | 'uncertain';
+  operation_status?: 'running' | 'submitted' | 'uncertain' | 'not_entered';
   selectors: CredentialInput | MethodInput;
   flow_id: string | null;
   flow_expires_at: Date | null;
@@ -388,6 +391,17 @@ export function credentialOrigin(value: string) {
       'Use only the website origin, such as https://example.com. Remove the path, query, and fragment.',
     );
   return url.origin;
+}
+
+export function credentialOrigins(value: string) {
+  const origin = credentialOrigin(value);
+  const url = new URL(origin);
+  const host = url.hostname.replace(/^www\./, '');
+  const domain = parseDomain(host, { allowPrivateDomains: true });
+  if (host.startsWith('www.') || domain.domain !== host || !(domain.isIcann || domain.isPrivate))
+    return [origin];
+  url.hostname = url.hostname === host ? `www.${host}` : host;
+  return [origin, url.origin];
 }
 
 function savedCredentialOrigin(value: string) {
@@ -577,7 +591,7 @@ export async function createVault(pool: Pool, options: VaultOptions) {
       owner_id text PRIMARY KEY, account text NOT NULL, updated_at timestamptz NOT NULL DEFAULT now()
     );
   `);
-  const uses = await createVaultUses(pool, owner, options.analytics);
+  const uses = await createVaultUses(pool, owner, options.analytics, options.signal);
   let keyPromise: Promise<Buffer> | undefined;
   const key = () => {
     keyPromise ??= options.keyStore
@@ -1338,7 +1352,7 @@ export async function createVault(pool: Pool, options: VaultOptions) {
     await lockKey(client, `thread:${owner}`);
     const { rows } = await client.query<RequestRow>(
       `SELECT r.* FROM credential_requests r JOIN turns u ON u.id=r.turn_id AND u.owner_id=r.owner_id
-       WHERE r.token_hash=$1 AND r.owner_id=$2 AND ${condition} ${allowExpired ? '' : "AND (r.kind<>'method' OR r.flow_expires_at>now())"} AND ${waitingTurnSql('u', 'credentials')}
+       WHERE r.token_hash=$1 AND r.owner_id=$2 AND ${condition} ${allowExpired ? '' : "AND (r.kind<>'method' OR r.created_at>now()-interval '30 minutes')"} AND ${waitingTurnSql('u', 'credentials')}
        FOR UPDATE OF r`,
       [hash, owner],
     );
@@ -1352,10 +1366,35 @@ export async function createVault(pool: Pool, options: VaultOptions) {
     return row.status === 'pending' && row.current_step ? 'pending' : 'expired';
   }
 
+  async function requestStatuses(threadId: string, sessionId: string, turnIds: string[]) {
+    if (!turnIds.length) return [];
+    const { rows } = await pool.query<
+      RequestStatusRow & Pick<RequestRow, 'turn_id' | 'origin' | 'label' | 'kind'>
+    >(
+      `SELECT r.turn_id,r.origin,r.label,r.kind,r.status,v.status AS operation_status,
+        r.status='pending' AND (r.kind<>'method' OR r.created_at>now()-interval '30 minutes')
+        AND ${waitingTurnSql('u', 'credentials')} AS current_step
+       FROM credential_requests r JOIN turns u
+         ON u.id=r.turn_id AND u.owner_id=r.owner_id AND u.thread_id=r.thread_id
+       LEFT JOIN vault_uses v ON v.id=r.id AND v.owner_id=r.owner_id AND r.status='consumed'
+       WHERE r.owner_id=$1 AND r.thread_id=$2 AND u.session_id=$3 AND r.turn_id=ANY($4::uuid[])
+       ORDER BY r.created_at DESC,r.id DESC`,
+      [owner, threadId, sessionId, turnIds],
+    );
+    return rows.map((row) => ({
+      turnId: row.turn_id,
+      origin: row.origin,
+      label: row.label,
+      kind: row.kind,
+      status: requestStatus(row),
+      ...(row.operation_status === 'not_entered' ? { notEntered: true } : {}),
+    }));
+  }
+
   async function describe(token: string): Promise<CredentialRequest> {
     await forgetExpiredHolds();
     const { rows } = await pool.query<RequestRow & { current_step: boolean }>(
-      `SELECT r.*,v.status AS operation_status,r.status='pending' AND (r.kind<>'method' OR r.flow_expires_at>now()) AND EXISTS(SELECT 1 FROM turns u WHERE u.id=r.turn_id AND u.owner_id=r.owner_id
+      `SELECT r.*,v.status AS operation_status,r.status='pending' AND (r.kind<>'method' OR r.created_at>now()-interval '30 minutes') AND EXISTS(SELECT 1 FROM turns u WHERE u.id=r.turn_id AND u.owner_id=r.owner_id
         AND ${waitingTurnSql('u', 'credentials')}) AS current_step
        FROM credential_requests r LEFT JOIN vault_uses v
          ON v.id=r.id AND v.owner_id=r.owner_id AND r.status='consumed'
@@ -1372,8 +1411,8 @@ export async function createVault(pool: Pool, options: VaultOptions) {
       const selected = chosen?.kind === 'identifier' ? chosen : undefined;
       username = await stagedUsername(selected);
       const entries = await pool.query<EntryRow>(
-        'SELECT e.* FROM vault_entries e WHERE e.owner_id=$1 AND e.origin=$2 ORDER BY e.updated_at DESC',
-        [row.owner_id, row.origin],
+        'SELECT e.* FROM vault_entries e WHERE e.owner_id=$1 AND e.origin=ANY($2::text[]) ORDER BY e.updated_at DESC',
+        [row.owner_id, credentialOrigins(row.origin)],
       );
       const matches =
         row.kind === 'password' && selected && username === undefined ? [] : entries.rows;
@@ -1412,6 +1451,7 @@ export async function createVault(pool: Pool, options: VaultOptions) {
       fields: row.inspection.fields,
       ...(row.kind === 'method' ? { methods: row.inspection.methods ?? [] } : {}),
       status,
+      ...(row.operation_status === 'not_entered' ? { notEntered: true } : {}),
       ...(savedEntries ? { savedEntries } : {}),
       ...(row.kind === 'password' && username ? { username } : {}),
       ...(manager ? { passwordManager: manager } : {}),
@@ -1528,6 +1568,7 @@ export async function createVault(pool: Pool, options: VaultOptions) {
       id: request?.id,
       ownerId,
       rootTurnId: root,
+      turnId: turn.turnId,
       origin: input.origin,
       kind: input.kind,
       itemId: undefined as string | undefined,
@@ -1584,8 +1625,8 @@ export async function createVault(pool: Pool, options: VaultOptions) {
             selected?.entry_id &&
             !(
               await client.query(
-                'SELECT id FROM vault_entries WHERE id=$1 AND owner_id=$2 AND origin=$3 FOR SHARE',
-                [selected.entry_id, ownerId, input.origin],
+                'SELECT id FROM vault_entries WHERE id=$1 AND owner_id=$2 AND origin=ANY($3::text[]) FOR SHARE',
+                [selected.entry_id, ownerId, credentialOrigins(input.origin)],
               )
             ).rowCount
           )
@@ -1598,8 +1639,8 @@ export async function createVault(pool: Pool, options: VaultOptions) {
             throw new VaultError('An authenticator key can only enter a verification code.', 409);
           const row = (
             await client.query<EntryRow>(
-              'SELECT * FROM vault_entries WHERE id=$1 AND owner_id=$2 AND origin=$3 FOR SHARE',
-              [source.entryId, ownerId, input.origin],
+              'SELECT * FROM vault_entries WHERE id=$1 AND owner_id=$2 AND origin=ANY($3::text[]) FOR SHARE',
+              [source.entryId, ownerId, credentialOrigins(input.origin)],
             )
           ).rows[0];
           if (!row) throw new VaultError('This saved login is no longer available.', 409);
@@ -1668,8 +1709,8 @@ export async function createVault(pool: Pool, options: VaultOptions) {
           if (entryId) {
             const row = (
               await client.query<EntryRow>(
-                'SELECT * FROM vault_entries WHERE id=$1 AND owner_id=$2 AND origin=$3 FOR SHARE',
-                [entryId, ownerId, input.origin],
+                'SELECT * FROM vault_entries WHERE id=$1 AND owner_id=$2 AND origin=ANY($3::text[]) FOR SHARE',
+                [entryId, ownerId, credentialOrigins(input.origin)],
               )
             ).rows[0];
             if (!row) throw new VaultError('No saved password is available for this website.', 404);
@@ -1736,19 +1777,22 @@ export async function createVault(pool: Pool, options: VaultOptions) {
             ],
           );
       },
-      perform: async () => {
-        await options.inject({
-          ...input,
-          threadId: browserOf(turn),
-          ...(input.kind === 'otp'
-            ? { code: authenticator ? authenticatorCode(authenticator) : secret.code }
-            : input.kind === 'identifier'
-              ? { username: secret.username }
-              : {
-                  username: input.usernameSelector ? secret.username : undefined,
-                  password: secret.password,
-                }),
-        });
+      perform: async (signal) => {
+        await options.inject(
+          {
+            ...input,
+            threadId: browserOf(turn),
+            ...(input.kind === 'otp'
+              ? { code: authenticator ? authenticatorCode(authenticator) : secret.code }
+              : input.kind === 'identifier'
+                ? { username: secret.username }
+                : {
+                    username: input.usernameSelector ? secret.username : undefined,
+                    password: secret.password,
+                  }),
+          },
+          signal,
+        );
         return true;
       },
       complete: async (client) => {
@@ -1937,6 +1981,7 @@ export async function createVault(pool: Pool, options: VaultOptions) {
           id: row.id,
           ownerId: owner,
           rootTurnId: row.root_turn_id,
+          turnId: row.turn_id,
           origin: row.origin,
           kind: 'method',
         },
@@ -1949,12 +1994,16 @@ export async function createVault(pool: Pool, options: VaultOptions) {
               row.id,
             ]);
           },
-          perform: () =>
-            options.selectSignInMethod!(row.browser_id ?? row.thread_id, {
-              origin: row.origin,
-              document: row.inspection.document!,
-              methodId,
-            }),
+          perform: (signal) =>
+            options.selectSignInMethod!(
+              row.browser_id ?? row.thread_id,
+              {
+                origin: row.origin,
+                document: row.inspection.document!,
+                methodId,
+              },
+              signal,
+            ),
           complete: async (client) => {
             await lockKey(client, `thread:${owner}`);
             if (
@@ -1992,7 +2041,7 @@ export async function createVault(pool: Pool, options: VaultOptions) {
       const request = await lockRequest(
         client,
         tokenHash(token),
-        "((r.status='consumed' AND EXISTS(SELECT 1 FROM vault_uses v WHERE v.id=r.id AND v.status='uncertain')) OR (r.status='pending' AND (r.failed_at IS NOT NULL OR (r.kind='method' AND r.flow_expires_at<=now()))))",
+        "((r.status='consumed' AND EXISTS(SELECT 1 FROM vault_uses v WHERE v.id=r.id AND v.status='uncertain')) OR (r.status='pending' AND (r.failed_at IS NOT NULL OR (r.kind='method' AND r.created_at<=now()-interval '30 minutes'))))",
         true,
       );
       if (!request)
@@ -2025,8 +2074,8 @@ export async function createVault(pool: Pool, options: VaultOptions) {
     const root = await rootTurn(pool, turn, ownerId);
     if (!root) return undefined;
     const { rows } = await pool.query<EntryRow>(
-      'SELECT * FROM vault_entries WHERE owner_id=$1 AND origin=$2',
-      [ownerId, origin],
+      'SELECT * FROM vault_entries WHERE owner_id=$1 AND origin=ANY($2::text[])',
+      [ownerId, credentialOrigins(origin)],
     );
     if (!rows.length) return undefined;
     const credentialKey = await key();
@@ -2073,7 +2122,8 @@ export async function createVault(pool: Pool, options: VaultOptions) {
     try {
       return await enterLogin(turn, ownerId, raw, { kind: 'selection', selected });
     } catch (error) {
-      if (error instanceof VaultUseError && error.statusCode === 502) throw error;
+      if (error instanceof VaultUseError && (error.statusCode === 502 || error.notEntered))
+        throw error;
       return false;
     }
   }
@@ -2126,7 +2176,8 @@ export async function createVault(pool: Pool, options: VaultOptions) {
         since,
       });
     } catch (error) {
-      if (error instanceof VaultUseError && error.statusCode === 502) throw error;
+      if (error instanceof VaultUseError && (error.statusCode === 502 || error.notEntered))
+        throw error;
       return false;
     }
   }
@@ -2136,7 +2187,7 @@ export async function createVault(pool: Pool, options: VaultOptions) {
     turnId: string,
     text: string,
     requestId: string,
-  ): Promise<{ status: 'submitted' | 'invalid' | 'unavailable' }> {
+  ): Promise<{ status: 'submitted' | 'invalid' | 'unavailable'; notEntered?: boolean }> {
     if (ownerId !== owner) return { status: 'unavailable' };
     const code = text.trim();
     if (!/^\d{4,8}$/.test(code)) return { status: 'invalid' };
@@ -2150,8 +2201,11 @@ export async function createVault(pool: Pool, options: VaultOptions) {
       if (rows.length !== 1) return { status: 'unavailable' };
       await submit(rows[0].token_hash, { code }, true);
       return { status: 'submitted' };
-    } catch {
-      return { status: 'unavailable' };
+    } catch (error) {
+      return {
+        status: 'unavailable',
+        ...(error instanceof VaultUseError && error.notEntered ? { notEntered: true } : {}),
+      };
     }
   }
 
@@ -2308,7 +2362,7 @@ export async function createVault(pool: Pool, options: VaultOptions) {
         '/api/credential-requests/:id/status',
         async (request) => {
           const { rows } = await pool.query<RequestStatusRow>(
-            `SELECT r.status,v.status AS operation_status,r.status='pending' AND (r.kind<>'method' OR r.flow_expires_at>now()) AND EXISTS(
+            `SELECT r.status,v.status AS operation_status,r.status='pending' AND (r.kind<>'method' OR r.created_at>now()-interval '30 minutes') AND EXISTS(
                SELECT 1 FROM turns u WHERE u.id=r.turn_id AND u.owner_id=r.owner_id
                AND ${waitingTurnSql('u', 'credentials')}) AS current_step
              FROM credential_requests r LEFT JOIN vault_uses v
@@ -2317,7 +2371,10 @@ export async function createVault(pool: Pool, options: VaultOptions) {
             [tokenHash(request.params.id), owner],
           );
           if (!rows[0]) throw new VaultError('Credential request not found.', 404);
-          return { status: requestStatus(rows[0]) };
+          return {
+            status: requestStatus(rows[0]),
+            ...(rows[0].operation_status === 'not_entered' ? { notEntered: true } : {}),
+          };
         },
       );
       scope.post<{ Params: { id: string } }>(
@@ -2355,6 +2412,7 @@ export async function createVault(pool: Pool, options: VaultOptions) {
       authenticatorKey?: string;
     }) => save(owner, passwordInput.parse(input)),
     request,
+    requestStatuses,
     list,
     readCredential,
     fillSaved,

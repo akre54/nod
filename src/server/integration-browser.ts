@@ -2,8 +2,14 @@ import { randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { z } from 'zod';
 import type { FastifyInstance } from 'fastify';
-import { createHostedIntegrationBrowser } from './integration-browser-hosted.ts';
-import type { IntegrationConnectionBrowser } from '../ports/integrations.ts';
+import {
+  createHostedIntegrationBrowser,
+  integrationPrivacyNotice,
+} from './integration-browser-hosted.ts';
+import {
+  IntegrationConnectionError,
+  type IntegrationConnectionBrowser,
+} from '../ports/integrations.ts';
 import { logFailure } from './failure-log.ts';
 
 const token = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
@@ -23,7 +29,10 @@ function renderIntegrationBrowser(
   const broker = JSON.stringify(brokerOrigin).replaceAll('<', '\\u003c');
   const secret = JSON.stringify(bridgeKey).replaceAll('<', '\\u003c');
   const expected = JSON.stringify(continuation).replaceAll('<', '\\u003c');
-  return String.raw`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connecting your app · Nod</title><style nonce="${nonce}">:root{color-scheme:light dark}body{font:16px system-ui;margin:0;min-height:100svh;display:grid;place-items:center;background:light-dark(#fafafa,#191919);color:light-dark(#191919,#fafafa)}main{max-width:360px;padding:32px;text-align:center}h1{font-size:16px;font-weight:400}p{line-height:1.6;color:light-dark(#676767,#bfbfbf)}.failed h1{font-size:21px;font-weight:550;letter-spacing:-.4px}</style></head><body><main hidden><h1 id="heading">Opening sign-in…</h1><p id="status" role="status"></p></main><script nonce="${nonce}">
+  const introduction = continuation.id
+    ? ''
+    : `<div id="introduction">${integrationPrivacyNotice}<button id="connect" type="button">Continue to sign in</button></div>`;
+  return String.raw`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect your app · Nod</title><style nonce="${nonce}">:root{color-scheme:light dark}body{font:16px system-ui;margin:0;min-height:100svh;display:grid;place-items:center;background:light-dark(#fafafa,#191919);color:light-dark(#191919,#fafafa)}main{max-width:360px;padding:32px;text-align:center}h1{font-size:21px;font-weight:550;letter-spacing:-.4px}p{line-height:1.6;color:light-dark(#676767,#bfbfbf)}button{font:inherit;padding:12px 20px;border:0;border-radius:8px;background:light-dark(#191919,#fafafa);color:light-dark(#fafafa,#191919);cursor:pointer}button:disabled{opacity:.5;cursor:default}a{color:inherit;text-underline-offset:3px}</style></head><body><main${continuation.id ? ' hidden' : ''}><h1 id="heading">${continuation.id ? 'Opening sign-in…' : 'Connect your app'}</h1>${introduction}<p id="status" role="status"></p></main><script nonce="${nonce}">
 const brokerOrigin=${broker};
 const bridgeKey=${secret};
 const expected=${expected};
@@ -37,9 +46,15 @@ const valid=()=>{if(Date.now()>=expected.expiresAt)throw new Error();};
 const open=()=>new Promise((resolve,reject)=>{const request=indexedDB.open(slot,1);request.onupgradeneeded=()=>request.result.createObjectStore('keys');request.onsuccess=()=>resolve(request.result);request.onerror=request.onblocked=()=>reject(new Error());});
 const stored=(action,value)=>new Promise((resolve,reject)=>{const transaction=database.transaction('keys','readwrite',{durability:'strict'});const store=transaction.objectStore('keys');let result;const request=store.get('current');request.onsuccess=()=>{result=request.result;if(action==='put')store.put(value,'current');else store.delete('current');};transaction.oncomplete=()=>resolve(result);transaction.onerror=transaction.onabort=()=>reject(new Error());});
 const encoded=(bytes)=>btoa(String.fromCharCode(...bytes)).replaceAll('+','-').replaceAll('/','_').replaceAll('=','');
-const request=async(body)=>{const response=await fetch('/start',{method:'POST',credentials:'same-origin',headers:{'X-Nod-Bridge':bridgeKey,'Content-Type':'application/json'},body:JSON.stringify(body)});if(!response.ok)throw new Error();return response.json();};
+const request=async(body)=>{const response=await fetch('/start',{method:'POST',credentials:'same-origin',headers:{'X-Nod-Bridge':bridgeKey,'Content-Type':'application/json'},body:JSON.stringify(body)});if(!response.ok){const reply=await response.json().catch(()=>({}));throw Object.assign(new Error(),{reply:typeof reply?.error==='string'?reply.error.slice(0,300):''});}return response.json();};
 (async()=>{try{
-database=await open();valid();
+if(!expected.id){
+await new Promise(resolve=>document.getElementById('connect').addEventListener('click',resolve,{once:true}));
+document.getElementById('connect').disabled=true;
+document.getElementById('introduction').hidden=true;
+document.getElementById('heading').textContent='Opening sign-in…';
+}
+valid();database=await open();valid();
 if(expected.id){
 const marker=sessionStorage.getItem(slot);sessionStorage.removeItem(slot);
 const saved=await stored('take');valid();
@@ -65,9 +80,9 @@ if(!/^[A-Za-z0-9_-]{43}$/.test(attempt.id)||!Number.isSafeInteger(attempt.expire
 await stored('put',{...saved,id:attempt.id,expiresAt:Math.min(expected.expiresAt,attempt.expiresAt)});valid();
 location.replace(target.href);
 }
-}catch{
+}catch(error){
 try{sessionStorage.removeItem(slot);if(database)await stored('take');}catch{}
-content.hidden=false;document.body.classList.add('failed');document.title='Sign-in could not be completed · Nod';document.getElementById('heading').textContent='Sign-in could not be completed';document.getElementById('status').textContent='Return to Nod and try again.';
+content.hidden=false;document.body.classList.add('failed');document.title='Sign-in could not be completed · Nod';document.getElementById('heading').textContent='Sign-in could not be completed';document.getElementById('status').textContent=error?.reply||'Return to Nod and try again.';
 }finally{clearTimeout(waiting);database?.close();}})();
 </script></body></html>`;
 }
@@ -203,7 +218,10 @@ export function createIntegrationBrowser(options?: {
           if (response.destroyed) finish(id);
           else response.once('close', () => finish(id));
           send(400, {
-            error: 'The app connection could not be started. Return to Nod and try again.',
+            error:
+              error instanceof IntegrationConnectionError
+                ? error.message
+                : 'The app connection could not be started. Return to Nod and try again.',
           });
         }
       });
@@ -225,7 +243,19 @@ export function createIntegrationBrowser(options?: {
       }
       origin = `http://127.0.0.1:${address.port}`;
       const url = `${origin}/${capability}`;
-      const timer = setTimeout(() => finish(id), expiresAt - Date.now());
+      const timer = setTimeout(() => {
+        if (attempts.has(id))
+          logFailure('app_connection_expired', undefined, {
+            step: returned
+              ? 'consent'
+              : attempts.get(id)!.remote
+                ? 'pair'
+                : bootstrapped
+                  ? 'start'
+                  : 'open',
+          });
+        finish(id);
+      }, expiresAt - Date.now());
       timer.unref();
       attempts.set(id, { url, server, expiresAt, timer });
       return url;

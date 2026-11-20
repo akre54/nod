@@ -1,8 +1,8 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
-import { copyFile, mkdir, mkdtemp, realpath } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, realpath, rename, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import pg from 'pg';
 import { createAgentSession } from '@earendil-works/pi-coding-agent';
@@ -18,6 +18,7 @@ import { integrationDatabaseUrl } from '../../scripts/local-database.ts';
 import { accessCookie, accessKey } from '../../src/server/access.ts';
 import { createCapture, type Observation } from './capture.ts';
 import { collectUsage, type Run } from './trace.ts';
+import { estimateAnthropicRequestUsd } from './spend.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 export const repository = resolve(here, '../..');
@@ -110,6 +111,8 @@ export interface Stack {
   ): Promise<Response>;
   origin: string;
   directory: string;
+  home?: string;
+  trashed?: string[];
   container: string;
   pool: pg.Pool;
   waiting(alias: string): string;
@@ -132,13 +135,16 @@ export function createStackRequest(baseUrl: string, cookie: string): Stack['requ
 
 export async function startStack(options: {
   model: Model;
+  backgroundModel?: string;
   integrations: IntegrationProvider;
+  desktop?: import('../../src/ports/desktop.ts').DesktopControl;
   observations?: import('../../src/ports/proactivity.ts').ObservationProvider[];
   proactiveBaseline?: boolean;
   siteHosts: string[];
   siteUpstreamPort: number;
   hermetic: boolean;
   environment: Record<string, string | undefined>;
+  localFiles?: Record<string, string | Buffer>;
 }): Promise<Stack> {
   const { model, environment } = options;
   const typesafe = environment.TYPESAFE_API_KEY?.trim();
@@ -153,6 +159,17 @@ export async function startStack(options: {
   process.umask(0);
   await mkdir(workspaceRoot, { recursive: true });
   await mkdir(toolsRoot);
+  if (options.localFiles && process.platform === 'win32')
+    throw new Error('Local-file evals need macOS or Linux, where mounted drives can be kept out.');
+  const home = options.localFiles ? join(directory, 'home') : undefined;
+  const trashed: string[] = [];
+  if (home) {
+    await mkdir(join(directory, 'trash'));
+    for (const [path, content] of Object.entries(options.localFiles!)) {
+      await mkdir(dirname(join(home, path)), { recursive: true });
+      await writeFile(join(home, path), content);
+    }
+  }
   const baseDatabase = new URL(await integrationDatabaseUrl(repository, environment));
   if (!['127.0.0.1', 'localhost'].includes(baseDatabase.hostname))
     throw new Error('The evaluation requires a local PostgreSQL test database.');
@@ -192,7 +209,10 @@ export async function startStack(options: {
     const closedBeforeRead = closed;
     if (databasePool) {
       finalUsage = await collectUsage(databasePool).catch(() => undefined);
-      if (finalUsage && !closedBeforeRead) finalUsage.costUsd = null;
+      if (finalUsage && !closedBeforeRead) {
+        finalUsage.costUsd = null;
+        delete finalUsage.budgetCostUsd;
+      }
     }
     if (browserStarted) {
       const logs = await runProcess('docker', ['logs', '--tail', '200', browserContainer]).catch(
@@ -332,6 +352,8 @@ export async function startStack(options: {
       { createDockerWorkspace },
       { createPublicLinkPreviewProvider },
       waitingTurnSql,
+      { createModelService },
+      { createPiModelBackend },
     ] = await Promise.all([
       load<typeof import('../../src/server/composition.ts')>('src/server/composition.ts'),
       load<typeof import('../../src/server/db.ts')>('src/server/db.ts'),
@@ -348,10 +370,51 @@ export async function startStack(options: {
         'src/providers/public-web/link-preview.ts',
       ),
       loadWaitingTurnSql(appSource),
+      load<typeof import('../../src/server/models.ts')>('src/server/models.ts'),
+      load<typeof import('../../src/providers/pi/models.ts')>('src/providers/pi/models.ts'),
     ]);
     databasePool = pool;
     const vaultKey = randomBytes(32);
     const sessionRoot = join(directory, '.local', 'sessions');
+    const models = createModelService({
+      database: pool,
+      ownerId: 'local-development',
+      keyStore: { id: 'isolated-memory', configured: true, getKey: async () => vaultKey },
+      backend: createPiModelBackend(),
+      origin: `http://localhost:${port}`,
+      bootstrap: {
+        provider: model.provider,
+        model: model.name,
+        credentials: {
+          [model.provider]: { type: 'api_key', key: model.apiKey },
+        },
+      },
+    });
+    await models.initialize();
+    if (options.backgroundModel) {
+      if (!('setRoute' in models))
+        throw new Error('--background-model needs app code that supports model routes.');
+      const connection = models.view().connections.find((row) => row.provider === model.provider);
+      const choice = connection?.models.find((item) => item.id === options.backgroundModel);
+      if (options.backgroundModel !== 'light' && !choice)
+        throw new Error(
+          `${options.backgroundModel} is not a ${model.provider} model. Use light or a model from the --model provider.`,
+        );
+      if (options.backgroundModel === 'light' && !models.view().light)
+        throw new Error(
+          `${model.provider} has no light model that costs no more than ${model.name}, so --background-model light would run ${model.name}.`,
+        );
+      await models.setRoute(
+        'background',
+        options.backgroundModel === 'light'
+          ? 'light'
+          : {
+              connectionId: connection!.id,
+              modelId: choice!.id,
+              effort: choice!.efforts.includes('high') ? 'high' : choice!.efforts[0]!,
+            },
+      );
+    }
     const computer = createContainerBrowserComputer({
       dataRoot: join(directory, '.local'),
       container: browserContainer,
@@ -361,17 +424,23 @@ export async function startStack(options: {
     application = await createApplication(
       {
         observations: options.observations,
+        models,
         observe: capture.observe,
         agent: capture.agent(
           createPiAgent({
             provider: model.provider,
             model: model.name,
             apiKey: model.apiKey,
+            resolve: (choice) => models.resolve(false, choice),
             sessionRoot,
             ...(model.effort
               ? {
                   createSession: (input) =>
-                    createAgentSession({ ...input, thinkingLevel: model.effort }),
+                    createAgentSession(
+                      input?.model?.id === model.name
+                        ? { ...input, thinkingLevel: model.effort }
+                        : input,
+                    ),
                 }
               : {}),
           }),
@@ -425,6 +494,8 @@ export async function startStack(options: {
                   'src/providers/decisions.ts',
                 )
               ).createDecisionModel({
+                reserve:
+                  'reserve' in models ? (maximumUsd) => models.reserve(maximumUsd) : undefined,
                 resolve: async () =>
                   typesafe
                     ? { provider: 'typesafe', key: typesafe }
@@ -435,23 +506,52 @@ export async function startStack(options: {
               }),
             }
           : {}),
-        memoryCurator: createPiMemoryCurator({ provider: model.provider, apiKey: model.apiKey }),
+        classificationCurator: createPiMemoryCurator({
+          provider: model.provider,
+          resolve: () => models.resolveClassification(),
+          configured: () => models.hasClassificationModel(),
+        }),
+        memoryCurator: createPiMemoryCurator({
+          provider: model.provider,
+          resolve: () => models.resolve(true),
+          configured: () => models.configured,
+          estimateAnthropicRequestUsd,
+        }),
         onboardingCurator: createPiMemoryCurator({
           provider: model.provider,
           apiKey: model.apiKey,
           model: model.name,
+          resolve: async () => ({ ...(await models.resolve()), effort: 'off' }),
+          configured: () => models.configured,
           lightest: true,
         }),
         linkPreviews: createPublicLinkPreviewProvider(),
+        ...(options.desktop ? { desktop: options.desktop } : {}),
         model: { provider: model.provider, name: model.name, configured: true },
+        ...(home
+          ? {
+              localFilesHome: home,
+              trash: {
+                ready: async () => true,
+                async put(path: string, signal?: AbortSignal) {
+                  signal?.throwIfAborted();
+                  await rename(path, join(directory, 'trash', `${randomUUID()}-${basename(path)}`));
+                  trashed.push(relative(home, path));
+                },
+              },
+            }
+          : {}),
       },
       { heartbeat: false },
     );
+    application.app.addHook('onClose', () => models.close());
     await application.app.listen({ host: '127.0.0.1', port });
     const baseUrl = `http://localhost:${port}`;
     const cookie = `${accessCookie(port)}=${await accessKey(join(directory, '.local'))}`;
     const engine = application.proactivity;
     return {
+      home,
+      trashed,
       get finalUsage() {
         return finalUsage;
       },

@@ -41,21 +41,42 @@ ipcRenderer.on('nod:feedback:open', () => {
   else for (const listener of feedbackListeners) listener();
 });
 
+const remote = process.argv.includes('--nod-remote');
+const localRuntime = remote
+  ? undefined
+  : {
+      status: () => invoke('nod:status'),
+      subscribeStatus: (listener) => {
+        const receive = (_event, value) => listener(value);
+        ipcRenderer.on('nod:status', receive);
+        return () => ipcRenderer.removeListener('nod:status', receive);
+      },
+      prepare: (options) => invoke('nod:prepare', options),
+      setup: () => invoke('nod:setup:get'),
+      completePreferences: () => invoke('nod:setup:preferences'),
+      reconcileSetup: () => invoke('nod:setup:reconcile'),
+    };
+
 contextBridge.exposeInMainWorld('nodDesktop', {
-  remote: process.argv.includes('--nod-remote'),
+  protocolVersion: 1,
+  mode: remote ? 'remote' : 'local',
+  ...(localRuntime
+    ? {
+        localRuntime,
+        status: localRuntime.status,
+        prepare: localRuntime.prepare,
+        onStatus: localRuntime.subscribeStatus,
+      }
+    : {}),
+  remote,
   fileAction: (id, action) => invoke('nod:file:action', id, action),
   fileMenu: (id, image) => invoke('nod:file:menu', id, image),
   ready: () => invoke('nod:renderer-ready'),
-  status: () => invoke('nod:status'),
   updateStatus: () => invoke('nod:updates:status'),
   dismissUpdate: (version) => invoke('nod:updates:dismiss', version),
+  retryUpdate: (id) => invoke('nod:updates:retry', id),
+  downloadUpdate: () => invoke('nod:updates:download'),
   restartUpdate: () => invoke('nod:updates:restart'),
-  prepare: (options) => invoke('nod:prepare', options),
-  onStatus: (listener) => {
-    const receive = (_event, value) => listener(value);
-    ipcRenderer.on('nod:status', receive);
-    return () => ipcRenderer.removeListener('nod:status', receive);
-  },
   onUpdateStatus: (listener) => {
     const receive = (_event, value) => listener(value);
     ipcRenderer.on('nod:updates:status', receive);
@@ -75,6 +96,9 @@ contextBridge.exposeInMainWorld('nodDesktop', {
   openExternal: (url) => invoke('nod:external', url),
   getSettings: () => invoke('nod:settings:get'),
   saveSettings: (input) => invoke('nod:settings:save', input),
+  savePreferences: (input) => invoke('nod:preferences:save', input),
+  getZoomFactor: () => invoke('nod:zoom:get'),
+  setZoomFactor: (factor) => invoke('nod:zoom:set', factor),
   removeAllData: () => invoke('nod:data:remove'),
   onOpenSettings: (listener) => {
     if (typeof listener !== 'function') throw new TypeError('A settings listener is required.');

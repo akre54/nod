@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import pg from 'pg';
 import { accessCookie, accessKey } from '../src/server/access.ts';
+import { afterCommit } from '../src/server/transaction.ts';
 
 test('a verification code is held back in any wording or language and is the code only by itself', async () => {
   const { classifyVerificationReply, securityCodeIn } =
@@ -62,7 +63,9 @@ test(
     });
     const { createApp } = await import('../src/server/app.ts');
     const { dataRoot, ownerId, port, configuration } = await import('../src/server/config.ts');
+    const { createTasks } = await import('../src/server/tasks.ts');
     await db.initializeDatabase();
+    await createTasks({ pool: db.pool, ownerId }).initialize();
     await thread.initializeThreads();
     await db.pool.query(`CREATE TABLE credential_requests (
     id text PRIMARY KEY,thread_id uuid REFERENCES threads(id),turn_id uuid REFERENCES turns(id),
@@ -76,6 +79,7 @@ test(
     const failurePresentations: Array<{ threadId: string; input: object }> = [];
     let beforePayment = async () => {};
     let duringPayment = async () => {};
+    let cancelPaymentBeforeEntry: string | undefined;
     const { createPayments } = await import('../src/server/payments.ts');
     const { createVaultUses } = await import('../src/server/vault-use.ts');
     const paymentCard = {
@@ -89,7 +93,10 @@ test(
     const payments = await createPayments(db.pool, {
       ownerId,
       uses: await createVaultUses(db.pool, ownerId),
-      present: async () => 'Synthetic private payment step.',
+      present: async () => ({
+        question: 'Synthetic private payment step.',
+        action: 'Approve payment',
+      }),
       page: async () => ({
         origin: 'https://shop.fixture.test',
         url: 'https://shop.fixture.test/checkout',
@@ -100,12 +107,19 @@ test(
       }),
       capture: async () => new Uint8Array([255, 216, 255]),
       cards: async () => [paymentCard],
-      card: async () => ({
-        cardholder: 'Synthetic Cardholder',
-        cardNumber: '4242424242424242',
-        expiryMonth: 8,
-        expiryYear: 2031,
-      }),
+      card: async (_id, _version, client) => {
+        if (cancelPaymentBeforeEntry && client) {
+          const turnId = cancelPaymentBeforeEntry;
+          cancelPaymentBeforeEntry = undefined;
+          afterCommit(client, () => thread.abortTurns([turnId]));
+        }
+        return {
+          cardholder: 'Synthetic Cardholder',
+          cardNumber: '4242424242424242',
+          expiryMonth: 8,
+          expiryYear: 2031,
+        };
+      },
       fill: async (input) => {
         entered.push(input.card.securityCode ?? '');
         await duringPayment();
@@ -445,6 +459,70 @@ test(
           }
         },
       );
+      await t.test('known non-entry keeps a cancelled code receipt across replay', async () => {
+        for (const kind of ['otp', 'payment']) {
+          await reset();
+          const pending = await seed();
+          let requestId = pending.requestId;
+          let calls = 0;
+          const guarded =
+            kind === 'payment'
+              ? verification
+              : await createChatVerification(db.pool, {
+                  ownerId,
+                  keyStore: { getKey: async () => Buffer.alloc(32, 61) },
+                  refresh() {},
+                  submitCode: async (_owner, _turn, _code, id) => {
+                    calls++;
+                    await db.pool.query(
+                      "UPDATE credential_requests SET status='consumed' WHERE id=$1",
+                      [id],
+                    );
+                    return { status: 'unavailable', notEntered: true };
+                  },
+                });
+          if (kind === 'payment') {
+            await payments.request(pending, {
+              amount: '43.20',
+              currency: 'EUR',
+              fields: { number: '@e4', expiry: '@e5', securityCode: '@e6' },
+            });
+            requestId = (await db.pool.query('SELECT id FROM vault_payments')).rows[0].id;
+            cancelPaymentBeforeEntry = pending.turnId;
+          }
+          const clientMessageId = randomUUID();
+          const input = {
+            clientMessageId,
+            threadId: pending.threadId,
+            verificationRequestId: requestId,
+          };
+          const code = kind === 'payment' ? '737' : '563829';
+          const response = await guarded.accept(code, input);
+          assert.equal(response?.verificationStatus, 'unavailable');
+          assert.match(response?.messageText ?? '', /cancelled before sending/);
+          const stored = (
+            await db.pool.query(
+              'SELECT v.status,m.text FROM chat_verification_submissions v JOIN messages m ON m.id=v.message_id WHERE v.message_id=$1',
+              [clientMessageId],
+            )
+          ).rows[0];
+          assert.equal(stored.status, 'cancelled');
+          assert.equal(stored.text, response?.messageText);
+          assert.equal(stored.text.includes(code), false);
+          assert.doesNotMatch(stored.text, /sent securely/);
+          const repeated = await guarded.accept(code, input);
+          assert.deepEqual(repeated, response);
+          assert.deepEqual(entered, []);
+          assert.deepEqual(injected, []);
+          assert.equal(calls, kind === 'otp' ? 1 : 0);
+          assert.deepEqual(failurePresentations, []);
+          if (kind === 'payment')
+            assert.deepEqual(
+              (await db.pool.query('SELECT status FROM vault_uses WHERE id=$1', [requestId])).rows,
+              [{ status: 'not_entered' }],
+            );
+        }
+      });
       await t.test(
         'Stop cancels a waiting payment before or during entry without restarting the task',
         async () => {
@@ -515,7 +593,7 @@ test(
         },
       );
       await t.test(
-        'a security code sent by itself pays in Nod while other numbers are held back',
+        'a security code sent by itself pays in Nod while unrelated numbered messages reach chat',
         async () => {
           await reset();
           const threadId = (await thread.activeThread(db.pool, ownerId)).id;
@@ -539,13 +617,29 @@ test(
             (error: Error & { statusCode?: number }) => error.statusCode === 409,
           );
           assert.equal((await send('73951')).statusCode, 409);
-          for (const text of [
-            '2 hinges for 7395',
-            'mi código es 739',
+          const unrelated = [
+            'unrelated but can u remind me what invoice NS-1043 was for? the paid one',
+            '2 hinges for 2041',
             'card ending 4242',
             'The year is 2026',
-          ])
-            assert.equal((await send(text)).statusCode, 409, text);
+            'What is code abc123def?',
+            'What is code abc123?',
+          ];
+          for (const text of unrelated) assert.equal((await send(text)).statusCode, 200, text);
+          const wrappedCodes = ['my code is 1234', 'Code: 123', 'O código é 739', 'pin 8421'];
+          for (const text of wrappedCodes) {
+            const response = await send(text);
+            assert.equal(response.statusCode, 409, text);
+            assert.ok(!response.body.includes(text));
+          }
+          assert.deepEqual(ordinary, unrelated);
+          assert.deepEqual(entered, []);
+          assert.equal(
+            (await db.pool.query('SELECT text FROM messages WHERE role=$1', ['user'])).rows.some(
+              ({ text }: { text: string }) => wrappedCodes.includes(text),
+            ),
+            false,
+          );
           const earlierTurn = randomUUID();
           const earlierMessage = randomUUID();
           await db.pool.query(
@@ -558,23 +652,57 @@ test(
             [earlierMessage, ownerId, threadId, earlierTurn],
           );
           const replied = await send("it's 739", { replyToMessageId: earlierMessage });
-          assert.equal(replied.statusCode, 409);
+          assert.equal(replied.statusCode, 200);
           const prose = ['2 hinges for the door', 'Pay at 15:30'];
           for (const text of prose) assert.equal((await send(text)).statusCode, 200, text);
-          assert.deepEqual(ordinary, prose);
+          assert.deepEqual(ordinary, [...unrelated, "it's 739", ...prose]);
           assert.deepEqual(entered, []);
           const response = await send('7395');
           assert.equal(response.statusCode, 200, response.body);
           assert.equal(response.json().verificationStatus, 'submitted');
           assert.deepEqual(entered, ['7395']);
           assert.equal((await send('2026')).statusCode, 200);
-          assert.deepEqual(ordinary, [...prose, '2026']);
+          assert.deepEqual(ordinary, [...unrelated, "it's 739", ...prose, '2026']);
           assert.deepEqual(entered, ['7395']);
           const persisted = await db.pool.query(
             `SELECT text AS value FROM messages UNION ALL SELECT prompt FROM turns
              UNION ALL SELECT fields::text||status FROM vault_payments`,
           );
           assert.ok(!JSON.stringify(persisted.rows).includes('7395'));
+        },
+      );
+      await t.test(
+        'an expired payment still holds code-like replies while an invoice question reaches chat',
+        async () => {
+          await reset();
+          const threadId = (await thread.activeThread(db.pool, ownerId)).id;
+          const turnId = randomUUID();
+          await db.pool.query(
+            `INSERT INTO turns(id,owner_id,thread_id,source,prompt,channel,status,waiting_reason,started_at)
+             VALUES($1,$2,$3,'user','Buy the hinges','web','waiting','credentials',clock_timestamp())`,
+            [turnId, ownerId, threadId],
+          );
+          await payments.request(
+            { threadId, turnId },
+            {
+              amount: '43.20',
+              currency: 'EUR',
+              fields: { number: '@e4', expiry: '@e5', securityCode: '@e6' },
+            },
+          );
+          await db.pool.query(
+            `INSERT INTO turns(id,owner_id,thread_id,source,prompt,channel,status,started_at)
+             VALUES($1,$2,$3,'user','Unrelated follow-up','web','succeeded',clock_timestamp())`,
+            [randomUUID(), ownerId, threadId],
+          );
+          assert.equal((await send('739')).statusCode, 409);
+          assert.equal((await send('73951')).statusCode, 409);
+          assert.equal((await send('my code is 739')).statusCode, 409);
+          assert.equal((await send('Code: 739')).statusCode, 409);
+          const question = 'What was invoice NS-1043 for?';
+          assert.equal((await send(question)).statusCode, 200);
+          assert.deepEqual(ordinary, [question]);
+          assert.deepEqual(entered, []);
         },
       );
       await t.test(

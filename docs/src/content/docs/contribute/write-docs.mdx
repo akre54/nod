@@ -25,6 +25,8 @@ The short version: write for a busy person who has never seen Nod's code. Lead w
 
 The docs are an [Astro Starlight](https://starlight.astro.build) site in the `docs` folder. It has its own lockfile, like `desktop`.
 
+For a documentation-only change, use Node.js 24.21.0 or newer and pnpm 10.34.5. You do not need the app dependencies, Docker, a running Nod instance, or a model connection.
+
 <Steps>
 
 1. Install the docs dependencies.
@@ -56,6 +58,16 @@ On every pull request that changes the site, the **Docs** workflow builds it as 
 The Cloudflare Pages project **nod-n8n**, at [nod.n8n.io](https://nod.n8n.io/), serves the landing page, `src/pages/next.astro`, at its root and these docs under `/docs/`. Its production branch is `main`. The build puts the docs under `/docs/`, then copies the landing page and the 404 page to the root. Without a root `404.html`, Pages serves the landing page for every unknown address.
 
 Every push to `main` that changes the site runs the **Docs** workflow, which builds the site and deploys it. To redeploy without a change, run the workflow on `main` from the **Actions** tab. The deploy job runs in the `nod-n8n` GitHub environment, which only `main` can use, and reads its `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` secrets. The token needs **Cloudflare Pages: Edit** on the project's account. That permission covers every Pages project in the account, so keep the token in that environment only.
+
+### Site security settings
+
+`docs/public/_headers` sets the response headers for the landing page and docs. The workflow copies it to the site root for Cloudflare Pages.
+
+The headers set HSTS for one year, block framing, prevent content type guessing, and disable camera, microphone, location, payment, and USB access. The Content Security Policy limits scripts, connections, fonts, and frames to the site and required services. Images can load from HTTPS addresses. Inline scripts, inline styles, and `eval()` remain allowed for the current pages and tag manager consent variables. This also permits WebAssembly for docs search. These exceptions limit protection against script injection.
+
+When you add a script, font, embed, or external request, update the policy only for the source it needs. Check the built site in a browser for blocked resources. After deployment, use `curl -sI https://nod.n8n.io/` and `curl -sI https://nod.n8n.io/docs/` to check the headers. Cloudflare zone settings can change the final response. Check that HSTS has `max-age=31536000` or a longer lifetime.
+
+`docs/public/.well-known/security.txt` lists the private reporting routes and security policy. The workflow publishes it at `/.well-known/security.txt` and `/security.txt`. The site artifact includes hidden files so the `.well-known` folder reaches the deploy job. Keep the reporting links current and renew `Expires` before it passes, with a date less than one year ahead.
 
 ## Where pages live
 

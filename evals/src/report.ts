@@ -33,7 +33,7 @@ export function terminal(summary: RunSummary, attempts: AttemptResult[], reviews
   const lines: string[] = [];
   lines.push(
     '',
-    `Run ${manifest.label}  ·  agent ${manifest.model}  ·  judge ${manifest.judge}  ·  ${manifest.ref ?? manifest.commit.slice(0, 7)}${manifest.dirty ? '+local changes' : ''}`,
+    `Run ${manifest.label}  ·  agent ${manifest.model}${manifest.backgroundModel ? `  ·  own work ${manifest.backgroundModel}` : ''}  ·  judge ${manifest.judge}  ·  ${manifest.ref ?? manifest.commit.slice(0, 7)}${manifest.dirty ? '+local changes' : ''}`,
     coverage(summary),
     '',
     combined.total
@@ -142,6 +142,14 @@ function metrics(runs: Loaded[]): Array<[string, string[]] | undefined> {
   const each = (cell: (summary: RunSummary) => string) => runs.map((run) => cell(run.summary));
   return [
     ['agent', each((summary) => summary.manifest.model)],
+    ...(runs.some((run) => run.summary.manifest.backgroundModel)
+      ? [
+          ['own work', each((summary) => summary.manifest.backgroundModel ?? 'same')] as [
+            string,
+            string[],
+          ],
+        ]
+      : []),
     [
       'attempts completed',
       each((summary) => `${summary.coverage.completed}/${summary.coverage.expected ?? '?'}`),
@@ -333,7 +341,7 @@ export function compareTable(runs: Loaded[]) {
       true,
     ),
     ...values.map((metric) =>
-      metric ? row(...metric, metric[0] === 'agent' || metric[0] === 'source') : '',
+      metric ? row(...metric, ['agent', 'own work', 'source'].includes(metric[0])) : '',
     ),
     '',
   ];
@@ -381,7 +389,7 @@ export function markdown(runs: Loaded[]) {
       ? `### Incomplete run: ${coverage(latest)}`
       : `### ${pct(latest.combined.percent)} of regression attempts pass all required checks (${latest.combined.passed}/${latest.combined.total})${moved ? `, ${moved.delta >= 0 ? '+' : ''}${moved.delta} points vs ${runs[0].summary.manifest.label}` : ''}`,
     '',
-    `\`${latest.manifest.model}\` · judge \`${latest.manifest.judge}\` · ${latest.manifest.repeat} attempt${latest.manifest.repeat === 1 ? '' : 's'} per scenario · ${safety} safety incident${safety === 1 ? '' : 's'} · ${money(spent)} on models`,
+    `\`${latest.manifest.model}\`${latest.manifest.backgroundModel ? ` · own work \`${latest.manifest.backgroundModel}\`` : ''} · judge \`${latest.manifest.judge}\` · ${latest.manifest.repeat} attempt${latest.manifest.repeat === 1 ? '' : 's'} per scenario · ${safety} safety incident${safety === 1 ? '' : 's'} · ${money(spent)} on models`,
     '',
   ];
   for (const run of runs) {
@@ -505,7 +513,14 @@ export function changes(a: Loaded, b: Loaded) {
 export function runsTable(
   runs: Array<{
     label: string;
-    manifest: { model: string; ref?: string; commit: string; startedAt: string; judge: string };
+    manifest: {
+      model: string;
+      backgroundModel?: string;
+      ref?: string;
+      commit: string;
+      startedAt: string;
+      judge: string;
+    };
     summary: RunSummary;
   }>,
 ) {
@@ -515,7 +530,7 @@ export function runsTable(
     `  ${'label'.padEnd(width)}  ${'when'.padEnd(16)}  ${'agent'.padEnd(28)} ${'source'.padEnd(12)} all required checks`,
     ...runs.map(
       (run) =>
-        `  ${run.label.padEnd(width)}  ${run.manifest.startedAt.slice(0, 16).replace('T', ' ')}  ${run.manifest.model.padEnd(28)} ${(run.manifest.ref ?? run.manifest.commit.slice(0, 7)).slice(0, 12).padEnd(12)} ${pct(run.summary.combined.percent)} (${run.summary.combined.passed}/${run.summary.combined.total}), ${money(run.summary.costUsd)}, ${minutes(run.summary.seconds)}`,
+        `  ${run.label.padEnd(width)}  ${run.manifest.startedAt.slice(0, 16).replace('T', ' ')}  ${`${run.manifest.model}${run.manifest.backgroundModel ? ` + ${run.manifest.backgroundModel}` : ''}`.slice(0, 28).padEnd(28)} ${(run.manifest.ref ?? run.manifest.commit.slice(0, 7)).slice(0, 12).padEnd(12)} ${pct(run.summary.combined.percent)} (${run.summary.combined.passed}/${run.summary.combined.total}), ${money(run.summary.costUsd)}, ${minutes(run.summary.seconds)}`,
     ),
   ].join('\n');
 }
@@ -543,7 +558,7 @@ ${attempt.error ? `<p class="fail">${escape(attempt.error)}</p>` : ''}${attempt.
     })
     .join('');
   return `<!doctype html><meta charset="utf-8"><title>${escape(manifest.label)}</title><style>body{font:15px/1.5 system-ui;max-width:980px;margin:32px auto;padding:0 20px}pre{white-space:pre-wrap;background:#f6f6f8;padding:10px;border-radius:6px;max-height:420px;overflow:auto}.pass{color:#0a7a3d}.fail{color:#b00020}.incomplete{color:#8a6d00}summary{cursor:pointer}small{color:#666;font-weight:400}</style>
-<h1>${escape(manifest.label)}</h1><p>${escape(manifest.model)} · judge ${escape(manifest.judge)} · ${escape(manifest.ref ?? manifest.commit)} · ${manifest.startedAt}</p>
+<h1>${escape(manifest.label)}</h1><p>${escape(manifest.model)}${manifest.backgroundModel ? ` · own work ${escape(manifest.backgroundModel)}` : ''} · judge ${escape(manifest.judge)} · ${escape(manifest.ref ?? manifest.commit)} · ${manifest.startedAt}</p>
 <p class="${summary.coverage.missing.length || summary.coverage.incomplete ? 'incomplete' : 'pass'}"><b>${coverage(summary)}</b></p>${summary.coverage.missing.length ? `<details><summary>Attempts not run</summary><ul>${summary.coverage.missing.map((id) => `<li>${escape(id)}</li>`).join('')}</ul></details>` : ''}
 <h2>${pct(combined.percent)} pass all required checks (${combined.passed}/${combined.total}) · pass@${manifest.k} ${pct(combined.passAtK)} · pass^${manifest.k} ${pct(combined.passPowK)}</h2><p>Task completion: ${pct(regression.percent)} (${regression.passed}/${regression.total})</p>${rows}`;
 }

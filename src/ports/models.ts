@@ -40,6 +40,28 @@ export class ModelWorkspaceSelectionError extends ModelAuthError {
   }
 }
 
+export type ModelCatalogFailure = {
+  path: '/models' | '/v1/models';
+  status?: number;
+  detail: string;
+};
+
+export class ModelCatalogError extends Error {
+  constructor(readonly failures: readonly ModelCatalogFailure[]) {
+    super(
+      failures
+        .map(({ path, status, detail }) => {
+          const http = status === undefined ? '' : ` (HTTP ${status})`;
+          return `${path}: Model discovery failed${http}${detail ? `: ${detail}` : '.'}`.slice(
+            0,
+            failures.length > 1 ? 950 : 2000,
+          );
+        })
+        .join('\n'),
+    );
+  }
+}
+
 export interface ModelDefinition {
   choice: ModelChoice;
   spec: Record<string, unknown>;
@@ -52,7 +74,13 @@ export interface ModelAccess {
   effort: ModelEffort;
   textModel?: { definition: ModelDefinition; effort: ModelEffort };
   read(): Promise<ModelCredential | undefined>;
-  prepareRequest?(modelId: string, automatic: boolean): Promise<(error?: string) => Promise<void>>;
+  reserve?(
+    maximumUsd: number | null | (() => number | null),
+  ): Promise<(spentUsd: number | null) => Promise<void>>;
+  prepareRequest?(
+    modelId: string,
+    automatic: boolean,
+  ): Promise<(error?: string, status?: number) => Promise<void>>;
   needsReconnect?(credential?: ModelCredential): Promise<void>;
 }
 

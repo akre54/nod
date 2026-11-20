@@ -1,4 +1,12 @@
-import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
+import {
+  forwardRef,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react';
 import { EditorContent, useEditor } from '@tiptap/react';
 import type { JSONContent } from '@tiptap/core';
 import {
@@ -14,11 +22,16 @@ import {
 } from './icons';
 import type { Artifact, Message } from '../../shared/contracts';
 import { fileBytes } from '../../shared/files';
+import { messageTextLimit, messageTooLongError } from '../../shared/message-limits';
 import { api, errorMessage } from '../lib/api';
 import { isEditingTarget, shortcutLabel } from '../lib/navigation';
 import { Tooltip } from './tooltip';
 import { captureAnalytics } from '../lib/analytics';
-import { createComposerExtensions } from '../lib/composer-editor';
+import {
+  createComposerExtensions,
+  subscribeTouchKeyboard,
+  touchKeyboard,
+} from '../lib/composer-editor';
 import {
   composerDisplayMarkdown,
   composerMarkdown,
@@ -176,6 +189,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
       }),
     [],
   );
+  const touch = useSyncExternalStore(subscribeTouchKeyboard, touchKeyboard, () => false);
   const editor = useEditor({
     extensions,
     content: parseComposerMarkdown(text),
@@ -630,6 +644,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     const sentAttachments = attachmentValues.current;
     const includesAudio = recorder.phase === 'recording' || Boolean(recorder.recording);
     if (!sentText && !sentAttachments.length && !includesAudio) return;
+    if (sentText.length > messageTextLimit) return;
     if (includesAudio) audioSend.current = true;
     const sequence = ++sends.current;
     pendingSends.current++;
@@ -735,6 +750,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   );
   const { setDrafts } = drawer;
   const hasRecording = recorder.phase !== 'idle';
+  const lengthError = text.length > messageTextLimit ? messageTooLongError : '';
   const showStop = Boolean(onStop && !text.trim() && !attachments.length && !hasRecording);
   function releaseRecording() {
     const press = recordingPress.current;
@@ -865,6 +881,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
       : 'Send message';
   const sendDisabled =
     !ready ||
+    Boolean(lengthError) ||
     pendingUploads > 0 ||
     recordingPending ||
     sendingAudio ||
@@ -880,7 +897,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   }, [images, setDrafts]);
   return (
     <div className="composer-wrap">
-      {(error || audioSetupError) && <Notice>{error || audioSetupError}</Notice>}
+      {(lengthError || error || audioSetupError) && (
+        <Notice>{lengthError || error || audioSetupError}</Notice>
+      )}
       {replyTo && (
         <div className="reply-context composer-reply">
           <CornerUpLeft size={16} />
@@ -1061,7 +1080,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
         <EditorContent editor={editor} />
         <EditorFormatting editor={editor} underlineShortcut={false} />
         <span className="sr-only" id="composer-keyboard-hint">
-          Enter to send. Shift or Alt plus Enter for a new line or list item.
+          {touch
+            ? `Return for a new line or list item. Use the send button${mac ? ', or Command plus Return,' : ''} to send.`
+            : 'Enter to send. Shift or Alt plus Enter for a new line or list item.'}
         </span>
         <div className="composer-tools">
           <div className="composer-left">
@@ -1188,8 +1209,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
                   : microphoneLabel}
               </span>
             </MicrophonePicker>
-            <span className="stop-slot">
-              {showStop && (
+            {showStop && (
+              <span className="stop-slot">
                 <Button
                   type="button"
                   variant="ghost"
@@ -1202,8 +1223,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
                 >
                   <Square size={16} solid />
                 </Button>
-              )}
-            </span>
+              </span>
+            )}
             <Button
               ref={sendButton}
               type="submit"

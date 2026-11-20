@@ -13,8 +13,5 @@ export function startRoadmapLine() {
     line.style.top = `${top}px`;
     line.style.height = `${last.top + last.height / 2 - box.top - top}px`;
   };
-  place();
-  window.addEventListener('resize', place);
-  window.addEventListener('load', place);
-  document.fonts?.ready.then(place);
+  new ResizeObserver(place).observe(track);
 }

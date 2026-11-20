@@ -504,8 +504,11 @@ export async function createChannelSettings(
         await store.save({ provider, enabled: true, ciphertext, summary });
         try {
           summary = await activate(provider, { environment: configured, summary });
-        } catch {
-          throw new ChannelSetupFailure('activation_pending');
+        } catch (error) {
+          throw new ChannelSetupFailure(
+            'activation_pending',
+            error instanceof ChannelSetupFailure ? error.details : undefined,
+          );
         }
         return { ok: true, channel: summary, ...(pairingUrl ? { pairingUrl } : {}) };
       }
@@ -526,6 +529,20 @@ export async function createChannelSettings(
       if (input === undefined)
         await options.verifier.unregister?.(provider, oldEnvironment).catch(() => {});
       return { ok: true, channel: summary, ...(pairingUrl ? { pairingUrl } : {}) };
+    });
+  }
+  async function reconnect(provider: ChannelProvider) {
+    return exclusive(async () => {
+      const channel = (await status()).channels.find((item) => item.provider === provider);
+      if (!channel?.enabled) throw new ChannelSetupFailure('pairing_unavailable');
+      const configured = await environment();
+      if (provider === 'telegram' && !managed.telegram && channel.mode === 'webhook')
+        await activate(provider, { environment: configured, summary: channel });
+      else await options.apply(configured);
+      return {
+        ok: true,
+        channel: (await status()).channels.find((item) => item.provider === provider)!,
+      };
     });
   }
   async function telegramRow() {
@@ -725,7 +742,7 @@ export async function createChannelSettings(
           webhook_failed:
             'Telegram did not confirm the webhook registration. Check the public URL and try again.',
           activation_pending:
-            'The setup was saved and the bot token is valid, but Nod could not start receiving messages. Retry the connection to continue.',
+            'The setup was saved, but message delivery could not be confirmed. Retry the connection to continue.',
           server_managed:
             'This channel is managed by the server environment. Update it there and restart Nod.',
           pairing_unavailable:
@@ -744,11 +761,20 @@ export async function createChannelSettings(
           .send({
             error:
               error instanceof ChannelSetupFailure
-                ? messages[error.reason]
+                ? error.details
+                  ? error.reason === 'activation_pending'
+                    ? `${messages.activation_pending} ${error.details}`
+                    : error.details
+                  : messages[error.reason]
                 : 'Channel settings could not be saved securely. Check the setup before retrying.',
           });
       });
       scope.get('/api/channel-settings', status);
+      scope.post<{ Params: { provider: string } }>(
+        '/api/channel-settings/:provider/reconnect',
+        { bodyLimit: 1024 },
+        (request) => reconnect(providerSchema.parse(request.params.provider)),
+      );
       scope.get('/api/channel-settings/whatsapp/pairing', async (_request, reply) => {
         reply.header('Cache-Control', 'no-store');
         const row = (await status()).channels.find(

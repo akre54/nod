@@ -110,17 +110,20 @@ test('Jev keeps action data out of the owner proof and blocks failures without a
         },
       });
       const check = () => review('Apply the owner policy.', input, controller.signal);
-      assert.equal(trustBasis(await check(), words, ['owner-message'])?.kind, 'message');
+      assert.equal(
+        trustBasis(await check(), withOwnerIds(words, ['owner-message']))?.kind,
+        'message',
+      );
       assert.equal(requests, 2);
       assert.equal(resolutions, 1);
       recipientConflict = true;
       requests = 0;
-      assert.equal(trustBasis(await check(), words, ['owner-message']), undefined);
+      assert.equal(trustBasis(await check(), withOwnerIds(words, ['owner-message'])), undefined);
       recipientConflict = false;
       wrongMethod = 1;
-      assert.equal(trustBasis(await check(), words, ['owner-message']), undefined);
+      assert.equal(trustBasis(await check(), withOwnerIds(words, ['owner-message'])), undefined);
       wrongMethod = 0.4;
-      assert.equal(trustBasis(await check(), words, ['owner-message']), undefined);
+      assert.equal(trustBasis(await check(), withOwnerIds(words, ['owner-message'])), undefined);
       wrongMethod = 0;
       for (failure of ['http', 'version', 'probability', 'stop'] as const) {
         requests = 0;
@@ -132,7 +135,10 @@ test('Jev keeps action data out of the owner proof and blocks failures without a
       requests = 0;
       controller = new AbortController();
       const before = resolutions;
-      assert.equal(trustBasis(await check(), words, ['owner-message'])?.kind, 'message');
+      assert.equal(
+        trustBasis(await check(), withOwnerIds(words, ['owner-message']))?.kind,
+        'message',
+      );
       assert.equal(requests, 2);
       assert.equal(resolutions, before + 1);
       failure = 'refusal';
@@ -269,7 +275,10 @@ test('a nested effect can refuse the private-read path even when the first Jev c
     review: async () => assert.fail('An effect denial or failure must not start an LLM.'),
   });
   assert.equal(
-    trustBasis(await review('Apply the owner policy.', input), input, ['owner-message']),
+    trustBasis(
+      await review('Apply the owner policy.', input),
+      withOwnerIds(input, ['owner-message']),
+    ),
     undefined,
   );
   assert.equal(privateChecks, 1);
@@ -314,13 +323,16 @@ test('decision evidence keeps the selected message when owner replies repeat', (
     ],
   };
   const answer = trustDecision(words).result({ trust: 'message:1' });
-  assert.deepEqual(trustBasis(answer, words, ['first', 'second']), {
+  assert.deepEqual(trustBasis(answer, withOwnerIds(words, ['first', 'second'])), {
     kind: 'message',
     messageId: 'second',
     quote: 'Yes',
   });
   assert.equal(
-    trustBasis({ run: true, because: 'Yes', source: 'message:2' }, words, ['first', 'second']),
+    trustBasis(
+      { run: true, because: 'Yes', source: 'message:2' },
+      withOwnerIds(words, ['first', 'second']),
+    ),
     undefined,
   );
 });
@@ -369,6 +381,40 @@ test('date checks include calendar dates, implicit years, clock suffixes and unc
       .uncertain,
     true,
   );
+});
+
+test('scheduled date facts keep multiline terms and the first source after many corrections', async () => {
+  const { trustFacts } = await import('../src/server/trust-facts.ts');
+  const scheduledInstructions = Array.from({ length: 24 }, (_, index) => ({
+    at: `2028-02-${String(index + 1).padStart(2, '0')}T09:00:00Z`,
+    text: index === 0 ? 'Check the report.\nLondon\n2027' : 'Keep the original date.',
+  }));
+  const facts = trustFacts({
+    scheduledInstructions,
+    scheduledApproval: {
+      at: '2028-02-24T09:00:00Z',
+      definition: { prompt: 'Summarize the report.', title: 2099 },
+    },
+    scheduledFor: '2028-02-25T09:00:00Z',
+    action: { name: 'CREATE_EVENT', arguments: { start: '2028-02-26T09:00:00Z' } },
+  }).serverDateFacts;
+  assert.ok(
+    facts.references.some(
+      (reference) =>
+        JSON.stringify((reference as { field: unknown }).field) ===
+        JSON.stringify(['scheduledInstructions', 0, 'at']),
+    ),
+  );
+  assert.ok(
+    facts.comparisons.some(
+      (comparison) =>
+        JSON.stringify((comparison as { referenceField: unknown }).referenceField) ===
+          JSON.stringify(['scheduledInstructions', 0, 'at']) &&
+        (comparison as { timeZone: string }).timeZone === 'Europe/London',
+    ),
+  );
+  assert.ok(Object.hasOwn(facts.monthEnds, 'December 2027'));
+  assert.equal(Object.hasOwn(facts.monthEnds, 'December 2099'), false);
 });
 
 test('date and amount facts preserve zone aliases and complete grouped amounts', async () => {
@@ -698,46 +744,84 @@ test('relative days use the configured zone and refuse a missing or unlisted zon
       date_field: choice('date:0'),
     },
   };
-  for (const [timeZone, zone, start, expected] of [
-    [undefined, 'unspecified', '2028-03-01T14:00:00Z', false],
-    ['Europe/Madrid', 'unspecified', '2028-03-01T14:00:00Z', true],
-    ['Europe/Madrid', 'unspecified', '2028-03-02T14:00:00Z', false],
-    ['Europe/Madrid', 'unlisted', '2028-03-01T14:00:00Z', false],
-  ] as const) {
-    const result = await checkJevTrust(
-      {
-        check: async () => ({
-          choice: true,
-          probability: 0.99,
-          model,
-          additional: {
-            owner_method: {
-              ...choice('any'),
-              probabilities: { any: 1, app: 0, browser: 0, unclear: 0 },
-            },
-            relative_day: choice('tomorrow'),
-            owner_zone: choice(zone),
-            owner_clock: choice('15:00'),
-            owner_duration: choice('none'),
-            owner_month: choice('none'),
-            owner_day: choice('none'),
-            owner_weekday: choice('none'),
-            owner_time_bounds: { choice: false, probability: 1 },
+  for (const source of ['message:0', 'schedule:0', 'scheduleApproval'])
+    for (const [timeZone, zone, start, expected] of [
+      [undefined, 'unspecified', '2028-03-01T14:00:00Z', false],
+      ['Europe/Madrid', 'unspecified', '2028-03-01T14:00:00Z', true],
+      ['Europe/Madrid', 'unspecified', '2028-03-02T14:00:00Z', false],
+      ['Europe/Madrid', 'unlisted', '2028-03-01T14:00:00Z', false],
+    ] as const) {
+      const text = 'Create a calendar event tomorrow at 15:00.';
+      const scheduledInstructions = [
+        { at: '2028-02-20T09:00:00Z', text: 'Do that every morning.', replyTo: { text } },
+      ];
+      const scheduledApproval = { at: '2028-02-20T09:00:00Z', definition: { prompt: text } };
+      const result = await checkJevTrust(
+        {
+          check: async (request) => {
+            const input = request.input as Record<string, unknown>;
+            assert.equal('action' in input, false);
+            if (source === 'scheduleApproval') {
+              assert.deepEqual(input.scheduledApproval, scheduledApproval);
+              assert.equal(
+                Object(input.ownerSourceForThisCheck).text,
+                JSON.stringify(scheduledApproval.definition),
+              );
+              assert.deepEqual(
+                request.additionalQuestions
+                  ?.find((question) => question.name === 'owner_clock')
+                  ?.choices.map((choice) => choice.value),
+                ['none', '15:00'],
+              );
+            }
+            if (source === 'schedule:0') {
+              assert.deepEqual(input.scheduledInstructions, scheduledInstructions);
+              assert.equal(input.assistantMessageBeforeLatestUserMessage, text);
+              assert.deepEqual(
+                request.additionalQuestions
+                  ?.find((question) => question.name === 'owner_clock')
+                  ?.choices.map((choice) => choice.value),
+                ['none', '15:00'],
+              );
+            }
+            return {
+              choice: true,
+              probability: 0.99,
+              model,
+              additional: {
+                owner_method: {
+                  ...choice('any'),
+                  probabilities: { any: 1, app: 0, browser: 0, unclear: 0 },
+                },
+                relative_day: choice('tomorrow'),
+                owner_zone: choice(zone),
+                owner_clock: choice('15:00'),
+                owner_duration: choice('none'),
+                owner_month: choice('none'),
+                owner_day: choice('none'),
+                owner_weekday: choice('none'),
+                owner_time_bounds: { choice: false, probability: 1 },
+              },
+            };
           },
-        }),
-      },
-      {
-        timeZone,
-        userMessages: [
-          { at: '2028-02-28T23:30:00Z', text: 'Create a calendar event tomorrow at 15:00.' },
-        ],
-        action: { name: 'GOOGLECALENDAR_CREATE_EVENT', arguments: { start } },
-      },
-      raw,
-      { provider: model.provider, model: model.requested },
-    );
-    assert.equal(result?.run, expected);
-  }
+        },
+        {
+          timeZone,
+          ...(source === 'message:0'
+            ? {
+                userMessages: [{ at: '2028-02-28T23:30:00Z', text }],
+              }
+            : {
+                scheduledFor: '2028-02-28T23:30:00Z',
+                ...(source === 'schedule:0' ? { scheduledInstructions } : { scheduledApproval }),
+              }),
+          action: { name: 'GOOGLECALENDAR_CREATE_EVENT', arguments: { start } },
+        },
+        { ...raw, choice: source },
+        { provider: model.provider, model: model.requested },
+      );
+      assert.equal(result?.run, expected, `${source}: ${timeZone}, ${zone}, ${start}`);
+    }
 });
 
 test('an uncertain effect needs a strong separate check before it can become private work', async () => {
@@ -803,7 +887,7 @@ test('an uncertain effect needs a strong separate check before it can become pri
   }
 });
 
-test('every checker must quote owner words for Nod settings, sign-in and uploads', () => {
+test('every checker must quote owner words for Nod settings, sign-in, uploads and opening apps or files', () => {
   const words = {
     userMessages: [{ at: '2033-06-20T18:30:00Z', text: 'Perform the synthetic action now.' }],
   };
@@ -816,15 +900,23 @@ test('every checker must quote owner words for Nod settings, sign-in and uploads
     'NOD_browser_session',
     'NOD_vault_allow',
     'NOD_browser',
+    'COMPUTER_OPEN',
+    'LOCAL_FILES_READ',
+    'LOCAL_FILES_IMPORT',
   ]) {
     const input = {
       ...words,
       action: { name, arguments: name === 'NOD_browser' ? { step: 'upload' } : {} },
     };
-    assert.equal(trustBasis({ run: true, because: 'read' }, input, ['owner-message']), undefined);
     assert.equal(
-      trustBasis({ run: true, because: words.userMessages[0].text }, input, ['owner-message'])
-        ?.kind,
+      trustBasis({ run: true, because: 'read' }, withOwnerIds(input, ['owner-message'])),
+      undefined,
+    );
+    assert.equal(
+      trustBasis(
+        { run: true, because: words.userMessages[0].text },
+        withOwnerIds(input, ['owner-message']),
+      )?.kind,
       'message',
     );
   }
@@ -833,6 +925,15 @@ test('every checker must quote owner words for Nod settings, sign-in and uploads
       action: { name: 'NOD_limits_update' },
       [source]: 'Set the task check-in to USD 7.',
     };
-    assert.equal(trustBasis({ run: true, because: input[source] }, input, []), undefined);
+    assert.equal(trustBasis({ run: true, because: input[source] }, input), undefined);
   }
 });
+
+function withOwnerIds<
+  T extends { userMessages?: ReadonlyArray<{ at: string; text: string; canAuthorize?: boolean }> },
+>(words: T, ids: readonly string[]) {
+  return {
+    ...words,
+    userMessages: words.userMessages?.map((message, index) => ({ ...message, id: ids[index] })),
+  };
+}

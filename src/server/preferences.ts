@@ -19,6 +19,7 @@ const preferencesSchema = z
     quietStart: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/),
     quietEnd: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/),
     proactivePaused: z.boolean(),
+    localFilesEnabled: z.boolean(),
   })
   .strict();
 type Preferences = z.infer<typeof preferencesSchema>;
@@ -33,7 +34,8 @@ export const defaultPreferences: Preferences = {
   quietHoursEnabled: true,
   quietStart: '22:00',
   quietEnd: '08:00',
-  proactivePaused: false,
+  proactivePaused: true,
+  localFilesEnabled: false,
 };
 type QuietHours = Pick<Preferences, 'quietHoursEnabled' | 'quietStart' | 'quietEnd' | 'timeZone'>;
 export function isQuietTime(preferences: QuietHours, now = new Date()) {
@@ -66,8 +68,8 @@ function canonicalLocale(value: string) {
   return null;
 }
 const columns =
-  'speech_voice AS "speechVoice",speech_reply AS "speechReply",notification_rule AS "notificationRule",rules,time_zone AS "timeZone",locale,hour_cycle AS "hourCycle",quiet_hours_enabled AS "quietHoursEnabled",quiet_start AS "quietStart",quiet_end AS "quietEnd",proactive_paused AS "proactivePaused"';
-function ianaTimeZone(value: string) {
+  'speech_voice AS "speechVoice",speech_reply AS "speechReply",notification_rule AS "notificationRule",rules,time_zone AS "timeZone",locale,hour_cycle AS "hourCycle",quiet_hours_enabled AS "quietHoursEnabled",quiet_start AS "quietStart",quiet_end AS "quietEnd",proactive_paused AS "proactivePaused",local_files_enabled AS "localFilesEnabled"';
+export function ianaTimeZone(value: string) {
   try {
     new Intl.DateTimeFormat('en', { timeZone: value });
     return !/^[+-]/.test(value);
@@ -99,22 +101,26 @@ export function createPreferencesStore(pool: Pool, ownerId: string, analytics?: 
     async update(
       raw: unknown,
       actor: SettingActor = 'owner',
-      expectedRules?: string,
-      shared?: PoolClient,
+      options: {
+        expectedRules?: string;
+        expectedNotificationRule?: string;
+        client?: PoolClient;
+      } = {},
     ): Promise<Preferences> {
+      const { expectedRules, expectedNotificationRule, client: shared } = options;
       const patch = validate(raw);
       const capture = snapshotAnalytics(analytics);
       const save = async (connection: Pick<Pool, 'query'>) => {
         const result = await connection.query(
-          `INSERT INTO preferences(owner_id,notification_rule,time_zone,quiet_start,quiet_end,quiet_hours_enabled,locale,hour_cycle,rules,speech_voice,speech_reply,proactive_paused)
-        VALUES($1,COALESCE($2,$7),$3,COALESCE($4,$8),COALESCE($5,$9),COALESCE($6::boolean,$10::boolean),$11,COALESCE($12,$13),COALESCE($16,''),$17,COALESCE($18,'auto'),COALESCE($20::boolean,$21::boolean))
+          `INSERT INTO preferences(owner_id,notification_rule,time_zone,quiet_start,quiet_end,quiet_hours_enabled,locale,hour_cycle,rules,speech_voice,speech_reply,proactive_paused,local_files_enabled)
+        VALUES($1,COALESCE($2,$7),$3,COALESCE($4,$8),COALESCE($5,$9),COALESCE($6::boolean,$10::boolean),$11,COALESCE($12,$13),COALESCE($16,''),$17,COALESCE($18,'auto'),COALESCE($20::boolean,$21::boolean),COALESCE($24::boolean,false))
         ON CONFLICT(owner_id) DO UPDATE SET notification_rule=COALESCE($2,preferences.notification_rule),rules=COALESCE($16,preferences.rules),
         time_zone=CASE WHEN $15 THEN $3 ELSE preferences.time_zone END,quiet_start=COALESCE($4,preferences.quiet_start),quiet_end=COALESCE($5,preferences.quiet_end),
         quiet_hours_enabled=COALESCE($6,preferences.quiet_hours_enabled),locale=CASE WHEN $14 THEN $11 ELSE preferences.locale END,
         hour_cycle=COALESCE($12,preferences.hour_cycle),speech_reply=COALESCE($18,preferences.speech_reply),
         speech_voice=CASE WHEN $19 THEN $17 ELSE preferences.speech_voice END,
-        proactive_paused=COALESCE($20,preferences.proactive_paused)
-        WHERE $22::text IS NULL OR preferences.rules=$22
+        proactive_paused=COALESCE($20,preferences.proactive_paused),local_files_enabled=COALESCE($24,preferences.local_files_enabled)
+        WHERE ($22::text IS NULL OR preferences.rules=$22) AND ($23::text IS NULL OR preferences.notification_rule=$23)
         RETURNING ${columns}`,
           [
             ownerId,
@@ -139,12 +145,18 @@ export function createPreferencesStore(pool: Pool, ownerId: string, analytics?: 
             patch.proactivePaused ?? null,
             defaultPreferences.proactivePaused,
             expectedRules ?? null,
+            expectedNotificationRule ?? null,
+            patch.localFilesEnabled ?? null,
           ],
         );
         if (!result.rows[0])
-          throw Object.assign(new Error('Your rules changed. Review them before asking again.'), {
-            statusCode: 409,
-          });
+          throw Object.assign(
+            new Error('The saved owner instructions changed. Review them before asking again.'),
+            {
+              statusCode: 409,
+              notRun: true,
+            },
+          );
         return result.rows[0] as Preferences;
       };
       if (!analytics) return save(shared ?? pool);
@@ -171,6 +183,7 @@ export function createPreferencesStore(pool: Pool, ownerId: string, analytics?: 
             quietStart: 'quiet_start',
             quietEnd: 'quiet_end',
             proactivePaused: 'proactivity_paused',
+            localFilesEnabled: 'local_files_access',
           }),
         );
         return after;

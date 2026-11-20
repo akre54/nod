@@ -25,6 +25,7 @@ export interface AttemptSpec {
   attempt: number;
   outFile: string;
   model: string;
+  backgroundModel?: string;
   effort?: ModelEffort;
   judge: string;
 }
@@ -99,8 +100,10 @@ async function run(spec: AttemptSpec): Promise<AttemptResult> {
     );
     stack = await (starting = startStack({
       model,
+      ...(spec.backgroundModel ? { backgroundModel: spec.backgroundModel } : {}),
       observations: world.observations,
       proactiveBaseline: world.proactiveBaseline,
+      ...(world.desktop ? { desktop: world.desktop } : {}),
       integrations:
         world.apps?.provider ??
         (await import('./world/apps.ts')).createApps(
@@ -111,6 +114,7 @@ async function run(spec: AttemptSpec): Promise<AttemptResult> {
       siteUpstreamPort: sites.port,
       hermetic: definition.tier !== 'live',
       environment,
+      localFiles: world.localFiles,
     }));
     phase = 'prepare';
     await prepare(stack, world, definition.timeZone ?? 'Europe/Madrid');
@@ -272,6 +276,7 @@ async function run(spec: AttemptSpec): Promise<AttemptResult> {
     if (result && stack) {
       const usage = stack.finalUsage;
       result.costUsd = usage?.costUsd ?? null;
+      if (usage?.budgetCostUsd !== undefined) result.budgetCostUsd = usage.budgetCostUsd;
       if (usage) {
         result.modelCalls = usage.modelCalls;
         result.tokens = usage.tokens;

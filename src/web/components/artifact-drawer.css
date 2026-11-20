@@ -126,6 +126,7 @@
 :root[data-desktop='true'] .artifact-drawer-header {
   height: auto;
   min-height: var(--desktop-titlebar-height);
+  padding-right: calc(8px + var(--window-controls-width, 0px));
   -webkit-app-region: drag;
 }
 
@@ -163,6 +164,47 @@
 .artifact-drawer-title > span {
   color: var(--muted-foreground);
   font-variant-numeric: tabular-nums;
+}
+
+.artifact-drawer-picker {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding-block: 2px;
+  border-radius: var(--control-radius);
+  vertical-align: top;
+}
+
+.artifact-drawer-picker > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.artifact-drawer-picker > svg {
+  flex: none;
+  color: var(--muted-foreground);
+}
+
+.artifact-drawer-picker:hover {
+  background: var(--control-hover);
+}
+
+.artifact-drawer-picker:focus-within {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+
+.artifact-drawer-picker select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  font: inherit;
+  cursor: pointer;
 }
 
 .artifact-drawer-actions {
@@ -840,6 +882,10 @@
 
 .app-shell:has(.chat-route:not([hidden]) .artifact-drawer) .desktop-toolbar {
   right: var(--artifact-drawer-space, 0px);
+}
+
+.app-shell:has(.chat-route:not([hidden]) .artifact-drawer:not([hidden])) .desktop-toolbar {
+  padding-right: 16px;
 }
 
 @media (max-width: 640px) {

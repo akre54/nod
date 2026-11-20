@@ -1,3 +1,4 @@
+import { scheduledTexts } from './owner-instructions.ts';
 import type { TrustWords } from './trust-basis.ts';
 
 type TrustInput = TrustWords & { action?: { name: string; arguments?: unknown } };
@@ -68,9 +69,10 @@ function local(value: Date, zone: string) {
 
 export function trustFacts(input: TrustInput) {
   const messages = input.userMessages ?? [];
+  const scheduledMessages = input.scheduledInstructions ?? [];
   const texts = [
     ...messages.map((x) => x.text),
-    input.scheduledTaskInstruction,
+    ...scheduledTexts(input),
     input.standingInstruction,
     input.userRules,
   ].filter((x): x is string => Boolean(x));
@@ -124,17 +126,22 @@ export function trustFacts(input: TrustInput) {
     const facts = explain(message.at);
     if (facts) references.push({ field: ['userMessages', index, 'at'], ...facts });
   }
+  for (const [index, message] of scheduledMessages.entries()) {
+    const facts = explain(message.at);
+    if (facts) references.push({ field: ['scheduledInstructions', index, 'at'], ...facts });
+  }
+  const approved = explain(input.scheduledApproval?.at);
+  if (approved) references.push({ field: ['scheduledApproval', 'at'], ...approved });
   const scheduled = explain(input.scheduledFor);
   if (scheduled) references.push({ field: ['scheduledFor'], ...scheduled });
   const comparisons: object[] = [];
-  for (const reference of references.slice(-8).reverse()) {
+  for (const reference of references) {
     const source = reference as { field: unknown; value: string; kind: string };
     if (source.kind !== 'instant') continue;
     for (const argument of args) {
       const target = argument as { field: unknown; value: string; kind: string };
       if (target.kind !== 'instant') continue;
       for (const zone of interpretations.filter((zone) => zone !== 'UTC' || selected.size === 1)) {
-        if (comparisons.length >= 32) break;
         const before = local(new Date(source.value), zone).calendar;
         const after = local(new Date(target.value), zone).calendar;
         comparisons.push({
@@ -188,7 +195,7 @@ export function trustFacts(input: TrustInput) {
   }
   sumAmounts(input.action?.arguments, ['action', 'arguments'], 0);
   const years = new Set(texts.flatMap((x) => x.match(/\b(?:19|20|21)\d\d\b/g) ?? []));
-  for (const message of messages) {
+  for (const message of [...messages, ...scheduledMessages]) {
     if (explain(message.at)) years.add(message.at.slice(0, 4));
   }
   if (scheduled) years.add(scheduled.value.slice(0, 4));
@@ -205,15 +212,15 @@ export function trustFacts(input: TrustInput) {
   return {
     ...input,
     serverDateFacts: {
-      note: 'These are mathematical interpretations, not owner instructions. The UTC interpretation is not an assertion of owner time zone. Other zones come from timeZone or possible city references in owner words.',
+      note: 'These are mathematical interpretations, not owner instructions. The UTC interpretation is not an assertion of owner time zone. Other zones come from timeZone or possible city references in owner inputs, accepted proposals and approved schedule instructions.',
       arguments: args,
-      references: references.slice(-16),
+      references,
       comparisons,
       monthEnds: months,
       ...(scheduled && timeZone
         ? {
             scheduleContext: {
-              source: 'scheduledTaskInstruction',
+              source: 'scheduledInstructions',
               ...local(new Date(scheduled.value), timeZone),
             },
           }

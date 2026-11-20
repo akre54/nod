@@ -13,16 +13,29 @@ import {
   UserRound,
   Trash2,
 } from './icons';
-import type { ModelConnection, ModelProvider, ModelWorkspace } from '../../shared/models';
+import type {
+  ModelChoice,
+  ModelConnection,
+  ModelProvider,
+  ModelRoute,
+  ModelSelection,
+  ModelWorkspace,
+  WorkUsage,
+} from '../../shared/models';
 import { modelKeyError } from '../../shared/model-keys';
+import { appPages } from '../../shared/app-links';
 import {
   modelProviderInfo,
   modelProviderNames,
   modelProviders,
   modelSource,
   openAIRegions,
+  canReuseWorkCost,
+  repriceUsd,
 } from '../../shared/models';
 import { analyticsForCurrentSession } from '../lib/analytics';
+import { money } from '../lib/money';
+import { ModelSentences } from './model-choices';
 import {
   keyConnection,
   keySettingsReady,
@@ -134,12 +147,13 @@ export function ModelKeyHelp({
         <a href={`https://${info.keyUrl}`} target="_blank" rel="noreferrer">
           Get API key
         </a>
-        {info.catalog === 'bundled' && ' Access checked on first use.'}
+        {info.catalog === 'bundled' && ' Access is checked after you select a model.'}
       </p>
       {provider === 'google' && (
         <p className={className}>
+          Gemini 4 Argon requires paid API access. Gemini 3.8 Flash is a lower-cost option with{' '}
           <a href="https://ai.google.dev/gemini-api/docs/pricing" target="_blank" rel="noreferrer">
-            Free tier available with limits.
+            limited free access.
           </a>{' '}
           Google sign-in and AI app plans are separate from API access.
         </p>
@@ -180,7 +194,7 @@ function providerDescription(provider: ModelProvider) {
     case 'anthropic':
       return 'API key only. Claude plans can’t be used here.';
     case 'google':
-      return 'Gemini with an AI Studio key · Free tier available';
+      return 'Gemini with an AI Studio key · Argon requires paid access';
     case 'openrouter':
       return 'Many models with one API key';
     case 'amazon-bedrock':
@@ -532,12 +546,6 @@ export function ModelSettings({ onDirtyChange }: { onDirtyChange?(dirty: boolean
   const providers = modelProviders.filter((provider) =>
     connections.some((connection) => connection.provider === provider),
   );
-  const selectedConnection = connections.find(
-    (connection) => connection.id === data.selection?.connectionId,
-  );
-  const selectedModel = selectedConnection?.models.find(
-    (model) => model.id === data.selection?.modelId,
-  );
   const available = connections.some(
     (connection) => connection.status === 'connected' && connection.models.length > 0,
   );
@@ -555,32 +563,7 @@ export function ModelSettings({ onDirtyChange }: { onDirtyChange?(dirty: boolean
   const panelProvider = panel && 'provider' in panel ? panel.provider : null;
   return (
     <div className="model-settings">
-      {available && (
-        <section className="model-current-section" aria-label="Your model">
-          <h3>Your model</h3>
-          <div className="model-current">
-            {selectedConnection && (
-              <ModelProviderLogo provider={selectedConnection.provider} size={24} />
-            )}
-            <div className="model-current-label">
-              <strong>{selectedModel?.name ?? 'Choose a model'}</strong>
-              <span>
-                {selectedConnection
-                  ? `${modelProviderNames[selectedConnection.provider]} · ${connectionName(selectedConnection, true)}`
-                  : 'Choose from your connections'}
-              </span>
-              {selectedModel?.audio && (
-                <span>
-                  {selectedModel.textModelName
-                    ? `Text support: ${selectedModel.textModelName}`
-                    : 'Text model unavailable'}
-                </span>
-              )}
-            </div>
-            <ModelPicker manageConnections={false} surface="settings" label="Change" />
-          </div>
-        </section>
-      )}
+      {available && <ModelSentences />}
       <div className="model-section-heading">
         <h3>{connections.length ? 'Connections' : 'Connect a model'}</h3>
         {!!connections.length && (
@@ -603,7 +586,9 @@ export function ModelSettings({ onDirtyChange }: { onDirtyChange?(dirty: boolean
       <div className="model-services">
         {providers.map((provider) => {
           const accounts = connections.filter((connection) => connection.provider === provider);
-          const attention = accounts.some((connection) => connection.status !== 'connected');
+          const attention = accounts.some(
+            (connection) => connection.status !== 'connected' || connection.issue,
+          );
           return (
             <div className="model-service" key={provider}>
               <ModelProviderLogo provider={provider} size={24} />
@@ -722,7 +707,9 @@ export function ModelSettings({ onDirtyChange }: { onDirtyChange?(dirty: boolean
                         <ModelConnectionAvatar connection={connection} />
                         <div className="model-connection-identity">
                           <strong>{connectionName(connection, true)}</strong>
-                          <span className={`model-connection-meta ${connection.status}`}>
+                          <span
+                            className={`model-connection-meta ${connection.issue ? 'reconnect' : connection.status}`}
+                          >
                             {connection.managed
                               ? 'Server settings'
                               : connection.method === 'subscription'
@@ -734,16 +721,35 @@ export function ModelSettings({ onDirtyChange }: { onDirtyChange?(dirty: boolean
                                     : 'API key'}
                             {connection.status === 'reconnect'
                               ? ' · Needs attention'
-                              : connection.status === 'loading'
-                                ? ' · Models not loaded'
-                                : ''}
+                              : connection.issue
+                                ? ' · Last request failed'
+                                : connection.status === 'loading'
+                                  ? ' · Models not loaded'
+                                  : ''}
                           </span>
+                          {connection.issue?.reason && (
+                            <span className="model-connection-meta reconnect">
+                              {connection.issue.reason}
+                            </span>
+                          )}
                           {data.selection?.connectionId === connection.id && (
-                            <span className="model-connection-selected">Current model</span>
+                            <span className="model-connection-meta model-connection-selected">
+                              Current model:{' '}
+                              {connection.models.find(
+                                (model) => model.id === data.selection?.modelId,
+                              )?.name ?? data.selection.modelId}
+                            </span>
                           )}
                         </div>
                       </div>
                       <div className="model-service-actions">
+                        {data.selection?.connectionId === connection.id && available && (
+                          <ModelPicker
+                            appearance="quiet"
+                            label="Change model"
+                            manageConnections={false}
+                          />
+                        )}
                         {connection.status === 'reconnect' && !connection.managed && (
                           <Button
                             type="button"
@@ -1010,16 +1016,53 @@ export function ModelSettings({ onDirtyChange }: { onDirtyChange?(dirty: boolean
   );
 }
 
+export interface ModelTarget {
+  title: string;
+  value: ModelRoute | null;
+  defaults: Array<{ value: 'light' | null; label: string; model: ModelSelection | null }>;
+  usage?: WorkUsage;
+  save(value: ModelRoute | null): Promise<true | string>;
+}
+
+function tokenPrice(pricing: ModelChoice['pricing']) {
+  return pricing === 'variable'
+    ? 'Price varies'
+    : !pricing
+      ? 'Price unavailable'
+      : pricing.input === 0 && pricing.output === 0
+        ? 'Free tokens'
+        : `${modelPrice.format(pricing.input)} in · ${modelPrice.format(pricing.output)} out / 1M`;
+}
+
+export function workPrice(usage: WorkUsage | undefined, model: ModelChoice | undefined) {
+  const spent = usage ? usage.agentUsd + usage.otherUsd : 0;
+  if (!usage || spent <= 0 || !model) return null;
+  if (canReuseWorkCost(usage, model.id, model.pricing)) return money(spent);
+  const value = repriceUsd(usage, model.pricing, model.audio);
+  return value === null ? 'No price' : `≈ ${money(value)}`;
+}
+
 export function ModelPicker({
   manageConnections = true,
   surface = 'settings',
   label,
+  target,
+  usage: chatUsage,
+  appearance = 'button',
 }: {
   manageConnections?: boolean;
   surface?: 'settings' | 'onboarding';
   label?: string;
+  target?: ModelTarget;
+  usage?: WorkUsage;
+  appearance?: 'button' | 'statement' | 'quiet';
 }) {
   const models = useModels();
+  const [saving, setSaving] = useState(false);
+  const [targetError, setTargetError] = useState('');
+  const busy = models.busy || saving;
+  const usage = target ? target.usage : chatUsage;
+  const pricedUsage = Boolean(usage && usage.agentUsd + usage.otherUsd > 0);
   const [open, setOpen] = useState(false);
   const [manage, setManage] = useState(false);
   const [search, setSearch] = useState('');
@@ -1031,7 +1074,11 @@ export function ModelPicker({
   const results = useRef<HTMLDivElement>(null);
   const optionNodes = useRef(new Map<string, HTMLButtonElement>());
   const id = useId();
-  const selected = models.data?.selection;
+  const selected = target
+    ? target.value && target.value !== 'light'
+      ? target.value
+      : (target.defaults.find((item) => item.value === target.value)?.model ?? undefined)
+    : models.data?.selection;
   const connection = models.data?.connections.find((item) => item.id === selected?.connectionId);
   const model = connection?.models.find((item) => item.id === selected?.modelId);
   const sourceDescription = connection
@@ -1043,12 +1090,14 @@ export function ModelPicker({
     (source) => source.status === 'connected',
   );
   const available = connections.flatMap((source) =>
-    source.models.map((item) => ({
-      source,
-      item,
-      recommended: item.id === recommendedModel(source)?.id,
-      key: `${source.id}:${item.id}`,
-    })),
+    source.models
+      .filter((item) => !target || !item.audio)
+      .map((item) => ({
+        source,
+        item,
+        recommended: item.id === recommendedModel(source)?.id,
+        key: `${source.id}:${item.id}`,
+      })),
   );
   const current = useRef(available);
   current.current = available;
@@ -1077,9 +1126,28 @@ export function ModelPicker({
   const enabled = groups
     .flatMap((group) => group.choices)
     .filter(({ item }) => !item.audio || item.textModelName);
-  const enabledKeys = enabled.map(({ key }) => key);
+  const leading =
+    target && !words.length && provider === 'all'
+      ? target.defaults.map((item) => ({ ...item, key: item.value ?? 'same' }))
+      : [];
+  const enabledKeys = [...leading.map(({ key }) => key), ...enabled.map(({ key }) => key)];
   const filterKey = enabledKeys.join('|');
-  const selectedKey = selected ? `${selected.connectionId}:${selected.modelId}` : '';
+  const selectedKey = target
+    ? target.value === 'light'
+      ? 'light'
+      : target.value
+        ? `${target.value.connectionId}:${target.value.modelId}`
+        : 'same'
+    : selected
+      ? `${selected.connectionId}:${selected.modelId}`
+      : '';
+  const describe = (choice: ModelSelection | null) => {
+    const source = models.data?.connections.find((item) => item.id === choice?.connectionId);
+    return {
+      source,
+      model: source?.models.find((item) => item.id === choice?.modelId),
+    };
+  };
   useEffect(() => {
     if (!open) return;
     setActive((value) =>
@@ -1106,7 +1174,23 @@ export function ModelPicker({
     else if (item.bottom > bounds.bottom) viewport.scrollTop += item.bottom - bounds.bottom;
   }
   async function choose(key: string) {
-    if (models.busy) return;
+    if (busy) return;
+    if (target) {
+      const fixed = target.defaults.find((item) => (item.value ?? 'same') === key);
+      const choice = current.current.find((value) => value.key === key);
+      if (!fixed && !choice) return;
+      setSaving(true);
+      setTargetError('');
+      const saved = await target
+        .save(fixed ? fixed.value : modelSelection(choice!.source, choice!.item.id))
+        .finally(() => setSaving(false));
+      if (saved === true) setOpen(false);
+      else {
+        setTargetError(saved);
+        requestAnimationFrame(() => focusOption(key));
+      }
+      return;
+    }
     const choice = current.current.find((value) => value.key === key);
     if (!choice || (choice.item.audio && !choice.item.textModelName)) return;
     const capture = analyticsForCurrentSession();
@@ -1137,7 +1221,7 @@ export function ModelPicker({
       event.shiftKey ||
       event.nativeEvent.isComposing ||
       event.keyCode === 229 ||
-      models.busy ||
+      busy ||
       !enabledKeys.length
     )
       return;
@@ -1168,56 +1252,84 @@ export function ModelPicker({
               );
     focusOption(enabledKeys[next]!);
   }
+  const openPicker = () => {
+    setTargetError('');
+    setSearch('');
+    setProvider('all');
+    models.setError('');
+    setHeight(
+      Math.min(
+        420,
+        Math.max(
+          156,
+          (available.length + (target?.defaults.length ?? 0)) * 38 + connections.length * 38 + 12,
+        ),
+      ),
+    );
+    setActive(selectedKey);
+    canChoose ? setOpen(true) : setManage(true);
+  };
+  const triggerLabel = target
+    ? `${target.title}: ${model ? `${model.name}, ${sourceDescription}` : 'not available'}`
+    : model
+      ? `Choose model: ${model.name}, ${sourceDescription}`
+      : canChoose
+        ? 'Choose a model'
+        : 'Connect a model';
+  const triggerTitle = model
+    ? `${model.name} · ${sourceDescription}${model.audio ? ` · ${model.textModelName ? `Text support: ${model.textModelName}` : 'Text model unavailable'}` : ''}`
+    : undefined;
+  const Wrapper = appearance === 'statement' ? 'span' : 'div';
   return (
-    <div className="model-picker">
-      <Button
-        ref={trigger}
-        type="button"
-        variant={label ? 'secondary' : 'ghost'}
-        size="sm"
-        className="model-picker-trigger"
-        disabled={models.loading}
-        onClick={() => {
-          setSearch('');
-          setProvider('all');
-          models.setError('');
-          setHeight(
-            Math.min(420, Math.max(156, available.length * 38 + connections.length * 38 + 12)),
-          );
-          setActive(selectedKey);
-          canChoose ? setOpen(true) : setManage(true);
-        }}
-        aria-label={
-          model
-            ? `Choose model: ${model.name}, ${sourceDescription}`
-            : canChoose
-              ? 'Choose a model'
-              : 'Connect a model'
-        }
-        title={
-          model
-            ? `${model.name} · ${sourceDescription}${model.audio ? ` · ${model.textModelName ? `Text support: ${model.textModelName}` : 'Text model unavailable'}` : ''}`
-            : undefined
-        }
-      >
-        {label ?? (
-          <>
-            <span className="model-picker-name">
-              {model?.name ?? (canChoose ? 'Choose a model' : 'Connect a model')}
-            </span>
-            {model ? <ChevronDown size={12} /> : <Plus size={16} />}
-          </>
-        )}
-      </Button>
-      {surface === 'settings' && model && connection?.status === 'reconnect' && (
-        <a className="model-needs-reconnect" href="/settings/models">
-          Reconnect in Settings &gt; Models
-        </a>
+    <Wrapper
+      className={appearance === 'statement' ? 'model-picker model-picker-inline' : 'model-picker'}
+    >
+      {appearance === 'statement' ? (
+        <button
+          ref={trigger}
+          type="button"
+          className="statement-value"
+          disabled={models.loading}
+          onClick={openPicker}
+          aria-label={triggerLabel}
+          title={triggerTitle}
+        >
+          {label ?? model?.name ?? 'Choose a model'}
+        </button>
+      ) : (
+        <Button
+          ref={trigger}
+          type="button"
+          variant={label && appearance !== 'quiet' ? 'secondary' : 'ghost'}
+          size="sm"
+          className="model-picker-trigger"
+          disabled={models.loading}
+          onClick={openPicker}
+          aria-label={triggerLabel}
+          title={triggerTitle}
+        >
+          {label ?? (
+            <>
+              <span className="model-picker-name">
+                {model?.name ?? (canChoose ? 'Choose a model' : 'Connect a model')}
+              </span>
+              {model ? <ChevronDown size={12} /> : <Plus size={16} />}
+            </>
+          )}
+        </Button>
       )}
+      {(!target || appearance !== 'statement') &&
+        surface === 'settings' &&
+        model &&
+        connection?.status === 'reconnect' && (
+          <a className="model-needs-reconnect" href="/settings/models">
+            Reconnect in {appPages['/settings/models']}
+          </a>
+        )}
       <Dialog
         open={open}
         onOpenChange={(value) => {
-          if (!models.busy) setOpen(value);
+          if (!busy) setOpen(value);
         }}
       >
         <DialogContent
@@ -1233,8 +1345,10 @@ export function ModelPicker({
             if (!manage) trigger.current?.focus();
           }}
         >
-          <DialogTitle>Choose a model</DialogTitle>
-          <p className="field-hint">Applies to your next message.</p>
+          <DialogTitle>{target?.title ?? 'Choose a model'}</DialogTitle>
+          <p className="field-hint">
+            {target ? 'Applies from the next run.' : 'Applies to your next message.'}
+          </p>
           <div className="model-picker-toolbar">
             <SearchField
               inputRef={searchInput}
@@ -1251,7 +1365,7 @@ export function ModelPicker({
               className="model-provider-filter"
               value={provider}
               onChange={setProvider}
-              disabled={models.busy}
+              disabled={busy}
               options={[
                 { value: 'all', label: 'All providers' },
                 ...Array.from(new Set(connections.map((source) => source.provider))).map(
@@ -1273,9 +1387,54 @@ export function ModelPicker({
             className="model-options"
             role={choices.length ? 'listbox' : 'region'}
             aria-label="Available models"
-            aria-busy={models.busy}
+            aria-busy={busy}
             style={{ '--model-results-height': `${height}px` } as CSSProperties}
           >
+            {!!leading.length && (
+              <div className="model-option-group" role="group" aria-label="Defaults">
+                {leading.map((item) => {
+                  const { source, model: chosen } = describe(item.model);
+                  const price = workPrice(usage, chosen);
+                  return (
+                    <button
+                      ref={(node) => {
+                        if (node) optionNodes.current.set(item.key, node);
+                        else optionNodes.current.delete(item.key);
+                      }}
+                      key={item.key}
+                      type="button"
+                      role="option"
+                      aria-selected={selectedKey === item.key}
+                      className="model-option model-option-default"
+                      tabIndex={active === item.key ? 0 : -1}
+                      disabled={busy}
+                      onFocus={() => focusOption(item.key)}
+                      onClick={() => void choose(item.key)}
+                    >
+                      <span className="model-option-copy">
+                        <span className="model-option-heading">
+                          <strong>{item.label}</strong>
+                        </span>
+                        <span className="model-option-detail">
+                          {chosen && source
+                            ? `${chosen.name} · ${modelProviderNames[source.provider]}`
+                            : 'No model available'}
+                        </span>
+                      </span>
+                      <span className="model-option-capabilities" />
+                      {price && (
+                        <span className="model-option-price" aria-label={`${price} over 30 days`}>
+                          {price}
+                        </span>
+                      )}
+                      <span className="model-option-status" aria-hidden="true">
+                        {selectedKey === item.key && <Check size={15} />}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
             {groups.map(({ source, choices: group }) => (
               <div
                 key={source.id}
@@ -1289,15 +1448,10 @@ export function ModelPicker({
                   <span>{connectionName(source, true)}</span>
                 </div>
                 {group.map(({ item, key, recommended }) => {
-                  const price =
-                    source.provider === 'openrouter'
-                      ? item.pricing === 'variable'
-                        ? 'Price varies'
-                        : !item.pricing
-                          ? 'Price unavailable'
-                          : item.pricing.input === 0 && item.pricing.output === 0
-                            ? 'Free tokens'
-                            : `${modelPrice.format(item.pricing.input)} in · ${modelPrice.format(item.pricing.output)} out / 1M`
+                  const price = pricedUsage
+                    ? workPrice(usage, item)
+                    : target || source.provider === 'openrouter'
+                      ? tokenPrice(item.pricing)
                       : null;
                   return (
                     <button
@@ -1311,7 +1465,7 @@ export function ModelPicker({
                       aria-selected={selectedKey === key}
                       className="model-option"
                       tabIndex={active === key ? 0 : -1}
-                      disabled={models.busy || (item.audio && !item.textModelName)}
+                      disabled={busy || (item.audio && !item.textModelName)}
                       onFocus={() => focusOption(key)}
                       onClick={() => void choose(key)}
                     >
@@ -1322,6 +1476,14 @@ export function ModelPicker({
                             <span className="model-option-recommended">Recommended</span>
                           )}
                         </span>
+                        {source.provider === 'google' && item.id === 'gemini-4-argon' && (
+                          <span className="model-option-detail">Requires paid API access</span>
+                        )}
+                        {source.provider === 'google' && item.id === 'gemini-3.8-flash' && (
+                          <span className="model-option-detail">
+                            Lower cost · Limited free access
+                          </span>
+                        )}
                         {item.audio && (
                           <span className="model-option-detail">
                             {item.textModelName
@@ -1356,7 +1518,9 @@ export function ModelPicker({
                       {price && (
                         <span
                           className="model-option-price"
-                          aria-label={`${price} tokens in US dollars`}
+                          aria-label={
+                            pricedUsage ? `${price} over 30 days` : `${price} tokens in US dollars`
+                          }
                         >
                           {price}
                         </span>
@@ -1390,9 +1554,13 @@ export function ModelPicker({
           <div className="model-picker-footer">
             <span role="status">
               {choices.length} {choices.length === 1 ? 'model' : 'models'}
-              {connections.some((source) => source.provider === 'openrouter')
-                ? ' · OpenRouter prices in USD; rates can vary.'
-                : ''}
+              {pricedUsage
+                ? ' · Prices show the last 30 days of this work on each model.'
+                : target
+                  ? ' · Prices in USD per million tokens.'
+                  : connections.some((source) => source.provider === 'openrouter')
+                    ? ' · OpenRouter prices in USD; rates can vary.'
+                    : ''}
             </span>
             {manageConnections && (
               <Button
@@ -1409,7 +1577,7 @@ export function ModelPicker({
               </Button>
             )}
           </div>
-          {models.error && <Notice>{models.error}</Notice>}
+          {(targetError || models.error) && <Notice>{targetError || models.error}</Notice>}
         </DialogContent>
       </Dialog>
       <Dialog open={manage} onOpenChange={setManage}>
@@ -1425,6 +1593,6 @@ export function ModelPicker({
           <ModelSettings />
         </DialogContent>
       </Dialog>
-    </div>
+    </Wrapper>
   );
 }

@@ -1,6 +1,16 @@
 import type { DecisionModel, DecisionQuestion } from '../ports/decisions.ts';
 import type { MemoryCurator } from '../ports/memory-curator.ts';
 import type { MailCheck } from './integration-result.ts';
+import { spendingLimitReached } from './ledger.ts';
+import { logFailure } from './failure-log.ts';
+
+const decisionFailures: Record<string, string> = {
+  decision_http: 'the check model request failed',
+  decision_transport: 'the check model connection failed',
+  decision_response: 'the check model response could not be read',
+  decision_json: 'the check model returned invalid JSON',
+  decision_validation: 'the check model returned an invalid response',
+};
 
 export function createMailCheck({
   curator,
@@ -26,32 +36,43 @@ export function createMailCheck({
       },
     ],
   };
+  const slots = 6;
   let checking = 0;
+  const expired = Symbol('mail check limit');
   const waiting: Array<() => void> = [];
   async function request<T>(
     work: (stop: AbortSignal) => Promise<T>,
-    signal?: AbortSignal,
+    signal: AbortSignal,
   ): Promise<T> {
-    const stop = AbortSignal.any([AbortSignal.timeout(15_000), ...(signal ? [signal] : [])]);
     await new Promise<void>((resolve, reject) => {
       const cancel = () => {
         const index = waiting.indexOf(start);
         if (index !== -1) waiting.splice(index, 1);
-        reject(stop.reason);
+        reject(signal.reason);
       };
       const start = () => {
-        if (stop.aborted) return cancel();
         checking += 1;
-        stop.removeEventListener('abort', cancel);
+        signal.removeEventListener('abort', cancel);
         resolve();
       };
-      stop.addEventListener('abort', cancel, { once: true });
-      if (stop.aborted) cancel();
-      else if (checking < 6) start();
+      if (signal.aborted) return reject(signal.reason);
+      signal.addEventListener('abort', cancel, { once: true });
+      if (checking < slots) start();
       else waiting.push(start);
     });
+    const limit = AbortSignal.timeout(15_000);
+    const stop = AbortSignal.any([limit, signal]);
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      checking -= 1;
+      waiting.shift()?.();
+    };
+    const expire = () => setImmediate(release);
+    limit.addEventListener('abort', expire, { once: true });
     return new Promise<T>((resolve, reject) => {
-      const cancel = () => reject(stop.reason);
+      const cancel = () => reject(limit.aborted ? expired : stop.reason);
       stop.addEventListener('abort', cancel, { once: true });
       void (async () => {
         try {
@@ -63,19 +84,25 @@ export function createMailCheck({
           reject(error);
         } finally {
           stop.removeEventListener('abort', cancel);
-          checking -= 1;
-          waiting.shift()?.();
+          limit.removeEventListener('abort', expire);
+          release();
         }
       })();
     });
   }
   return async (emails, signal) => {
-    if (!emails.length || signal?.aborted) return emails.map(() => undefined);
+    const stopped = 'the read was stopped before its check finished';
+    if (!emails.length) return [];
+    if (signal?.aborted) return emails.map(() => stopped);
     const decision = decisions?.configured === false ? undefined : decisions;
+    const read = new AbortController();
+    let timeouts = 0;
+    const stop = signal ? AbortSignal.any([signal, read.signal]) : read.signal;
     return Promise.all(
       emails.map(async (email) => {
         const input = { email };
-        if (JSON.stringify(input).length > 32_000) return undefined;
+        if (JSON.stringify(input).length > 32_000) return 'the email is too long to check';
+        if (!decision && !curator.configured) return 'no model is available for the check';
         try {
           const result = await request(
             async (stop) =>
@@ -84,24 +111,52 @@ export function createMailCheck({
                     { instructions: accessInstructions, input, question: accessQuestion },
                     stop,
                   )
-                : curator.configured
-                  ? curator.curate(
-                      {
-                        task: 'access',
-                        instructions: `${accessInstructions}\nReply with only JSON with one property, "access", whose value is true or false.`,
-                        input,
-                      },
-                      stop,
-                    )
-                  : undefined,
-            signal,
+                : curator.curate(
+                    {
+                      task: 'access',
+                      instructions: `${accessInstructions}\nReply with only JSON with one property, "access", whose value is true or false.`,
+                      input,
+                    },
+                    stop,
+                  ),
+            stop,
           );
+          timeouts = 0;
           if (result && typeof result === 'object') {
             const access = (result as { access?: unknown }).access;
             if (typeof access === 'boolean') return access;
           }
-        } catch {}
-        return undefined;
+          return 'the check model gave no valid answer';
+        } catch (error) {
+          if (signal?.aborted) return stopped;
+          if (error === expired) {
+            if (++timeouts === slots) read.abort();
+            return 'the check model did not answer within 15 seconds';
+          }
+          if (read.signal.aborted) return stopped;
+          if (error instanceof Error && error.message === spendingLimitReached)
+            return spendingLimitReached;
+          const status =
+            (error as { status?: unknown })?.status ??
+            (error as { providerStatus?: unknown })?.providerStatus;
+          const httpStatus =
+            typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599
+              ? status
+              : undefined;
+          const supplied = (error as { code?: unknown })?.code;
+          const code =
+            typeof supplied === 'string' && Object.hasOwn(decisionFailures, supplied)
+              ? supplied
+              : 'mail_check_request';
+          logFailure(
+            'mail_check_failed',
+            Object.assign(new Error('The mail safety check failed.'), {
+              code,
+              ...(httpStatus === undefined ? {} : { status: httpStatus }),
+            }),
+          );
+          return `${decisionFailures[code] ?? 'the check model request failed'}${httpStatus === undefined ? '' : ` (HTTP ${httpStatus})`}`;
+        }
       }),
     );
   };

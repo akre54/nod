@@ -99,6 +99,7 @@ function PaymentForm({ id, embedded, onClose }: PrivateFormProps) {
   const card = useRef<HTMLDivElement>(null);
   const [request, setRequest] = useState<PaymentRequest>();
   const [status, setStatus] = useState<PaymentStatus>();
+  const [notEntered, setNotEntered] = useState(false);
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
   const action = useRef<AbortController | null>(null);
@@ -110,12 +111,16 @@ function PaymentForm({ id, embedded, onClose }: PrivateFormProps) {
       if (action.current) return;
       const version = ++updates.current;
       try {
-        const result = await api<{ status: PaymentStatus }>(`${path}/status`, {
-          signal: controller.signal,
-          cache: 'no-store',
-        });
+        const result = await api<{ status: PaymentStatus; notEntered?: boolean }>(
+          `${path}/status`,
+          {
+            signal: controller.signal,
+            cache: 'no-store',
+          },
+        );
         if (controller.signal.aborted || version !== updates.current) return;
         setStatus(result.status);
+        setNotEntered(result.notEntered === true);
         if (result.status !== 'pending') setError('');
         if (result.status === 'pending') {
           const value = await api<PaymentRequest>(path, {
@@ -172,13 +177,18 @@ function PaymentForm({ id, embedded, onClose }: PrivateFormProps) {
         setStatus('uncertain');
         setError('The result is not confirmed. Ask Nod to check the order before another attempt.');
         try {
-          const result = await api<{ status: PaymentStatus }>(`${path}/status`, {
-            signal: controller.signal,
-            cache: 'no-store',
-          });
+          const result = await api<{ status: PaymentStatus; notEntered?: boolean }>(
+            `${path}/status`,
+            {
+              signal: controller.signal,
+              cache: 'no-store',
+            },
+          );
           if (!controller.signal.aborted) {
             setStatus(result.status);
-            if (result.status === 'submitted' || result.status === 'entering') setError('');
+            setNotEntered(result.notEntered === true);
+            if (result.notEntered || result.status === 'submitted' || result.status === 'entering')
+              setError('');
           }
         } catch {}
       }
@@ -197,18 +207,24 @@ function PaymentForm({ id, embedded, onClose }: PrivateFormProps) {
         aria-busy={saving}
       >
         <h1>
-          {status === 'submitted'
-            ? 'Card submitted'
-            : status === 'uncertain'
-              ? 'The result is unknown.'
-              : status === 'expired'
-                ? 'This payment request has expired.'
-                : 'Approve payment'}
+          {notEntered
+            ? 'Stopped before entry'
+            : status === 'submitted'
+              ? 'Card submitted'
+              : status === 'uncertain'
+                ? 'The result is unknown.'
+                : status === 'expired'
+                  ? 'This payment request has expired.'
+                  : 'Approve payment'}
         </h1>
         {saving || status === 'entering' ? (
           <Loading label="Submitting your card…" />
         ) : status === 'submitted' ? (
           <p>Nod will check the result and continue your task in the same conversation.</p>
+        ) : notEntered ? (
+          <p>
+            No values were entered in this step. Return to chat if you want to start a new payment.
+          </p>
         ) : status === 'uncertain' ? (
           <p>
             The card may have reached the website. Ask Nod to check the order before another
@@ -340,6 +356,7 @@ function CredentialForm({ id, embedded, onClose, onRequestChange }: PrivateFormP
     };
   }, [activeId, embedded]);
   const uncertain = request?.status === 'uncertain';
+  const notEntered = request?.notEntered === true;
   const expired = uncertain || request?.status === 'expired';
   const filled = request?.status === 'filled';
   const fields = request?.fields ?? [];
@@ -382,7 +399,11 @@ function CredentialForm({ id, embedded, onClose, onRequestChange }: PrivateFormP
             `/api/credential-requests/${encodeURIComponent(activeId)}`,
             { signal: controller.signal, cache: 'no-store' },
           );
-          if (generation.current === current && !controller.signal.aborted) setRequest(value);
+          if (generation.current === current && !controller.signal.aborted) {
+            setRequest(value);
+            if (value.notEntered || value.status === 'filled' || value.status === 'uncertain')
+              setError('');
+          }
         } catch {}
       }
     } finally {
@@ -395,7 +416,9 @@ function CredentialForm({ id, embedded, onClose, onRequestChange }: PrivateFormP
       '/retry',
       {},
       () => setRetried(true),
-      'A new sign-in step could not be requested. Return to chat to check this task.',
+      uncertain
+        ? 'Nod could not check this sign-in step. Return to chat and ask Nod to inspect the page.'
+        : 'A new sign-in step could not be requested. Return to chat to check this task.',
     );
   }
   function submitted(result: { ok: boolean; retryUrl?: string; error?: string }) {
@@ -486,7 +509,8 @@ function CredentialForm({ id, embedded, onClose, onRequestChange }: PrivateFormP
       '',
       input,
       submitted,
-      'Sign-in could not continue. Try again or return to chat for a new link.',
+      'The sign-in response could not be confirmed. Ask Nod to check the website before another attempt.',
+      true,
     );
   }
   return (
@@ -534,21 +558,29 @@ function CredentialForm({ id, embedded, onClose, onRequestChange }: PrivateFormP
             <LockKeyhole size={32} />
             <h1>
               {retried
-                ? 'A new step is on its way.'
-                : uncertain
-                  ? 'The result is unknown.'
-                  : 'This link has expired.'}
+                ? 'Nod is continuing the sign-in.'
+                : notEntered
+                  ? 'Stopped before entry'
+                  : uncertain
+                    ? 'The result is unknown.'
+                    : 'This link has expired.'}
             </h1>
             <p>
               {retried
-                ? 'Return to chat for the next step.'
-                : uncertain
-                  ? 'The sign-in may have reached the website. Ask Nod to check its result before another attempt.'
-                  : 'Ask Nod to check the sign-in page again.'}
+                ? 'Return to chat to follow this task.'
+                : notEntered
+                  ? 'No values were entered in this step. Return to chat if you want to sign in again.'
+                  : uncertain
+                    ? 'The sign-in may have reached the website. Ask Nod to check its result before another attempt.'
+                    : 'Ask Nod to check the sign-in page again.'}
             </p>
-            {!retried && (
+            {!retried && !notEntered && (
               <Button disabled={saving} onClick={() => void retry()}>
-                {saving ? 'Requesting…' : 'Get a new Vault link'}
+                {saving
+                  ? 'Requesting…'
+                  : uncertain
+                    ? 'Check sign-in result'
+                    : 'Get a new Vault link'}
               </Button>
             )}
             <BackToChat onClose={onClose} />

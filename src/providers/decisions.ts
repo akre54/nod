@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { DecisionModel, DecisionQuestion } from '../ports/decisions.ts';
+import type { ModelAccess } from '../ports/models.ts';
 import type { OpenAIRegion } from '../shared/models.ts';
 import { openAIBaseUrl, openAIRequestError } from './openai/api.ts';
 import { ModelServiceError } from './model-error.ts';
@@ -149,6 +150,7 @@ export function createDecisionModel(options: {
   configured?: () => boolean;
   resolve(signal?: AbortSignal): Promise<DecisionConnection | undefined>;
   fetch?: typeof fetch;
+  reserve?: ModelAccess['reserve'];
 }): DecisionModel {
   const request = options.fetch ?? fetch;
   return {
@@ -174,6 +176,10 @@ export function createDecisionModel(options: {
       if (!connection || options.configured?.() === false) return undefined;
       const service = services[connection.provider];
       const model = connection.model ?? service.model;
+      const url =
+        connection.provider === 'openai'
+          ? `${openAIBaseUrl(connection.region)}/decisions`
+          : service.url;
       const {
         instructions,
         input,
@@ -205,14 +211,60 @@ export function createDecisionModel(options: {
         (connection.provider === 'typesafe' && model === 'jev-1.14.0') ||
         (connection.provider === 'openrouter' && model === 'typesafe/jev-1.14');
       const id = crypto.randomUUID();
-      const started = performance.now();
       let usage: z.infer<typeof usageSchema> | undefined;
       let status: 'succeeded' | 'failed' | 'cancelled' = 'failed';
+      const requestBody = JSON.stringify({
+        model,
+        ...(connection.provider === 'openrouter' ? { provider: { allow_fallbacks: false } } : {}),
+        ...(connection.provider === 'openai'
+          ? {
+              input: JSON.stringify(input),
+              questions: questions.map((item, index) => ({
+                type: item.format === 'predicate' ? 'predicate' : 'choice',
+                name: item.name,
+                instructions: describe(item, index),
+                ...(item.format === 'predicate' ? {} : { choices: item.choices }),
+              })),
+            }
+          : {
+              state: input,
+              questions: Object.fromEntries(
+                questions.map((item, index) => [
+                  item.name,
+                  {
+                    type: item.format === 'predicate' ? 'noul' : 'choice',
+                    instructions: describe(item, index),
+                    ...(item.format === 'predicate'
+                      ? {}
+                      : {
+                          criteria: Object.fromEntries(
+                            item.choices.map(({ value, description }) => [
+                              String(value),
+                              description,
+                            ]),
+                          ),
+                        }),
+                  },
+                ]),
+              ),
+            }),
+      });
+      const settleBudget = await options.reserve?.(
+        priced
+          ? (Buffer.byteLength(requestBody) * Math.max(service.rate, 0.125)) / 1_000_000
+          : null,
+      );
+      const started = performance.now();
+      let dispatched = false;
+      let failure = 'decision_transport';
+      let httpStatus: number | undefined;
       try {
-        const url =
-          connection.provider === 'openai'
-            ? `${openAIBaseUrl(connection.region)}/decisions`
-            : service.url;
+        const requestSignal = AbortSignal.any([
+          AbortSignal.timeout(45_000),
+          ...(signal ? [signal] : []),
+        ]);
+        requestSignal.throwIfAborted();
+        dispatched = true;
         const response = await request(url, {
           method: 'POST',
           redirect: 'error',
@@ -220,58 +272,29 @@ export function createDecisionModel(options: {
             authorization: `Bearer ${connection.key}`,
             'content-type': 'application/json',
           },
-          signal: AbortSignal.any([AbortSignal.timeout(45_000), ...(signal ? [signal] : [])]),
-          body: JSON.stringify({
-            model,
-            ...(connection.provider === 'openrouter'
-              ? { provider: { allow_fallbacks: false } }
-              : {}),
-            ...(connection.provider === 'openai'
-              ? {
-                  input: JSON.stringify(input),
-                  questions: questions.map((item, index) => ({
-                    type: item.format === 'predicate' ? 'predicate' : 'choice',
-                    name: item.name,
-                    instructions: describe(item, index),
-                    ...(item.format === 'predicate' ? {} : { choices: item.choices }),
-                  })),
-                }
-              : {
-                  state: input,
-                  questions: Object.fromEntries(
-                    questions.map((item, index) => [
-                      item.name,
-                      {
-                        type: item.format === 'predicate' ? 'noul' : 'choice',
-                        instructions: describe(item, index),
-                        ...(item.format === 'predicate'
-                          ? {}
-                          : {
-                              criteria: Object.fromEntries(
-                                item.choices.map(({ value, description }) => [
-                                  String(value),
-                                  description,
-                                ]),
-                              ),
-                            }),
-                      },
-                    ]),
-                  ),
-                }),
-          }),
+          signal: requestSignal,
+          body: requestBody,
         });
+        httpStatus = response.status;
         if (!response.ok) {
+          failure = 'decision_http';
           if (connection.provider === 'openai')
             throw await openAIRequestError(response, connection.key);
+          void response.body?.cancel().catch(() => {});
           throw new Error();
         }
+        failure = 'decision_response';
+        const text = await response.text();
+        failure = 'decision_json';
+        const value = JSON.parse(text);
+        failure = 'decision_validation';
         const body = z
           .object({
             answers: z.unknown(),
             usage: usageSchema,
             model: z.unknown().optional(),
           })
-          .parse(await response.json());
+          .parse(value);
         usage = body.usage;
         const answers =
           connection.provider === 'openai'
@@ -328,8 +351,20 @@ export function createDecisionModel(options: {
         };
       } catch (error) {
         status = signal?.aborted ? 'cancelled' : 'failed';
-        if (error instanceof ModelServiceError) throw error;
-        throw new Error('The decision service could not complete the check.');
+        signal?.throwIfAborted();
+        if (error instanceof ModelServiceError) {
+          Object.assign(error, { code: failure });
+          throw error;
+        }
+        throw Object.assign(new Error('The decision service could not complete the check.'), {
+          code: failure,
+          ...(typeof httpStatus === 'number' &&
+          Number.isInteger(httpStatus) &&
+          httpStatus >= 100 &&
+          httpStatus <= 599
+            ? { status: httpStatus }
+            : {}),
+        });
       } finally {
         const cacheRead =
           connection.provider === 'openai' ? (usage?.input_tokens_details?.cached_tokens ?? 0) : 0;
@@ -340,6 +375,16 @@ export function createDecisionModel(options: {
         const validCache = !usage || cacheRead + cacheWrite <= usage.input_tokens;
         const uncached =
           usage && validCache ? usage.input_tokens - cacheRead - cacheWrite : usage?.input_tokens;
+        const costUsd = !dispatched
+          ? 0
+          : usage
+            ? (usage.cost ??
+              (priced && validCache
+                ? ((uncached ?? 0) * service.rate + cacheRead * 0.01 + cacheWrite * 0.125) /
+                  1_000_000
+                : null))
+            : null;
+        await settleBudget?.(costUsd);
         report?.({
           id,
           provider: connection.provider,
@@ -359,15 +404,10 @@ export function createDecisionModel(options: {
             ? { cacheReadTokens: cacheRead, cacheWriteTokens: cacheWrite }
             : {}),
           outputTokens: usage?.output_tokens,
-          costUsd: usage
-            ? (usage.cost ??
-              (priced && validCache
-                ? ((uncached ?? 0) * service.rate + cacheRead * 0.01 + cacheWrite * 0.125) /
-                  1_000_000
-                : null))
-            : null,
-          pricing:
-            usage?.cost !== undefined
+          costUsd,
+          pricing: !dispatched
+            ? 'sdk_estimate'
+            : usage?.cost !== undefined
               ? 'reported'
               : usage && priced && validCache
                 ? 'sdk_estimate'

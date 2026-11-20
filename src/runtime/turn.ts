@@ -18,6 +18,7 @@ export interface Turn {
     id?: string,
     replyToMessageId?: string,
     presentation?: Presentation,
+    handoff?: boolean,
   ): Promise<ReplyDelivery>;
   pause(
     reason: 'question' | 'approval' | 'credentials' | 'browser',
@@ -27,5 +28,4 @@ export interface Turn {
   confirm(result: unknown): Promise<unknown>;
   visited(browserId: string, url: string): void;
   delegate?(title: string, instruction: string): Promise<string>;
-  setStatus?(text: string): Promise<string>;
 }

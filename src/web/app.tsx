@@ -37,10 +37,10 @@ import type { AccountControls, AccountTab } from './components/account-menu';
 import { usePageData } from './hooks/use-page-data';
 import { resolveBrowserRegion, setDateFormat } from './lib/date-format';
 import { useBrowserTimeZone } from './hooks/use-browser-time-zone';
+import { finishOnboarding } from './lib/onboarding';
 import {
   desktopSettingsAvailable,
   desktopRendererReady,
-  saveDesktopSettings,
   onFeedbackRequested,
   subscribeDesktopFocusMessage,
   subscribeDesktopSettings,
@@ -268,7 +268,9 @@ function Workspace({
                 <Vault hidden={path !== '/vault'} onAsk={askInChat} />
               </>
             )}
-            {path === '/apps' && <Apps configuration={state?.configuration} onAsk={askInChat} />}
+            {path === '/apps' && (
+              <Apps key={session.user!.id} configuration={state?.configuration} onAsk={askInChat} />
+            )}
             {path === '/channels' && <Channels />}
             {path === '/tasks' && (
               <Scheduled onAsk={askInChat} activity={connected ? state?.activity : undefined} />
@@ -564,10 +566,9 @@ function AuthenticatedApp({
           onTraces={account.onTraces}
           onComplete={async () => {
             setFinishingOnboarding(true);
-            if (!session.settings!.onboardingCompleted)
-              await onAccountUpdate({ onboardingCompleted: true });
-            if (desktopSettingsAvailable())
-              await saveDesktopSettings({ onboardingCompleted: true });
+            await finishOnboarding(session.settings!.onboardingCompleted, () =>
+              onAccountUpdate({ onboardingCompleted: true }),
+            );
             pendingDesktopPage.current = null;
             replaceNavigation('/');
             setFinishingOnboarding(false);
@@ -756,17 +757,17 @@ export function App({ sessionState }: { sessionState: ReturnType<typeof useSessi
       .catch(() => {});
     return stop;
   }, []);
-  useEffect(() => {
+  useLayoutEffect(() => {
     return subscribeNavigation(() => setPath(window.location.pathname));
   }, []);
-  useEffect(
-    () =>
-      onFeedbackRequested(() => {
-        if (/^\/privacy\/?$/.test(window.location.pathname)) navigate('/');
-        setFeedbackRequest((value) => value + 1);
-      }),
-    [],
-  );
+  const sessionReady = !sessionState.loading && Boolean(sessionState.session?.user);
+  useEffect(() => {
+    if (!sessionReady) return;
+    return onFeedbackRequested(() => {
+      if (/^\/privacy\/?$/.test(window.location.pathname)) navigate('/');
+      setFeedbackRequest((value) => value + 1);
+    });
+  }, [sessionReady]);
   return (
     <>
       {desktopSettingsAvailable() && <div className="desktop-titlebar" aria-hidden="true" />}

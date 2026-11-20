@@ -545,6 +545,7 @@ const spendingCsv = [
   '2026-09-28,Software,Figma,20.00,60.00,subscription',
   '2026-09-28,Software,Notion,20.00,60.00,subscription',
 ].join('\n');
+const draftFormats = ['minimal', 'full', 'raw', 'metadata'];
 const toolDefinitions = [
   {
     name: 'GMAIL_LIST_LABELS',
@@ -572,7 +573,11 @@ const toolDefinitions = [
     description: 'Read a synthetic email by its observed emailId, including attachment metadata.',
     parameters: {
       type: 'object',
-      properties: { message_id: { type: 'string' }, user_id: { type: 'string' } },
+      properties: {
+        message_id: { type: 'string' },
+        format: { type: 'string' },
+        user_id: { type: 'string' },
+      },
       required: ['message_id'],
     },
   },
@@ -671,6 +676,7 @@ const toolDefinitions = [
       type: 'object',
       properties: {
         recipient_email: { type: 'string', maxLength: 320 },
+        extra_recipients: { type: 'array', items: { type: 'string', maxLength: 320 } },
         subject: { type: 'string', maxLength: 300 },
         body: { type: 'string', maxLength: 12000 },
         user_id: { type: 'string', enum: ['me'] },
@@ -691,6 +697,20 @@ const toolDefinitions = [
   {
     name: 'GMAIL_GET_DRAFT',
     description: 'Read one unsent synthetic draft using its observed draft ID.',
+    parameters: {
+      type: 'object',
+      properties: {
+        draft_id: { type: 'string' },
+        format: { type: 'string', enum: draftFormats },
+        user_id: { type: 'string', enum: ['me'] },
+      },
+      required: ['draft_id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'GMAIL_DELETE_DRAFT',
+    description: 'Permanently delete one observed synthetic draft using its draft ID.',
     parameters: {
       type: 'object',
       properties: { draft_id: { type: 'string' }, user_id: { type: 'string', enum: ['me'] } },
@@ -1057,10 +1077,12 @@ export function createIntegrationFixture(
               : action === 'GMAIL_LIST_DRAFTS'
                 ? ['user_id']
                 : action === 'GMAIL_GET_DRAFT'
-                  ? ['draft_id', 'user_id']
-                  : action === 'GMAIL_DELETE_MESSAGE'
-                    ? ['message_id', 'user_id']
-                    : undefined;
+                  ? ['draft_id', 'format', 'user_id']
+                  : action === 'GMAIL_DELETE_DRAFT'
+                    ? ['draft_id', 'user_id']
+                    : action === 'GMAIL_DELETE_MESSAGE'
+                      ? ['message_id', 'user_id']
+                      : undefined;
           if (fields && Object.keys(args).some((key) => !fields.includes(key)))
             throw new Error('The synthetic action fields are invalid.');
           if (
@@ -1079,6 +1101,12 @@ export function createIntegrationFixture(
               ))
           )
             throw new Error('The mailbox query fields are invalid.');
+          if (
+            action === 'GMAIL_GET_DRAFT' &&
+            args.format !== undefined &&
+            (typeof args.format !== 'string' || !draftFormats.includes(args.format))
+          )
+            throw new Error('The synthetic draft format is invalid.');
           const sent =
             action === 'GMAIL_FETCH_EMAILS' &&
             (/(?:^|\s)(?:in|label):sent(?:\s|$)/i.test(String(args.query ?? '')) ||
@@ -1131,11 +1159,22 @@ export function createIntegrationFixture(
           if (action === 'GMAIL_CREATE_EMAIL_DRAFT') {
             if (
               Object.keys(args).some(
-                (key) => !['recipient_email', 'subject', 'body', 'user_id'].includes(key),
+                (key) =>
+                  !['recipient_email', 'extra_recipients', 'subject', 'body', 'user_id'].includes(
+                    key,
+                  ),
               ) ||
               typeof args.recipient_email !== 'string' ||
               !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(args.recipient_email) ||
               args.recipient_email.length > 320 ||
+              (args.extra_recipients !== undefined &&
+                (!Array.isArray(args.extra_recipients) ||
+                  args.extra_recipients.some(
+                    (recipient) =>
+                      typeof recipient !== 'string' ||
+                      recipient.length > 320 ||
+                      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient),
+                  ))) ||
               typeof args.subject !== 'string' ||
               !args.subject ||
               args.subject.length > 300 ||
@@ -1150,7 +1189,9 @@ export function createIntegrationFixture(
               accountId: accountId!,
               message: {
                 id: `fixture-draft-message-${item.id}`,
-                to: args.recipient_email,
+                to: [args.recipient_email, ...((args.extra_recipients as string[]) ?? [])].join(
+                  ', ',
+                ),
                 subject: args.subject,
                 body: args.body,
                 labelIds: ['DRAFT'],
@@ -1175,7 +1216,36 @@ export function createIntegrationFixture(
             const draft = typeof args.draft_id === 'string' ? drafts.get(args.draft_id) : undefined;
             if (!draft || draft.accountId !== accountId)
               throw new Error('The synthetic draft was not found in this account.');
+            if (args.format === 'metadata')
+              return {
+                id: draft.id,
+                message: {
+                  id: draft.message.id,
+                  labelIds: draft.message.labelIds,
+                  payload: {
+                    headers: [
+                      { name: 'To', value: draft.message.to },
+                      { name: 'Subject', value: draft.message.subject },
+                    ],
+                  },
+                },
+                ...fixtureMetadata,
+              };
             return { id: draft.id, message: draft.message, ...fixtureMetadata };
+          }
+          if (action === 'GMAIL_DELETE_DRAFT') {
+            const draft = typeof args.draft_id === 'string' ? drafts.get(args.draft_id) : undefined;
+            if (!draft || draft.accountId !== accountId)
+              throw new Error('The synthetic draft was not found in this account.');
+            const item = recordWrite(action, accountId!);
+            drafts.delete(draft.id);
+            return {
+              id: item.id,
+              draft_id: draft.id,
+              deleted: true,
+              ...fixtureMetadata,
+              deliveredExternally: false,
+            };
           }
           if (action === 'GMAIL_DELETE_MESSAGE') {
             const draft = [...drafts.values()].find(

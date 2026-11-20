@@ -9,11 +9,11 @@ import { Steps } from '@astrojs/starlight/components';
 
 Connect Gmail, Google Calendar, Drive, Sheets, Docs, Slack and many other apps from **Apps**. Select an app, sign in and review its permissions. Search tolerates common typos and abbreviations, and **Categories** narrows the results. Scroll to browse more apps.
 
-During onboarding, connect **Gmail** or **Outlook** so Nod can find emails that need a reply, pull out next steps and draft responses for you to review. Then connect **Google Calendar** or **Outlook Calendar** to work with upcoming meetings and available time. Outlook uses the same account connection for email and calendar, so an account connected in the email step is already shown in the calendar step. The permissions granted on the provider's consent screen still apply. Both steps are optional and have **Skip for now**. While signing in, progress and cancellation stay in the selected provider card. If the browser cannot open, use **Open sign-in** there; if signing in is interrupted, return to the card to try again.
+During onboarding, connect **Gmail** or **Outlook** so Nod can find emails that need a reply, pull out next steps and draft responses for you to review. Select **Continue without email** to move to the next setup step without a connection. You can connect email, **Google Calendar** or **Outlook Calendar** later from **Apps**. Outlook uses the same account connection for email and calendar, subject to the permissions granted on the provider's consent screen. While signing in, progress and cancellation stay in the selected provider card. If the browser cannot open, use **Open sign-in** there; if signing in is interrupted, return to the card to try again.
 
 After model selection, the app step lists the full catalog by category. Use **Manage** to add or remove accounts. While an app signs in, its card shows **Cancel**. You can continue without connecting any tools. A count shows connected tools, excluding email. You can also connect apps later from **Apps**.
 
-Nod uses [Composio](https://composio.dev) for these connections. By default, app requests and results pass through n8n's hosted connection service and Composio. Source installs can [select a trusted connection service](/deploy/configuration/#apps-and-composio). Nod checks each action before it reaches the connection service. Each installation signs its requests with its own random identity. The connection service stores only the public part, your connected accounts, usage counters, and expiring connection state, so knowing an account ID alone grants no access. Notion, Linear and n8n connect through their own MCP servers. See [MCP servers, APIs and CLIs](/connect/mcp-api-cli/).
+Nod uses [Composio](https://composio.dev) for these connections. By default, app requests and results pass through n8n's hosted connection service and Composio. Source installs can [select a trusted connection service](/deploy/configuration/#apps-and-composio). Notion, Linear and n8n connect through their own MCP servers. See [MCP servers, APIs and CLIs](/connect/mcp-api-cli/).
 
 ```mermaid
 flowchart TD
@@ -26,13 +26,41 @@ flowchart TD
   composio --> apps[Gmail · Calendar<br/>Slack · more]
 ```
 
+## How Nod protects app connections
+
+**Nod's default Composio project has Zero Data Retention (ZDR) enabled.** Composio does not save the content of covered app calls in its execution logs. For example, a covered email read does not leave a copy of the email text in those logs. It keeps a record of which tool ran, when it ran, and whether it succeeded. See [Composio Zero Data Retention](/trust/privacy/#composio-zero-data-retention) for what this covers and its limits.
+
+Several controls protect each connection:
+
+| Control                                 | What it does                                                                                                                                                                                                                                                             |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **App permissions**                     | You connect each app and review the provider's permission screen. That grant sets what Composio can read or change. Some grants cover a whole mailbox.                                                                                                                   |
+| **A check before each app call**        | Nod checks reads and actions before sending them to the connection service. Reads and drafts normally run. Other actions need your words, a standing instruction, or a rule that allows them. Otherwise, Nod asks. A rule to ask first also applies to reads and drafts. |
+| **Signed requests and account checks**  | Each installation signs requests with its own private key. The connection service holds the public key. Nod checks that the account belongs to the current owner. An account ID alone grants no access.                                                                  |
+| **Credentials outside the model**       | Composio holds the access tokens that keep the app connected. These tokens do not enter Nod's prompts, workspace, or browser.                                                                                                                                            |
+| **App content cannot grant permission** | Nod marks app results as untrusted data. The trust check sees your words and the proposed action, never the app results. An email cannot authorize an action.                                                                                                            |
+| **A record you can review**             | [Usage](/use/spending/) shows app actions and the words that allowed them while the source message exists. You can [disconnect an account](#manage-connected-accounts) or revoke access in the provider's settings.                                                      |
+
+Each signed request carries the time it was signed. If your computer's clock is wrong, the connection service refuses the request. Nod then uses the time the service reports and signs that request once more.
+
+Composio documents credential encryption with AES-256-GCM and TLS for data in transit. Its [security documentation](https://docs.composio.dev/docs/security/overview) explains these controls. Its [Trust Center](https://trust.composio.dev/) provides security reports and its subprocessor list.
+
+With the default setup, app requests and results pass through n8n's connection service and Composio. Other setups use the connection service their operator selects. ZDR limits storage for covered calls. It does not reduce OAuth permissions or set retention for your model provider, destination apps, or Nod's local data. The trust check uses a model and can make mistakes. See the [Security review guide](/trust/security-review/) for the wider boundaries.
+
+The trust check protects requests made through Nod. It cannot block someone who uses a stolen app token outside Nod. The permissions you grant remain the limit of what that token can do. Review those permissions and revoke access in the provider's settings when you no longer need the connection.
+
 ## Connect your apps
+
+Browse [custom connections](/connect/community-apps/) for apps that use their own MCP servers. To add a community or partner app, follow [Creating your own connectors](/contribute/apps/).
+
+These steps apply to apps connected through Composio, such as Gmail and Outlook. For Notion, Linear, n8n and other MCP apps, follow [MCP servers, APIs and CLIs](/connect/mcp-api-cli/).
 
 <Steps>
 
 1. Open **Apps**, find an app and select **Connect**.
-2. Sign in on the app's consent screen and choose what Nod can access. The screen may show Composio, the service that connects the app, instead of Nod.
-3. Return to Nod when the app is connected.
+2. Read the data handling notice, then select **Continue to sign in**. No remote connection starts before this step.
+3. Sign in on the app's consent screen and choose what Nod can access. The screen may show Composio, the service that connects the app, instead of Nod.
+4. Return to Nod when the app is connected.
 
 </Steps>
 
@@ -40,7 +68,11 @@ You can also ask Nod in chat. It searches the same catalog with your saved accou
 
 Use **Ask Nod** in the **Connect another tool** card below the catalog to get help connecting a tool. It opens chat with your search included, so Nod can guide the setup. If you already have an MCP server address, use **Connect MCP** at the top of the page.
 
+For Composio apps, the data handling notice appears in the desktop app and on a self-hosted server. This includes installs that use a custom connection service. It also appears for connection links from chat, onboarding and reconnection. App content, including email messages, passes through the connection service and Composio when Nod reads or sends it. Both services can read this content. See [data handling and retention](/trust/privacy/#composio-zero-data-retention).
+
 The sign-in dialog closes automatically once Nod confirms the connection.
+
+After you connect from **Apps**, the success notice has an **Open chat** button. Select it to give Nod a task. Your current draft stays in place. Opening chat does not send a message or start work.
 
 If sign-in fails or the link is unavailable, select **Try again** to open a fresh sign-in window. Nod stops waiting as soon as the sign-in page can't start or closes, such as after a restart. If you closed the browser before finishing, select **Start again**. Finish in the newest window; a replaced link can no longer complete sign-in. If sign-in is already finishing, Nod keeps waiting for that result instead of starting another consent flow.
 
@@ -52,7 +84,7 @@ Expired chat cards keep the app's name and icon, but their connection button is 
 
 ## Manage connected accounts
 
-Connected cards in **Apps** show an account count beside the people icon. Select it to review account identities, reconnect or disconnect accounts. Select the plus icon to connect another account. Disconnecting removes Nod's access through that connection. You can also review or revoke access in the provider's settings.
+Connected cards in **Apps** show an account count beside the people icon. Select it to review account identities, reconnect or disconnect accounts. When **Add account** is available there, select it to connect another account. Disconnecting removes Nod's access through that connection. You can also review or revoke access in the provider's settings.
 
 Select **Reconnect** to sign in to a saved account again. The control is available when the provider supports it, including while the account is connected. This lets you complete consent again after its permissions change. It keeps the saved account and its settings. Otherwise, if **Add account** is available, use it to create an additional connection without removing the old account. Nod starts an additional connection only when you ask. **Sign-in unavailable** means the provider is not configured or does not support that app. Ask your server operator to check the [connection-service setup](/deploy/configuration/#apps-and-composio).
 
@@ -61,6 +93,20 @@ When access is blocked, Nod is instructed to identify the account and unavailabl
 ## Automatic app updates
 
 Nod checks Gmail for new mail while it's running. The connection service doesn't receive app webhooks, so apps such as Calendar and Slack don't wake Nod automatically. You can still ask Nod to work with them.
+
+## When the connection service is busy
+
+All apps connected through the connection service share one allowance for your Nod install. When the service answers HTTP 429 (too many requests) or 503 (unavailable), Nod pauses background reads of all those apps. The pause lasts as long as the service's `Retry-After` header asks, up to 15 minutes. Without that header, the wait starts at one minute. A later refusal doubles it only if that request started after the previous refusal arrived. The wait can grow to 30 minutes. Refusals from requests already in flight do not each add a step. A successful app request that starts after the latest refusal ends the pause.
+
+When the connection service reports its own rate limit or outage during a Gmail inbox check, Nod waits instead of trying that check again immediately. It keeps its cursor and any completed messages for a later check.
+
+During the pause:
+
+- A read you ask for, in chat or a task you started, still tries once. If the service refuses it, the same wait rules apply.
+- An action, such as sending an email, fails at once with the time the pause ends. Nod doesn't send it, so it can't run twice. Ask again after that time.
+- Background checks, scheduled reads and reads in tasks Nod starts skip these apps. They can try again later.
+
+Errors name the service's reason, such as `installation_busy`, and the HTTP status. MCP servers, APIs, CLIs and local files don't use the connection service, so the pause doesn't affect them.
 
 ## Control what each app can access
 
@@ -81,6 +127,7 @@ Nod changes your apps only as far as you ask. Ask what needs a reply and it tell
 ## Related resources
 
 - [Local files](/connect/local-files/)
+- [Computer use](/connect/computer-use/)
 - [Models](/connect/models/)
 - [MCP servers, APIs and CLIs](/connect/mcp-api-cli/)
 - [Approvals and the trust check](/trust/approvals/)

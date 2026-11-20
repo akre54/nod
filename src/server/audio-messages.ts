@@ -6,13 +6,15 @@ import type { AppDependencies } from './app.ts';
 import { pool } from './db.ts';
 import { ownerId, configuration } from './config.ts';
 import { artifactView, localArtifacts } from './artifacts.ts';
-import { lockThread, stopSignal, submitUserMessage } from './thread.ts';
+import { lockThread, messageIntakeSignal, stopSignal, submitUserMessage } from './thread.ts';
 import { transaction } from './transaction.ts';
 import { refresh } from './events.ts';
 import { SpeechSetupError } from './speech.ts';
 import type { SubmitMessageResponse } from '../shared/contracts.ts';
+import { appPages } from '../shared/app-links.ts';
 import { classifyVerificationReply, securityCodeIn } from '../shared/verification-code.ts';
 import { questionAnswerSchema } from '../shared/answer-choices.ts';
+import { messageTextLimit, messageTooLongError } from '../shared/message-limits.ts';
 
 const audioMessageOptions = { config: { rateLimit: { max: 120, timeWindow: '1 minute' } } };
 
@@ -20,7 +22,7 @@ export const messageInput = z
   .object({
     text: z
       .string()
-      .max(100_000)
+      .max(messageTextLimit)
       .transform((value) => (value.trim() ? value : ''))
       .default(''),
     displayText: z.string().max(1_000_000).optional(),
@@ -32,6 +34,7 @@ export const messageInput = z
     seenMessageId: z.uuid().optional(),
     clientMessageId: z.uuid().optional(),
     threadId: z.uuid().optional(),
+    chatClearedAt: z.iso.datetime().nullable().optional(),
     verificationRequestId: z.uuid().optional(),
   })
   .strict();
@@ -74,7 +77,7 @@ export function registerAudioMessages(app: FastifyInstance, dependencies: AppDep
       throw privateConflict('Work is stopping. Send the recording again when it finishes.');
     const arrival = stopSignal();
     const controller = new AbortController();
-    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(120_000)]);
+    let signal = AbortSignal.any([controller.signal, AbortSignal.timeout(120_000)]);
     active.set(controller, undefined);
     const abort = () => controller.abort();
     request.raw.once('aborted', abort);
@@ -126,6 +129,10 @@ export function registerAudioMessages(app: FastifyInstance, dependencies: AppDep
         )
         .parse(rawMessage);
       active.set(controller, input.threadId);
+      if (input.text.trim().toLowerCase() === '/clear')
+        throw invalid('Send /clear as a text message without a recording.');
+      const chatSignal = await messageIntakeSignal(arrival, input);
+      if (chatSignal) signal = AbortSignal.any([signal, chatSignal]);
       signal.throwIfAborted();
       const speech = dependencies.speech;
       const fingerprint = createHash('sha256')
@@ -175,15 +182,14 @@ export function registerAudioMessages(app: FastifyInstance, dependencies: AppDep
             replyTurnId: replyTarget?.turn_id,
           };
         }
-        if (!speech || !speech.transcriptionConfigured)
-          throw new SpeechSetupError(
-            'Set up audio in Settings → General → Voice. Choose free voices or connect a voice service.',
-          );
+        if (!speech || !speech.transcriptionConfigured) throw new SpeechSetupError();
         if (
           !(dependencies.configuration?.() ?? configuration()).llmReady &&
           !verificationRequests.length
         )
-          throw invalid('Connect an AI provider in Settings → Models before sending a message.');
+          throw invalid(
+            `Connect an AI provider in ${appPages['/settings/models']} before sending a message.`,
+          );
         if (
           (await client.query('SELECT 1 FROM messages WHERE id=$1', [input.clientMessageId]))
             .rowCount
@@ -206,7 +212,8 @@ export function registerAudioMessages(app: FastifyInstance, dependencies: AppDep
       signal.throwIfAborted();
       const text = [input.text, transcript].filter(Boolean).join('\n\n');
       const displayText = input.displayText;
-      if (text.length > 100_000) throw invalid('Send a shorter voice message.');
+      if (text.length > messageTextLimit)
+        throw Object.assign(invalid(messageTooLongError), { code: 'message_too_long' });
       const codeLike =
         classifyVerificationReply(text).kind !== 'ordinary' || Boolean(securityCodeIn(text));
       let verificationRequestId = input.verificationRequestId;
@@ -243,7 +250,9 @@ export function registerAudioMessages(app: FastifyInstance, dependencies: AppDep
       if (verificationRequestId)
         throw privateConflict('This verification request is no longer available.');
       if (!(dependencies.configuration?.() ?? configuration()).llmReady)
-        throw invalid('Connect an AI provider in Settings → Models before sending a message.');
+        throw invalid(
+          `Connect an AI provider in ${appPages['/settings/models']} before sending a message.`,
+        );
       signal.throwIfAborted();
       submitting = true;
       const submitted = await (dependencies.submitMessage ?? submitUserMessage)(

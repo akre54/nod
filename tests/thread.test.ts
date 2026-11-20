@@ -6,8 +6,8 @@ import {
   type AnswerChoices,
 } from '../src/shared/answer-choices.ts';
 import assert from 'node:assert/strict';
-import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -25,7 +25,14 @@ import {
   type FeedbackReceipt,
   type FeedbackSubmission,
 } from '../src/shared/feedback.ts';
-import { ModelRequestError, type RuntimeContext, type RuntimeResult } from '../src/ports/agent.ts';
+import {
+  ContextLimitError,
+  ModelRequestError,
+  OutputLimitError,
+  ToolFailureError,
+  type RuntimeContext,
+  type RuntimeResult,
+} from '../src/ports/agent.ts';
 import type { ConnectedApp } from '../src/ports/integrations.ts';
 import type { MemoryCurator } from '../src/ports/memory-curator.ts';
 import { ObjectStoreConflict, type PrivateObjectStore } from '../src/ports/object-storage.ts';
@@ -36,9 +43,11 @@ import type { ThreadDependencies } from '../src/server/thread.ts';
 import type {
   Artifact,
   Connection,
+  Message,
   SubmitMessageResponse,
   Task,
   Turn,
+  WorkspaceCommand,
 } from '../src/shared/contracts.ts';
 import { fakeComputer, fakeWorkspace } from './runtime-fixtures.ts';
 import { createMemoryLearning } from '../src/server/memory-learning.ts';
@@ -190,6 +199,48 @@ test(
       },
     );
     await thread.initializeThreads();
+    await t.test('periodic checks use an installation-spread five-minute schedule', async () => {
+      const { createWorkConsumers } = await import('../src/server/work-admission.ts');
+      const consumers = createWorkConsumers();
+      await consumers.pause();
+      await thread.boss.createQueue('heartbeat', { retryLimit: 0 });
+      await thread.boss.schedule('heartbeat', '*/5 * * * *', {}, { tz: 'UTC' });
+      try {
+        const phases = new Set<number>();
+        for (const heartbeatKey of ['a'.repeat(64), 'c'.repeat(64), undefined]) {
+          await createTriage({
+            consumers,
+            heartbeatKey,
+            signal: async () => {},
+            due: async () => {},
+          }).initializeHeartbeat();
+          const schedule = await thread.boss.getSchedule('heartbeat');
+          assert.ok(schedule);
+          assert.equal(schedule.timezone, 'UTC');
+          const phase =
+            createHash('sha256')
+              .update(heartbeatKey ?? ownerId)
+              .digest()[0] % 5;
+          phases.add(phase);
+          const next = thread.boss.previewSchedule(schedule.cron, {
+            tz: schedule.timezone,
+            from: new Date('2026-01-01T00:00:00Z'),
+            count: 13,
+          });
+          assert.equal(next.length, 13);
+          assert.ok(next.every((instant) => instant.getUTCMinutes() % 5 === phase));
+          assert.ok(
+            next.every(
+              (instant, index) =>
+                !index || instant.getTime() - next[index - 1].getTime() === 300000,
+            ),
+          );
+        }
+        assert.equal(phases.size, 3);
+      } finally {
+        await consumers.close();
+      }
+    });
     const analyticsEvents: Parameters<ProductAnalytics['capture']>[0][] = [];
     const analytics = await createAnalytics({
       provider: { capture: (event) => analyticsEvents.push(event), shutdown: async () => {} },
@@ -374,7 +425,6 @@ test(
     vault.registerRoutes(app);
     createAccountSession({
       accounts,
-      origin: `http://localhost:${port}`,
       localUser: { id: ownerId, name: 'You', email: null, avatarUrl: null },
       start: () => onboarding.complete(),
     }).register(app);
@@ -444,7 +494,7 @@ test(
 
     let limitReached = false;
     const interruptedText = 'Synthetic interrupted turn.';
-    const modelErrors = new Map<string, string>();
+    const modelErrors = new Map<string, string | ModelRequestError>();
     let beforeRuntimeFailure = async (_context: RuntimeContext) => {};
     let presentInterruption: NonNullable<ThreadDependencies['present']> = async () =>
       interruptedText;
@@ -464,6 +514,7 @@ test(
           return operation();
         }),
       executeConfirmation: async () => undefined,
+      credentialRequestStatuses: vault.requestStatuses,
       bindVerificationQuestion: verification.bindQuestion,
       connectedApps: readConnectedApps,
       spendingLimit: async () => (limitReached ? { monthlyUsd: 25 } : null),
@@ -558,6 +609,12 @@ test(
           return { status: 'succeeded' };
         }
         if (context.prompt === 'limit race fixture') throw new Error(spendingLimitReached);
+        if (context.prompt === 'unexpected failure fixture')
+          throw new Error('Synthetic runtime failure.');
+        if (context.prompt === 'output limit fixture')
+          throw new OutputLimitError('Synthetic output limit.');
+        if (context.prompt === 'tool refusal fixture')
+          throw new ToolFailureError('The bash tool failed five times. Trust refused the command.');
         if (context.prompt.startsWith('session-fixture')) {
           await sessionGates.get(context.prompt);
           return { status: 'succeeded' };
@@ -649,7 +706,8 @@ test(
           stagedReads.set(context.prompt, await readFile(context.attachments[0].path, 'utf8'));
         workspaceListings.set(context.prompt, await readdir(context.workspacePath));
         const modelError = modelErrors.get(context.prompt);
-        if (modelError) throw new ModelRequestError(modelError);
+        if (modelError)
+          throw typeof modelError === 'string' ? new ModelRequestError(modelError) : modelError;
         if (context.prompt === 'runtime-failure') {
           await beforeRuntimeFailure(context);
           throw Object.assign(new Error('Synthetic runtime failure for private-fixture'), {
@@ -659,6 +717,11 @@ test(
         if (context.prompt === 'release-retry') failRelease = 1;
         if (context.prompt === 'ask-question')
           return { status: 'waiting_user', message: 'Which account should I use?' };
+        if (context.prompt === '👍' && context.replyTo?.text === 'Which account should I use?') {
+          assert.ok(context.currentMessageId);
+          await context.reply('Synthetic reaction follow-up.', undefined, context.currentMessageId);
+          return { status: 'succeeded' };
+        }
         if (context.prompt === 'ask-approval')
           return { status: 'waiting_user', waitingFor: 'approval' };
         if (context.prompt === 'ask-credentials') {
@@ -822,6 +885,23 @@ test(
           assert.equal(text.length, 100_000);
           assert.ok(displayText.length > 700_000);
           assert.ok(Buffer.byteLength(message) > 1024 * 1024);
+          const overText = await isolated.inject({
+            method: 'POST',
+            url: '/api/messages',
+            headers: { ...headers, 'content-type': 'application/json' },
+            payload: JSON.stringify({ text: 'x'.repeat(100_001) }),
+          });
+          assert.equal(overText.statusCode, 400);
+          assert.equal(overText.json().code, 'message_too_long');
+          const overAudioText = await isolated.inject(
+            audioRequest({
+              text: 'x'.repeat(100_001),
+              clientMessageId: randomUUID(),
+              threadId: randomUUID(),
+            }),
+          );
+          assert.equal(overAudioText.statusCode, 400);
+          assert.equal(overAudioText.json().code, 'message_too_long');
           assert.equal(
             (
               await isolated.inject({
@@ -1052,6 +1132,76 @@ test(
             assert.ok(!emitted.includes(privateValue));
         },
       );
+
+      await t.test('a task command stream shows only its own owner’s commands', async (t) => {
+        const turns: string[] = [];
+        const tasksMade: string[] = [];
+        const callIds: string[] = [];
+        const commandTask = async (owner: string, status: string, command: string) => {
+          const id = randomUUID();
+          const turnId = randomUUID();
+          tasksMade.push(id);
+          turns.push(turnId);
+          await db.pool.query(
+            "INSERT INTO turns(id,owner_id,thread_id,session_id,source,prompt,status,background) VALUES($1,$2,$3,$4,'task','Synthetic command task',$5,true)",
+            [turnId, owner, threadId, id, status],
+          );
+          await db.pool.query(
+            "INSERT INTO tasks(id,owner_id,turn_id,session_id,title,done_when,now_text,applied_revision) VALUES($1,$2,$3,$1,'Synthetic command task','Synthetic result','Working',1)",
+            [id, owner, turnId],
+          );
+          await db.pool.query('UPDATE turns SET task_id=$2 WHERE id=$1', [turnId, id]);
+          const events = [
+            ['tool_start', randomUUID(), { command }],
+            ['tool_start', randomUUID(), { command: `${command} --second` }],
+          ] as const;
+          callIds.push(...events.map(([, callId]) => callId));
+          for (const [index, [type, callId, record]] of events.entries())
+            await db.pool.query(
+              "INSERT INTO turn_events(id,turn_id,type,summary,call_id,command,created_at) VALUES($1,$2,$3,'bash',$4,$5,now()+$6*interval '1 second')",
+              [randomUUID(), turnId, type, callId, record, index],
+            );
+          await db.pool.query(
+            "INSERT INTO turn_events(id,turn_id,type,summary,call_id,command) VALUES($1,$2,'tool_complete','bash',$3,$4)",
+            [randomUUID(), turnId, events[0][1], { exitCode: 2, output: 'synthetic output' }],
+          );
+          return id;
+        };
+        t.after(async () => {
+          await db.pool.query('UPDATE turns SET task_id=NULL WHERE id=ANY($1::uuid[])', [turns]);
+          await db.pool.query('DELETE FROM turn_events WHERE turn_id=ANY($1::uuid[])', [turns]);
+          await db.pool.query('DELETE FROM tasks WHERE id=ANY($1::uuid[])', [tasksMade]);
+          await db.pool.query('DELETE FROM turns WHERE id=ANY($1::uuid[])', [turns]);
+        });
+        const own = await commandTask(ownerId, 'running', 'ls synthetic-own');
+        const ended = await commandTask(ownerId, 'cancelled', 'ls synthetic-ended');
+        const foreign = await commandTask('synthetic-other-command-owner', 'running', 'cat x');
+        const read = async (id: string) => {
+          const response = await request('GET', `/api/tasks/${id}/commands`);
+          return { status: response.statusCode, body: response.json() };
+        };
+        const mine = await read(own);
+        assert.equal(mine.status, 200);
+        assert.deepEqual(
+          mine.body.commands.map((command: WorkspaceCommand) => [
+            command.command,
+            command.state,
+            command.exitCode,
+            command.output,
+          ]),
+          [
+            ['ls synthetic-own', 'finished', 2, 'synthetic output'],
+            ['ls synthetic-own --second', 'running', null, ''],
+          ],
+        );
+        const stopped = await read(ended);
+        assert.equal(stopped.body.commands[1].state, 'interrupted');
+        for (const executionId of [...callIds, ...turns])
+          assert.equal(JSON.stringify([mine.body, stopped.body]).includes(executionId), false);
+        const other = await read(foreign);
+        assert.equal(other.status, 404);
+        assert.equal(JSON.stringify(other.body).includes('cat x'), false);
+      });
 
       await t.test('first-card tasks stay in the ledger after 100 newer tasks', async (t) => {
         const owner = `first-card-ledger-${randomUUID()}`;
@@ -1569,7 +1719,7 @@ test(
             assert.equal((await preferences.get()).proactivePaused, true);
             assert.equal((await foreign.get()).speechVoice, null);
             assert.equal((await foreign.get()).speechReply, 'auto');
-            assert.equal((await foreign.get()).proactivePaused, false);
+            assert.equal((await foreign.get()).proactivePaused, true);
             assert.equal((await foreign.update({ quietHoursEnabled: false })).speechReply, 'auto');
             await preferences.update({ speechReply: 'auto' });
             assert.equal((await preferences.get()).speechReply, 'auto');
@@ -1592,7 +1742,7 @@ test(
             assert.equal((await preferences.get()).proactivePaused, true);
             assert.equal((await foreign.get()).speechVoice, null);
             assert.equal((await foreign.get()).speechReply, 'auto');
-            assert.equal((await foreign.get()).proactivePaused, false);
+            assert.equal((await foreign.get()).proactivePaused, true);
           } finally {
             await preferences.update(original);
           }
@@ -2015,6 +2165,179 @@ test(
         assert.equal((await sendJson({ text: ` ${'x'.repeat(100_000)}` })).statusCode, 400);
       });
 
+      await t.test(
+        'a task start reuses an acknowledgement in the same owner request',
+        async (t) => {
+          const previousObserver = inspectObserver;
+          const startMessage = 'I will review the synthetic inbox and flag urgent messages.';
+          const resultText = 'Three synthetic messages need review. Two reply drafts are saved.';
+          const cases = [
+            {
+              prompt: 'Review the synthetic inbox and flag urgent messages.',
+              prior: 'On it. I will review the synthetic inbox.',
+              start: startMessage,
+              expected: ['On it. I will review the synthetic inbox.'],
+              anchor: 0,
+            },
+            {
+              prompt: 'Review the synthetic inbox after checking the invoice.',
+              prior: 'On it. I will review the synthetic inbox.',
+              between: 'The invoice is due Friday for €450.',
+              start: startMessage,
+              expected: [
+                'On it. I will review the synthetic inbox.',
+                'The invoice is due Friday for €450.',
+              ],
+              anchor: 0,
+            },
+            {
+              prompt: 'Review the synthetic Gmail inbox and save reply drafts.',
+              prior:
+                "On it! I'll go through your Gmail, pull out anything urgent, and save reply drafts for the emails that need an answer. Nothing gets sent without your OK.",
+              start:
+                "I've started on your inbox, Synthetic account 1. I'll sort your Gmail into groups, point out anything urgent and why, and save draft replies for people who need an answer.",
+              expected: [
+                "On it! I'll go through your Gmail, pull out anything urgent, and save reply drafts for the emails that need an answer. Nothing gets sent without your OK.",
+              ],
+              anchor: 0,
+            },
+            {
+              prompt: 'Prepare synthetic email reply drafts and wait for approval.',
+              prior:
+                "On it. I'll draft email replies. No email replies will be sent without your approval.",
+              start:
+                "I've started drafting email replies. No email replies will be sent without your approval.",
+              expected: [
+                "On it. I'll draft email replies. No email replies will be sent without your approval.",
+              ],
+              anchor: 0,
+            },
+            {
+              prompt: 'Revisa el buzón sintético y prepara borradores.',
+              prior:
+                'Ya estoy revisando tu buzón y preparando borradores de respuesta. No enviaré nada sin tu aprobación.',
+              handoff: true,
+              start:
+                'Ya he empezado a revisar tu buzón y preparar borradores de respuesta. No enviaré nada sin tu aprobación.',
+              expected: [
+                'Ya estoy revisando tu buzón y preparando borradores de respuesta. No enviaré nada sin tu aprobación.',
+              ],
+              anchor: 0,
+            },
+            {
+              prompt: 'Review the synthetic inbox after confirming the deadline.',
+              prior:
+                'I found 3 urgent synthetic inbox messages. The invoice is due Friday for €450.',
+              start: startMessage,
+              expected: [
+                'I found 3 urgent synthetic inbox messages. The invoice is due Friday for €450.',
+                startMessage,
+              ],
+              anchor: 1,
+            },
+            {
+              prompt: 'Review the synthetic inbox after checking the messages.',
+              prior: 'I found urgent synthetic inbox messages and flagged them.',
+              start: startMessage,
+              expected: ['I found urgent synthetic inbox messages and flagged them.', startMessage],
+              anchor: 1,
+            },
+            {
+              prompt: 'Check the synthetic invoice due Friday.',
+              prior: 'No, the synthetic invoice is due Friday.',
+              start: 'Check the synthetic invoice due Friday.',
+              expected: [
+                'No, the synthetic invoice is due Friday.',
+                'Check the synthetic invoice due Friday.',
+              ],
+              anchor: 1,
+            },
+            {
+              prompt: 'Review whether the synthetic invoice can be approved.',
+              prior: 'I will not approve the synthetic invoice.',
+              start: 'I will approve the synthetic invoice.',
+              expected: [
+                'I will not approve the synthetic invoice.',
+                'I will approve the synthetic invoice.',
+              ],
+              anchor: 1,
+            },
+          ] as const;
+          const started = new Map<string, Task>();
+          inspectObserver = async (context) => {
+            const scenario = cases.find(({ prompt }) => prompt === context.prompt);
+            if (!scenario) return;
+            if (context.taskContext) {
+              await context.reply(resultText);
+              await context.task!({
+                action: 'finish',
+                id: context.taskContext.id,
+                status: 'done',
+                result: resultText,
+              });
+              return { status: 'succeeded' };
+            }
+            await context.reply(
+              scenario.prior,
+              undefined,
+              undefined,
+              undefined,
+              'handoff' in scenario && scenario.handoff,
+            );
+            if ('between' in scenario) await context.reply(scenario.between);
+            started.set(
+              context.prompt,
+              (await context.task!({
+                action: 'start',
+                title: 'Review synthetic inbox',
+                message: scenario.start,
+                doneWhen: 'Urgent messages are flagged and reply drafts saved',
+                now: 'Reading synthetic messages',
+              })) as Task,
+            );
+            return { status: 'succeeded' };
+          };
+          t.after(() => {
+            inspectObserver = previousObserver;
+          });
+          for (const scenario of cases) {
+            const request = await userMessages.submit(scenario.prompt);
+            await waitFor(settled(request.turnId));
+            const task = started.get(scenario.prompt);
+            assert.ok(task);
+            const replies = (
+              await db.pool.query<{ id: string; text: string }>(
+                "SELECT id,text FROM messages WHERE owner_id=$1 AND turn_id=$2 AND role='assistant' AND hidden_at IS NULL ORDER BY created_at,id",
+                [ownerId, request.turnId],
+              )
+            ).rows;
+            assert.deepEqual(
+              replies.map(({ text }) => text),
+              scenario.expected,
+            );
+            assert.equal(task.messageId, replies[scenario.anchor]!.id);
+            const taskTurn = (
+              await db.pool.query<{ id: string }>(
+                "SELECT id FROM turns WHERE owner_id=$1 AND session_id=$2 AND source='task'",
+                [ownerId, task.id],
+              )
+            ).rows[0]!.id;
+            await waitFor(settled(taskTurn));
+            const taskReplies = (
+              await db.pool.query<{ text: string }>(
+                "SELECT text FROM messages WHERE owner_id=$1 AND turn_id=$2 AND role='assistant' AND hidden_at IS NULL",
+                [ownerId, taskTurn],
+              )
+            ).rows;
+            assert.deepEqual(
+              taskReplies.map(({ text }) => text),
+              [resultText],
+            );
+            assert.equal((await tasks.read()).find(({ id }) => id === task.id)?.status, 'done');
+          }
+        },
+      );
+
       await t.test('a task resumes its own session when its next check is due', async (t) => {
         const previousObserver = inspectObserver;
         const prompt = 'Track a synthetic reply after connecting its source.';
@@ -2289,6 +2612,113 @@ test(
         }
       });
 
+      await t.test('task checks exclude withdrawn requests from model input', async (t) => {
+        await waitFor(settledThread);
+        const previousChecks = dependencies.taskChecks;
+        dependencies.taskChecks = undefined;
+        t.after(() => {
+          dependencies.taskChecks = previousChecks;
+        });
+        for (const [status, withdrawn, copied] of [
+          ['succeeded', false, false],
+          ['cancelled', false, false],
+          ['cancelled', true, false],
+          ['failed', true, false],
+          ['succeeded', false, true],
+        ] as const) {
+          await t.test(`${status}, withdrawn=${withdrawn}, copied=${copied}`, async () => {
+            const id = randomUUID();
+            const turnId = randomUUID();
+            const messageId = randomUUID();
+            const prompt = `Synthetic task request ${id}`;
+            await db.pool.query(
+              `INSERT INTO turns(id,owner_id,thread_id,session_id,source,prompt,status,background,started_at,finished_at,withdrawn,message_id)
+               VALUES($1,$2,$3,$4,'user',$5,$6,true,now(),now(),$7,$8)`,
+              [turnId, ownerId, threadId, id, prompt, status, withdrawn, messageId],
+            );
+            await db.pool.query(
+              "INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text) VALUES($1,$2,$3,$4,'user',$5)",
+              [messageId, ownerId, threadId, turnId, prompt],
+            );
+            if (copied) {
+              const original = randomUUID();
+              await db.pool.query(
+                `INSERT INTO turns(id,owner_id,thread_id,session_id,source,prompt,status,background,started_at,finished_at,withdrawn)
+                 VALUES($1,$2,$3,$4,'user',$5,'failed',true,now()-interval '1 minute',now()-interval '1 minute',true)`,
+                [original, ownerId, threadId, id, prompt],
+              );
+              await db.pool.query(
+                "UPDATE turns SET source='resume',parent_turn_id=$2,prompt=$3,message_id=NULL WHERE id=$1",
+                [turnId, original, `Synthetic old check\nThe request was: ${prompt}`],
+              );
+              await db.pool.query('UPDATE messages SET turn_id=$2 WHERE id=$1', [
+                messageId,
+                original,
+              ]);
+            }
+            await db.pool.query(
+              `INSERT INTO tasks(id,owner_id,turn_id,session_id,title,done_when,now_text,next_check)
+               VALUES($1,$2,$3,$1,'Synthetic tracked work','Synthetic reply arrived','Waiting',date_trunc('milliseconds',now())-interval '1 minute')`,
+              [id, ownerId, turnId],
+            );
+            t.after(async () => {
+              await request('POST', `/api/tasks/${id}/stop`);
+              await db.pool.query('UPDATE turns SET task_id=NULL WHERE session_id=$1', [id]);
+              await db.pool.query('DELETE FROM tasks WHERE id=$1', [id]);
+            });
+            await Promise.all([tasks.resumeDue(threadId), tasks.resumeDue(threadId)]);
+            const checks = (
+              await db.pool.query<{ id: string; prompt: string; parent_turn_id: string }>(
+                "SELECT id,prompt,parent_turn_id FROM turns WHERE session_id=$1 AND source_id LIKE 'task-check:%'",
+                [id],
+              )
+            ).rows;
+            assert.equal(checks.length, 1);
+            const check = checks[0]!;
+            assert.equal(check.parent_turn_id, turnId);
+            assert.equal(check.prompt.includes(prompt), !withdrawn && !copied);
+            await waitFor(settled(check.id));
+            const context = ran(check.id)!;
+            assert.equal(context.sessionId, id);
+            assert.equal(context.prompt.includes(prompt), !withdrawn && !copied);
+            assert.equal(
+              context.history.some(({ text }) => text === prompt),
+              !withdrawn && !copied,
+            );
+            if (withdrawn)
+              assert.equal(context.withdrawnRequest, status === 'failed' ? 'failed' : 'stopped');
+            const saved = (
+              await db.pool.query('SELECT next_check,state FROM tasks WHERE id=$1', [id])
+            ).rows[0];
+            assert.equal(saved.next_check, null);
+            assert.equal(saved.state, 'open');
+            const detail = await request('GET', '/api/tasks');
+            assert.equal(detail.statusCode, 200);
+            assert.equal(JSON.stringify(detail.json()).includes(prompt), false);
+            if (copied) {
+              const renewed = randomUUID();
+              const renewedPrompt = 'Synthetic new owner request';
+              await db.pool.query(
+                `INSERT INTO turns(id,owner_id,thread_id,session_id,parent_turn_id,source,prompt,status,background,started_at,finished_at)
+                 VALUES($1,$2,$3,$4,$5,'user',$6,'succeeded',true,now(),now())`,
+                [renewed, ownerId, threadId, id, check.id, renewedPrompt],
+              );
+              await thread.resumeTurn(renewed, `synthetic-renewed:${id}`, 'Synthetic new check');
+              const next = (
+                await db.pool.query<{ id: string; prompt: string }>(
+                  'SELECT id,prompt FROM turns WHERE source_id=$1',
+                  [`synthetic-renewed:${id}`],
+                )
+              ).rows[0]!;
+              assert.equal(next.prompt.includes(renewedPrompt), true);
+              assert.equal(next.prompt.includes(prompt), false);
+              await waitFor(settled(next.id));
+              assert.equal(ran(next.id)!.prompt.includes(renewedPrompt), true);
+            }
+          });
+        }
+      });
+
       await t.test('a failed task check enqueue keeps its planned time', async (t) => {
         await waitFor(settledThread);
         const previousChecks = dependencies.taskChecks;
@@ -2420,6 +2850,82 @@ test(
       });
 
       await t.test(
+        'a failed usage check leaves queued input separate from a completed response',
+        async () => {
+          const prompt = `usage-intake-${randomUUID()}`;
+          const originalRun = dependencies.runTurn;
+          const originalLimit = dependencies.spendingLimit;
+          let unavailable = false;
+          block(prompt);
+          dependencies.spendingLimit = async () => {
+            if (unavailable) throw new Error('Synthetic usage persistence unavailable.');
+            return (await originalLimit?.()) ?? null;
+          };
+          dependencies.runTurn = async (context) => {
+            if (context.prompt !== prompt) return originalRun(context);
+            runs.push(context);
+            await waiting.get(prompt);
+            unavailable = true;
+            try {
+              assert.deepEqual(await context.takeMessages!(), []);
+            } finally {
+              unavailable = false;
+            }
+            await context.reply('The first synthetic result is complete.');
+            return { status: 'succeeded' };
+          };
+          try {
+            const first = await thread.submitUserMessage(prompt);
+            await waitFor(() => Boolean(ran(first.turnId)));
+            const queued = await thread.submitUserMessage('Keep this synthetic request separate.');
+            assert.equal(await turnStatus(queued.turnId), 'queued');
+            release(prompt);
+            await waitFor(settled(first.turnId));
+            await waitFor(settled(queued.turnId));
+            assert.equal(await turnStatus(first.turnId), 'succeeded');
+            assert.equal(await turnStatus(queued.turnId), 'succeeded');
+            assert.ok(ran(queued.turnId));
+            assert.equal(
+              (await db.pool.query('SELECT turn_id FROM messages WHERE id=$1', [queued.messageId]))
+                .rows[0].turn_id,
+              queued.turnId,
+            );
+            assert.equal(
+              (
+                await db.pool.query(
+                  "SELECT count(*)::int AS count FROM messages WHERE turn_id=$1 AND text='The first synthetic result is complete.'",
+                  [first.turnId],
+                )
+              ).rows[0].count,
+              1,
+            );
+          } finally {
+            unavailable = false;
+            release(prompt);
+            dependencies.runTurn = originalRun;
+            dependencies.spendingLimit = originalLimit;
+          }
+        },
+      );
+
+      await t.test('a scheduled turn continues when cache policy lookup fails', async (t) => {
+        const previous = dependencies.scheduleCache;
+        dependencies.scheduleCache = async () => {
+          throw new Error('Synthetic cache policy lookup failure');
+        };
+        t.after(() => {
+          dependencies.scheduleCache = previous;
+        });
+        const turnId = await thread.enqueueTurn('schedule cache lookup failure fixture', {
+          source: 'schedule',
+          sourceId: randomUUID(),
+        });
+        await waitFor(settled(turnId));
+        assert.equal(await turnStatus(turnId), 'succeeded');
+        assert.equal(ran(turnId)?.scheduleCache, undefined);
+      });
+
+      await t.test(
         'separate queued questions each receive an answer while work continues',
         async () => {
           const prompt = `steer-questions-${randomUUID()}`;
@@ -2487,6 +2993,7 @@ test(
             id: string,
             work_type: string,
             owner_requested: boolean,
+            result: string,
             outcome = 'succeeded',
           ) => {
             await waitFor(settled(id));
@@ -2514,28 +3021,29 @@ test(
               assert.equal(JSON.stringify(event).includes(id), false);
             }
             assert.equal(ends[0]!.properties.outcome, outcome);
+            assert.equal(ends[0]!.properties.result, result);
             assert.ok(Number(ends[0]!.properties.duration_ms) >= 0);
           };
           const requested = await thread.submitUserMessage('Synthetic analytics request');
-          await completed(requested.turnId, 'immediate', true);
+          await completed(requested.turnId, 'immediate', true, 'reply');
           const schedule = await thread.enqueueTurn('Synthetic analytics schedule', {
             source: 'schedule',
           });
-          await completed(schedule, 'scheduled', false);
+          await completed(schedule, 'scheduled', false, 'reply');
           const resumed = await thread.enqueueTurn('Synthetic analytics continuation', {
             source: 'resume',
             sessionId: schedule,
             parentTurnId: schedule,
             background: true,
           });
-          await completed(resumed, 'scheduled', false);
+          await completed(resumed, 'scheduled', false, 'reply');
           const task = await thread.enqueueTurn('Synthetic analytics delegated task', {
             source: 'task',
             parentTurnId: schedule,
           });
-          await completed(task, 'background', false);
+          await completed(task, 'background', false, 'reply');
           const question = await thread.enqueueTurn('ask-question', { source: 'schedule' });
-          await completed(question, 'scheduled', false, 'waiting_user');
+          await completed(question, 'scheduled', false, 'needs_owner', 'waiting_user');
           const message = (
             await db.pool.query(
               "SELECT id FROM messages WHERE turn_id=$1 AND role='assistant' ORDER BY created_at DESC LIMIT 1",
@@ -2545,14 +3053,88 @@ test(
           const answer = await thread.submitUserMessage('Synthetic analytics answer', [], {
             replyToMessageId: message.id,
           });
-          await completed(answer.turnId, 'scheduled', true);
+          await completed(answer.turnId, 'scheduled', true, 'reply');
           const ownerResume = await thread.enqueueTurn('Synthetic analytics answer continuation', {
             source: 'resume',
             sessionId: question,
             parentTurnId: answer.turnId,
             background: true,
           });
-          await completed(ownerResume, 'scheduled', true);
+          await completed(ownerResume, 'scheduled', true, 'reply');
+          const signedIn = await thread.enqueueTurn('Synthetic analytics sign-in continuation', {
+            source: 'resume',
+            sourceId: `credentials:${schedule}`,
+            sessionId: schedule,
+            parentTurnId: schedule,
+            background: true,
+          });
+          await completed(signedIn, 'scheduled', false, 'reply');
+          const taskCheck = await thread.enqueueTurn('Synthetic analytics planned check', {
+            source: 'resume',
+            sourceId: `task-check:${randomUUID()}:1`,
+            sessionId: schedule,
+            parentTurnId: schedule,
+            background: true,
+          });
+          await completed(taskCheck, 'scheduled', false, 'reply');
+          assert.deepEqual(
+            [requested.turnId, schedule, task, answer.turnId, signedIn, taskCheck].map(
+              (id) => ran(id)?.automatic,
+            ),
+            [false, true, true, false, false, true],
+          );
+          const inspect = inspectObserver;
+          try {
+            inspectObserver = async (context) => {
+              if (context.prompt === 'Synthetic analytics file reply')
+                await context.publishBrowserFile!({
+                  bytes: Buffer.from('Synthetic file content'),
+                  name: 'result.txt',
+                  mimeType: 'text/plain',
+                });
+              if (context.prompt === 'Synthetic analytics audio reply')
+                await context.createAudio!('Synthetic spoken result');
+              return { status: 'succeeded' };
+            };
+            const quiet = await thread.enqueueTurn('Synthetic quiet analytics check', {
+              source: 'event',
+              background: true,
+            });
+            await completed(quiet, 'background', false, 'no_reply');
+            for (const kind of ['file', 'audio']) {
+              const delivered = await thread.submitUserMessage(`Synthetic analytics ${kind} reply`);
+              await completed(delivered.turnId, 'immediate', true, 'reply');
+            }
+            let started!: () => void;
+            const active = new Promise<void>((resolve) => {
+              started = resolve;
+            });
+            inspectObserver = async (context) => {
+              started();
+              await new Promise<void>((resolve) =>
+                context.signal.addEventListener('abort', () => resolve(), { once: true }),
+              );
+              return { status: 'succeeded' };
+            };
+            const stopped = await thread.submitUserMessage('Synthetic cancelled analytics request');
+            await active;
+            await thread.stopThread();
+            await completed(stopped.turnId, 'immediate', true, 'cancelled', 'cancelled');
+          } finally {
+            inspectObserver = inspect;
+          }
+          const failedPrompt = 'Synthetic failed analytics request';
+          modelErrors.set(failedPrompt, 'SYNTHETIC_RAW_MODEL_ERROR_NOD1023');
+          try {
+            const failed = await thread.submitUserMessage(failedPrompt);
+            await completed(failed.turnId, 'immediate', true, 'failed', 'failed');
+            assert.doesNotMatch(
+              JSON.stringify(analyticsEvents),
+              /SYNTHETIC_RAW_MODEL_ERROR_NOD1023/,
+            );
+          } finally {
+            modelErrors.delete(failedPrompt);
+          }
           const previousObserver = inspectObserver;
           const previousConfirmation = dependencies.executeConfirmation;
           let confirmedActions = 0;
@@ -2603,7 +3185,7 @@ test(
             }
           };
           const start = await thread.submitUserMessage('Synthetic owner task creation');
-          await completed(start.turnId, 'immediate', true);
+          await completed(start.turnId, 'immediate', true, 'no_reply');
           const taskTurn = async (messageId: string) =>
             (
               await db.pool.query<{ id: string }>(
@@ -2612,23 +3194,23 @@ test(
               )
             ).rows[0]!.id;
           const created = await taskTurn(start.messageId);
-          await completed(created, 'background', true);
+          await completed(created, 'background', true, 'reply');
           const input = await thread.submitUserMessage('Synthetic owner task update');
-          await completed(input.turnId, 'immediate', true);
+          await completed(input.turnId, 'immediate', true, 'no_reply');
           const delivered = await taskTurn(input.messageId);
-          await completed(delivered, 'background', true);
+          await completed(delivered, 'background', true, 'reply');
           const continued = await thread.enqueueTurn('Synthetic task continuation', {
             source: 'resume',
             sessionId: taskId,
             parentTurnId: delivered,
             background: true,
           });
-          await completed(continued, 'background', true);
+          await completed(continued, 'background', true, 'reply');
           const waitingApproval = await thread.enqueueTurn('Synthetic analytics approval', {
             source: 'event',
             background: true,
           });
-          await completed(waitingApproval, 'background', false, 'waiting_user');
+          await completed(waitingApproval, 'background', false, 'needs_owner', 'waiting_user');
           const confirmation = (
             await db.pool.query<{ confirmation_message_id: string }>(
               'SELECT confirmation_message_id FROM approvals WHERE turn_id=$1',
@@ -2645,7 +3227,7 @@ test(
             [],
             confirmationInput,
           );
-          await completed(confirmed.turnId, 'background', true);
+          await completed(confirmed.turnId, 'background', true, 'reply');
           assert.equal(confirmedActions, 1);
           assert.deepEqual(
             (
@@ -2794,6 +3376,85 @@ test(
           }
         },
       );
+
+      await t.test('an unexpected turn failure offers a bug report', async () => {
+        const failed = await thread.submitUserMessage('unexpected failure fixture');
+        await waitFor(settled(failed.turnId));
+        const shown = async () =>
+          (
+            await db.pool.query(
+              "SELECT presentation FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
+              [failed.turnId, `failure:${failed.turnId}`],
+            )
+          ).rows.map((row) => row.presentation);
+        await waitFor(async () => (await shown()).length === 1);
+        const card = (await shown())[0];
+        assert.equal(card.type, 'bug-report');
+        const draft = (
+          await db.pool.query('SELECT owner_id,summary FROM feedback_drafts WHERE id=$1', [
+            card.draftId,
+          ])
+        ).rows[0];
+        assert.equal(draft.owner_id, ownerId);
+        assert.equal(draft.summary, card.summary);
+        assert.doesNotMatch(draft.summary, /Synthetic runtime failure/);
+      });
+
+      await t.test('a reply cut off at its output limit offers no bug report', async () => {
+        const failed = await thread.submitUserMessage('output limit fixture');
+        await waitFor(settled(failed.turnId));
+        const shown = async () =>
+          (
+            await db.pool.query(
+              "SELECT presentation FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
+              [failed.turnId, `failure:${failed.turnId}`],
+            )
+          ).rows.map((row) => row.presentation);
+        await waitFor(async () => (await shown()).length === 1);
+        assert.equal((await shown())[0]?.type, undefined);
+        const turn = (
+          await db.pool.query('SELECT status,error,withdrawn FROM turns WHERE id=$1', [
+            failed.turnId,
+          ])
+        ).rows[0];
+        assert.deepEqual(turn, {
+          status: 'failed',
+          error: 'Synthetic output limit.',
+          withdrawn: false,
+        });
+      });
+
+      await t.test('an exhausted tool refusal reports the cause without a bug report', async () => {
+        const drafts = (await db.pool.query('SELECT count(*) FROM feedback_drafts')).rows[0].count;
+        const failed = await thread.submitUserMessage('tool refusal fixture');
+        await waitFor(settled(failed.turnId));
+        await waitFor(
+          async () =>
+            (
+              await db.pool.query(
+                "SELECT 1 FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
+                [failed.turnId, `failure:${failed.turnId}`],
+              )
+            ).rowCount === 1,
+        );
+        const shown = (
+          await db.pool.query(
+            "SELECT text,presentation FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
+            [failed.turnId, `failure:${failed.turnId}`],
+          )
+        ).rows;
+        assert.equal(shown.length, 1);
+        assert.match(
+          (await db.pool.query('SELECT error FROM turns WHERE id=$1', [failed.turnId])).rows[0]
+            .error,
+          /Trust refused the command/,
+        );
+        assert.equal(shown[0].presentation, null);
+        assert.equal(
+          (await db.pool.query('SELECT count(*) FROM feedback_drafts')).rows[0].count,
+          drafts,
+        );
+      });
 
       await t.test('a reached spending limit pauses all but owner messages', async (t) => {
         const raced = await thread.submitUserMessage('limit race fixture');
@@ -2984,6 +3645,21 @@ test(
           );
         },
       );
+
+      await t.test('voice transcript overflow rejects without saving a message', async () => {
+        const clientMessageId = randomUUID();
+        const response = await sendAudio({
+          threadId,
+          clientMessageId,
+          text: 'x'.repeat(99_990),
+        });
+        assert.equal(response.statusCode, 400, response.body);
+        assert.equal(response.json().code, 'message_too_long');
+        assert.equal(
+          (await db.pool.query('SELECT 1 FROM messages WHERE id=$1', [clientMessageId])).rowCount,
+          0,
+        );
+      });
 
       await t.test(
         'native audio reads only attached recordings in the active owned turn',
@@ -4020,6 +4696,48 @@ test(
         assert.equal(ran(response[0]!.turn_id)?.prompt, '👍');
         assert.equal(ran(response[0]!.turn_id)?.replyTo?.id, asked);
         assert.equal(ran(response[0]!.turn_id)?.replyTo?.text, 'Which account should I use?');
+        const followUp = (
+          await db.pool.query<{ id: string; reply_to_message_id: string }>(
+            "SELECT id,reply_to_message_id FROM messages WHERE owner_id=$1 AND turn_id=$2 AND role='assistant' ORDER BY created_at DESC,id DESC LIMIT 1",
+            [ownerId, response[0]!.turn_id],
+          )
+        ).rows[0]!;
+        assert.equal(followUp.reply_to_message_id, response[0]!.id);
+        const state = (await request('GET', '/api/state')).json();
+        assert.equal(
+          state.messages.some((message: { id: string }) => message.id === response[0]!.id),
+          false,
+        );
+        assert.equal(
+          state.messages.find((message: { id: string }) => message.id === asked)?.reaction,
+          '👍',
+        );
+        assert.equal(
+          state.messages.find((message: { id: string }) => message.id === followUp.id)?.replyTo,
+          null,
+        );
+        const history = (
+          await request('GET', `/api/messages?threadId=${question.threadId}`)
+        ).json();
+        assert.equal(
+          history.messages.some((message: { id: string }) => message.id === response[0]!.id),
+          false,
+        );
+        assert.equal(
+          history.messages.find((message: { id: string }) => message.id === followUp.id)?.replyTo,
+          null,
+        );
+        const search = (
+          await request('GET', `/api/messages/search?q=${encodeURIComponent('👍')}`)
+        ).json();
+        assert.equal(
+          search.some((message: { id: string }) => message.id === response[0]!.id),
+          false,
+        );
+        assert.equal(
+          (await request('GET', `/api/messages/around/${response[0]!.id}`)).statusCode,
+          404,
+        );
         assert.equal(
           analyticsEvents.filter((event) => event.event === 'owner_message_accepted').length,
           beforeAccepted + 1,
@@ -5079,6 +5797,25 @@ test(
           );
           await thread.stopThread();
           await waitFor(settledThread);
+          await onboarding.complete('Alex');
+          assert.equal(onboarding.planning(), undefined);
+          assert.equal(
+            (
+              await db.pool.query(
+                'SELECT 1 FROM onboarding_suggestions WHERE greeted_at IS NOT NULL',
+              )
+            ).rowCount,
+            0,
+          );
+          assert.equal(
+            (
+              await db.pool.query(
+                'SELECT 1 FROM messages WHERE owner_id=$1 AND turn_id IS NULL AND role=$2',
+                [ownerId, 'assistant'],
+              )
+            ).rowCount,
+            0,
+          );
           t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-24T12:00:00Z') });
           currentApps = [
             {
@@ -5633,6 +6370,12 @@ test(
           await failing.complete('Sam');
           await failing.delivered();
           assert.deepEqual(await ownerCards(ownerId), before);
+          assert.deepEqual(
+            (await ownerCards('synthetic-other-owner'))[0].suggestions.tasks.map(
+              (task: { origin?: string }) => task.origin,
+            ),
+            ['fixed', 'fixed', 'fixed', 'common', 'common'],
+          );
           const firstGreeting = (
             await db.pool.query(
               'SELECT greeting_message_id FROM onboarding_suggestions WHERE owner_id=$1',
@@ -5790,6 +6533,786 @@ test(
             ],
           );
           planAnswer = () => null;
+        },
+      );
+
+      await t.test(
+        'a successful reply clears an earlier context failure without a restart',
+        async () => {
+          await waitFor(settledThread);
+          const question = await thread.submitUserMessage('ask-question');
+          await waitFor(settled(question.turnId));
+          const prompt = 'Synthetic context failure before a successful answer';
+          modelErrors.set(prompt, new ContextLimitError('Synthetic context window exceeded.'));
+          try {
+            const failed = await thread.submitUserMessage(prompt);
+            await waitFor(settled(failed.turnId));
+            const state = (await request('GET', '/api/state')).json();
+            assert.deepEqual(state.chatRecovery, { turnId: failed.turnId });
+            const asked = state.messages.find(
+              (message: { role: string; turnId: string }) =>
+                message.role === 'assistant' && message.turnId === question.turnId,
+            );
+            assert.ok(asked);
+            const answer = await thread.submitUserMessage('Synthetic successful answer', [], {
+              replyToMessageId: asked.id,
+            });
+            await waitFor(settled(answer.turnId));
+            assert.equal(await turnStatus(answer.turnId), 'succeeded');
+            assert.equal((await request('GET', '/api/state')).json().chatRecovery, undefined);
+            assert.equal(
+              (
+                await request('POST', '/api/conversation/restart-context', {
+                  threadId: failed.threadId,
+                  turnId: failed.turnId,
+                })
+              ).statusCode,
+              409,
+            );
+          } finally {
+            modelErrors.delete(prompt);
+          }
+        },
+      );
+
+      await t.test(
+        'clear keeps admitted task and schedule instructions while stopping chat',
+        async () => {
+          const { captureOwnerInstructions, validateOwnerInstructions } =
+            await import('../src/server/owner-instructions.ts');
+          const { turnOrigin } = await import('../src/server/approvals.ts');
+          const restriction = 'Do not publish synthetic project data.';
+          const earlier = await thread.submitUserMessage(restriction);
+          await waitFor(settled(earlier.turnId));
+          const prompt =
+            'Monitor the synthetic project for seven days and send its daily synthetic report.';
+          let task: Task | undefined;
+          let schedule: { id: string } | undefined;
+          let child: RuntimeContext | undefined;
+          let releaseMain!: () => void;
+          let releaseChild!: () => void;
+          const mainHeld = new Promise<void>((resolve) => {
+            releaseMain = resolve;
+          });
+          const childHeld = new Promise<void>((resolve) => {
+            releaseChild = resolve;
+          });
+          inspectObserver = async (context) => {
+            if (context.taskContext?.title === 'Synthetic seven-day monitor') {
+              child = context;
+              await childHeld;
+              return { status: 'succeeded' };
+            }
+            if (context.prompt === prompt) {
+              task = (await context.task!({
+                action: 'start',
+                title: 'Synthetic seven-day monitor',
+                message: 'The synthetic monitor is saved.',
+                doneWhen: 'Seven synthetic daily reports are saved.',
+                now: 'Check the synthetic project.',
+              })) as Task;
+              await mainHeld;
+              throw new ModelRequestError('Synthetic late creator failure.');
+            }
+          };
+          const creator = await thread.submitUserMessage(prompt);
+          try {
+            await waitFor(() => Boolean(task) && Boolean(child));
+            const origin = await turnOrigin(child!.turnId);
+            assert.ok(origin);
+            const capture = () =>
+              captureOwnerInstructions(
+                db.pool,
+                ownerId,
+                creator.threadId,
+                origin.messageIds,
+                task!.id,
+                new Date(0),
+                child!.turnId,
+              );
+            const before = await capture();
+            assert.ok(before?.authorizingIds.includes(creator.messageId));
+            const priorLimit = before?.words.userMessages?.find(
+              (message) => message.text === restriction,
+            );
+            assert.ok(priorLimit);
+            assert.equal(priorLimit.canAuthorize, false);
+            const args = {
+              title: 'Synthetic saved monitor',
+              prompt: 'Read the synthetic project report daily.',
+              kind: 'recurring',
+              cron: '0 9 * * *',
+              timeZone: 'UTC',
+            };
+            const chatEvidence = await captureOwnerInstructions(
+              db.pool,
+              ownerId,
+              creator.threadId,
+              [creator.messageId],
+              null,
+              new Date(0),
+              creator.turnId,
+            );
+            const prepared = await personal.prepareScheduleChange('schedule_create', args);
+            schedule = (await personal.manage('schedule_create', args, {
+              turnId: creator.turnId,
+              sourceMessageId: creator.messageId,
+              instructionChange: { ...prepared, evidence: chatEvidence!.evidence },
+            })) as { id: string };
+            const savedEvidence = (
+              await db.pool.query('SELECT authority FROM schedules WHERE id=$1', [schedule.id])
+            ).rows[0].authority;
+            await validateOwnerInstructions(db.pool, ownerId, savedEvidence);
+            const response = await request('POST', '/api/messages', {
+              threadId: creator.threadId,
+              text: '/clear',
+              clientMessageId: randomUUID(),
+            });
+            assert.equal(response.statusCode, 200, response.body);
+            await waitFor(async () => (await turnStatus(creator.turnId)) === 'cancelled');
+            assert.equal(child!.signal.aborted, false);
+            const record = (
+              await db.pool.query('SELECT state,source_message_id FROM tasks WHERE id=$1', [
+                task!.id,
+              ])
+            ).rows[0];
+            assert.equal(record.state, 'open');
+            const after = await capture();
+            await validateOwnerInstructions(db.pool, ownerId, savedEvidence);
+            assert.deepEqual(
+              after?.words.userMessages?.find((message) => message.text === restriction),
+              priorLimit,
+            );
+            releaseMain();
+            const freshPrompt = 'Give the synthetic monitor status only.';
+            block(freshPrompt);
+            const fresh = await thread.submitUserMessage(freshPrompt);
+            await waitFor(() => Boolean(ran(fresh.turnId)));
+            try {
+              const newChat = await captureOwnerInstructions(
+                db.pool,
+                ownerId,
+                creator.threadId,
+                [fresh.messageId],
+                null,
+                new Date(Date.now() - 86_400_000),
+                fresh.turnId,
+              );
+              assert.equal(newChat?.authorizingIds.includes(creator.messageId) ?? false, false);
+              assert.ok(newChat?.authorizingIds.includes(fresh.messageId));
+              const { createTrust } = await import('../src/server/trust.ts');
+              const oldGrant = await createTrust({
+                pool: db.pool,
+                ownerId,
+                review: async () => ({ run: true, because: prompt }),
+              }).check(
+                { threadId: creator.threadId, turnId: fresh.turnId },
+                'SYNTHETIC_SEND_REPORT',
+                { target: 'synthetic-report' },
+              );
+              assert.equal(oldGrant.confirm, true);
+              assert.deepEqual(
+                (
+                  await db.pool.query('SELECT status,withdrawn,error FROM turns WHERE id=$1', [
+                    creator.turnId,
+                  ])
+                ).rows[0],
+                { status: 'cancelled', withdrawn: false, error: null },
+              );
+              assert.ok((await capture())?.authorizingIds.includes(creator.messageId));
+              await validateOwnerInstructions(db.pool, ownerId, savedEvidence);
+            } finally {
+              release(freshPrompt);
+              await waitFor(settled(fresh.turnId));
+            }
+            assert.ok(
+              after?.authorizingIds.includes(creator.messageId),
+              'The active independent task lost its owner authority after /clear.',
+            );
+          } finally {
+            releaseMain();
+            releaseChild();
+            inspectObserver = undefined;
+            if (task) await request('POST', `/api/tasks/${task.id}/stop`);
+            await waitFor(settled(creator.turnId));
+            if (child) await waitFor(settled(child.turnId));
+            if (schedule) {
+              const removed = await app.inject({
+                method: 'DELETE',
+                url: `/api/schedules/${schedule.id}`,
+                headers,
+              });
+              assert.equal(removed.statusCode, 200, removed.body);
+            }
+            if (task) {
+              await db.pool.query('UPDATE turns SET task_id=NULL WHERE task_id=$1', [task.id]);
+              await db.pool.query('DELETE FROM tasks WHERE id=$1', [task.id]);
+            }
+          }
+        },
+      );
+
+      await t.test('clear keeps earlier Stop and model failure withdrawals', async (t) => {
+        const { validateOwnerInstructions } = await import('../src/server/owner-instructions.ts');
+        for (const kind of ['Stop', 'model failure'] as const) {
+          await t.test(kind, async () => {
+            await waitFor(settledThread);
+            const prompt = `Synthetic owner request before ${kind} and clear`;
+            block(prompt);
+            const submitted = await thread.submitUserMessage(prompt);
+            try {
+              await waitFor(() => Boolean(ran(submitted.turnId)));
+              const evidence = {
+                messages: [{ id: submitted.messageId, text: prompt, at: new Date().toISOString() }],
+              };
+              await validateOwnerInstructions(db.pool, ownerId, evidence);
+              if (kind === 'Stop') await request('POST', '/api/thread/stop');
+              else {
+                modelErrors.set(prompt, 'Synthetic model failure before clear.');
+                release(prompt);
+              }
+              await waitFor(settled(submitted.turnId));
+              const clear = await request('POST', '/api/messages', {
+                threadId: submitted.threadId,
+                text: '/clear',
+                clientMessageId: randomUUID(),
+              });
+              assert.equal(clear.statusCode, 200, clear.body);
+              assert.equal(
+                (await db.pool.query('SELECT withdrawn FROM turns WHERE id=$1', [submitted.turnId]))
+                  .rows[0].withdrawn,
+                true,
+              );
+              await assert.rejects(
+                validateOwnerInstructions(db.pool, ownerId, evidence),
+                /withdrawn or unavailable/,
+              );
+            } finally {
+              release(prompt);
+              modelErrors.delete(prompt);
+              await waitFor(settled(submitted.turnId));
+            }
+          });
+        }
+      });
+
+      await t.test(
+        'clear starts fresh chat without a model and keeps independent work',
+        async () => {
+          await waitFor(settledThread);
+          const threadId = (await thread.activeThread()).id;
+          const earlierPrompt = 'Synthetic earlier chat before clear';
+          const earlier = await thread.submitUserMessage(earlierPrompt);
+          await waitFor(settled(earlier.turnId));
+          const backgroundPrompt = 'Synthetic independent work during clear';
+          const runningPrompt = 'Synthetic current chat before clear';
+          const nextPrompt = 'Synthetic new request after clear';
+          block(backgroundPrompt);
+          block(runningPrompt);
+          modelErrors.set('/clear', 'Synthetic unavailable model');
+          const background = await thread.enqueueTurn(backgroundPrompt, {
+            source: 'schedule',
+            background: true,
+          });
+          const running = await thread.submitUserMessage(runningPrompt);
+          try {
+            await waitFor(() => Boolean(ran(background)) && Boolean(ran(running.turnId)));
+            const independent = ran(background)!;
+            const file = join(independent.workspacePath, 'clear-kept.txt');
+            await writeFile(file, 'Synthetic saved work');
+            const clientMessageId = randomUUID();
+            const clear = () =>
+              request('POST', '/api/messages', {
+                threadId,
+                text: '/clear',
+                clientMessageId,
+              });
+            const [response, concurrent] = await Promise.all([clear(), clear()]);
+            assert.equal(response.statusCode, 200, response.body);
+            const cleared = response.json() as SubmitMessageResponse;
+            assert.deepEqual(concurrent.json(), cleared);
+            assert.equal(await turnStatus(cleared.turnId), 'succeeded');
+            await waitFor(settled(cleared.turnId));
+            assert.equal(Boolean(ran(cleared.turnId)), false);
+            assert.equal(await turnStatus(running.turnId), 'cancelled');
+            assert.equal(independent.signal.aborted, false);
+            assert.equal(await turnStatus(background), 'running');
+            assert.equal(await readFile(file, 'utf8'), 'Synthetic saved work');
+            const state = (await request('GET', '/api/state')).json();
+            assert.equal(state.threadId, threadId);
+            assert.equal(typeof state.chatClearedAt, 'string');
+            assert.equal(
+              state.messages.some((message: Message) => message.id === earlier.messageId),
+              false,
+            );
+            assert.equal(
+              (await request('GET', '/api/messages'))
+                .json()
+                .messages.some((message: Message) => message.id === earlier.messageId),
+              false,
+            );
+            assert.equal(
+              (
+                await request(
+                  'GET',
+                  '/api/messages/search?q=Synthetic%20earlier%20chat%20before%20clear',
+                )
+              )
+                .json()
+                .some((message: Message) => message.id === earlier.messageId),
+              true,
+            );
+            assert.equal(
+              (await personal.recall(earlierPrompt, undefined, null)).some(
+                ({ id }) => id === earlier.messageId,
+              ),
+              false,
+            );
+            block(nextPrompt);
+            const next = await thread.submitUserMessage(nextPrompt);
+            await waitFor(() => Boolean(ran(next.turnId)));
+            const context = ran(next.turnId)!;
+            assert.ok(context.contextRestart);
+            assert.equal(
+              context.history.some(({ text }) => text === earlierPrompt),
+              false,
+            );
+            assert.deepEqual((await clear()).json(), cleared);
+            assert.equal(context.signal.aborted, false);
+            assert.equal(await turnStatus(next.turnId), 'running');
+            assert.equal(
+              (await request('GET', '/api/state')).json().chatClearedAt,
+              state.chatClearedAt,
+            );
+            assert.equal(
+              (
+                await request('POST', '/api/messages', {
+                  threadId: randomUUID(),
+                  text: '/clear',
+                  clientMessageId: randomUUID(),
+                })
+              ).statusCode,
+              409,
+            );
+            assert.equal(
+              (
+                await request('POST', '/api/messages', {
+                  threadId,
+                  text: '/clear',
+                  clientMessageId: earlier.messageId,
+                })
+              ).statusCode,
+              409,
+            );
+            release(nextPrompt);
+            await waitFor(settled(next.turnId));
+            const attachment = await storeArtifact(
+              Buffer.from('Synthetic clear attachment'),
+              'clear.txt',
+              'text/plain',
+              threadId,
+            );
+            assert.equal(
+              (
+                await request('POST', '/api/messages', {
+                  threadId,
+                  text: '/clear',
+                  attachmentIds: [attachment.id],
+                  clientMessageId: randomUUID(),
+                })
+              ).statusCode,
+              400,
+            );
+            assert.equal(
+              (await sendAudio({ threadId, text: '/clear', clientMessageId: randomUUID() }))
+                .statusCode,
+              400,
+            );
+            assert.equal(
+              (
+                await request('POST', '/api/messages', {
+                  threadId,
+                  text: 'Synthetic stale client input',
+                  clientMessageId: randomUUID(),
+                  chatClearedAt: null,
+                })
+              ).statusCode,
+              409,
+            );
+            const arrival = thread.stopSignal();
+            await db.pool
+              .query(`CREATE FUNCTION reject_clear() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+              IF NEW.text='/clear' THEN RAISE EXCEPTION 'Synthetic clear failure'; END IF;
+              RETURN NEW; END $$;
+              CREATE TRIGGER reject_clear BEFORE INSERT ON messages FOR EACH ROW EXECUTE FUNCTION reject_clear()`);
+            try {
+              assert.equal(
+                (
+                  await request('POST', '/api/messages', {
+                    threadId,
+                    text: '/clear',
+                    clientMessageId: randomUUID(),
+                  })
+                ).statusCode,
+                500,
+              );
+            } finally {
+              await db.pool.query(
+                'DROP TRIGGER reject_clear ON messages; DROP FUNCTION reject_clear()',
+              );
+            }
+            assert.equal(
+              (await request('GET', '/api/state')).json().chatClearedAt,
+              state.chatClearedAt,
+            );
+            const afterRollback = await thread.submitUserMessage(
+              'Synthetic input after failed clear',
+              [],
+              {
+                stopSignal: arrival,
+              },
+            );
+            await waitFor(settled(afterRollback.turnId));
+            assert.equal(await turnStatus(afterRollback.turnId), 'succeeded');
+          } finally {
+            modelErrors.delete('/clear');
+            release(backgroundPrompt);
+            release(runningPrompt);
+            release(nextPrompt);
+            await waitFor(settled(background));
+            await waitFor(settled(running.turnId));
+          }
+        },
+      );
+
+      await t.test(
+        'clear cancels earlier text and audio intake but keeps an addressed task reply',
+        async (t) => {
+          await waitFor(settledThread);
+          const threadId = (await thread.activeThread()).id;
+          const taskId = randomUUID();
+          const anchor = randomUUID();
+          const origin = await thread.enqueueTurn('Synthetic task before clear intake', {
+            source: 'task',
+            sessionId: taskId,
+            background: true,
+          });
+          await waitFor(settled(origin));
+          await db.pool.query(
+            "INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text) VALUES($1,$2,$3,$4,'assistant','Synthetic task question')",
+            [anchor, ownerId, threadId, origin],
+          );
+          await db.pool.query(
+            "INSERT INTO tasks(id,owner_id,turn_id,session_id,message_id,title,done_when,now_text,applied_revision) VALUES($1,$2,$3,$1,$4,'Synthetic independent task','Synthetic reply arrived','Waiting',1)",
+            [taskId, ownerId, origin, anchor],
+          );
+          await db.pool.query('UPDATE turns SET task_id=$1 WHERE id=$2', [taskId, origin]);
+          const statusMessage = randomUUID();
+          await db.pool.query(
+            "INSERT INTO messages(id,owner_id,thread_id,role,text,reply_to_message_id) VALUES($1,$2,$3,'assistant','Synthetic task status',$4)",
+            [statusMessage, ownerId, threadId, anchor],
+          );
+          const mainText = 'Synthetic main input still being read';
+          const taskText = 'Synthetic addressed task input still being read';
+          const reading = new Set<string>();
+          let releaseReading!: () => void;
+          const held = new Promise<void>((resolve) => {
+            releaseReading = resolve;
+          });
+          const accept = verification.accept.bind(verification);
+          t.mock.method(verification, 'accept', async (...args: Parameters<typeof accept>) => {
+            if (args[0] === mainText || args[0] === taskText) {
+              reading.add(args[0]);
+              await held;
+              return undefined;
+            }
+            return accept(...args);
+          });
+          let releaseAudio!: () => void;
+          transcriptionGate = new Promise<void>((resolve) => {
+            releaseAudio = resolve;
+          });
+          const previousTranscript = transcript;
+          const previousReady = chatReady;
+          transcript = 'Synthetic audio input before clear';
+          const audioCount = transcriptions.length;
+          const mainMessageId = randomUUID();
+          const audioMessageId = randomUUID();
+          const artifactCount = (await db.pool.query('SELECT count(*)::int AS n FROM artifacts'))
+            .rows[0].n;
+          const main = request('POST', '/api/messages', {
+            threadId,
+            text: mainText,
+            clientMessageId: mainMessageId,
+          }).then((response) => response);
+          const task = request('POST', '/api/messages', {
+            threadId,
+            text: taskText,
+            clientMessageId: randomUUID(),
+            replyToMessageId: statusMessage,
+            chatClearedAt: null,
+          }).then((response) => response);
+          const audio = sendAudio({ threadId, clientMessageId: audioMessageId }).then(
+            (response) => response,
+          );
+          try {
+            await waitFor(() => reading.size === 2 && transcriptions.length > audioCount);
+            chatReady = false;
+            const cleared = await request('POST', '/api/messages', {
+              threadId,
+              text: '/clear',
+              clientMessageId: randomUUID(),
+            });
+            assert.equal(cleared.statusCode, 200, cleared.body);
+            chatReady = previousReady;
+            releaseReading();
+            releaseAudio();
+            const [mainResult, taskResult, audioResult] = await Promise.all([main, task, audio]);
+            for (const response of [mainResult, audioResult]) {
+              assert.equal(response.statusCode, 409, response.body);
+              assert.equal(response.json().retryable, true);
+            }
+            assert.equal(
+              (
+                await db.pool.query('SELECT id FROM messages WHERE id=ANY($1::uuid[])', [
+                  [mainMessageId, audioMessageId],
+                ])
+              ).rowCount,
+              0,
+            );
+            assert.equal(
+              (await db.pool.query('SELECT count(*)::int AS n FROM artifacts')).rows[0].n,
+              artifactCount,
+            );
+            assert.equal(
+              (
+                await db.pool.query('SELECT response FROM audio_messages WHERE message_id=$1', [
+                  audioMessageId,
+                ])
+              ).rows[0].response,
+              null,
+            );
+            const freshState = (await request('GET', '/api/state')).json();
+            assert.equal(
+              freshState.messages.some(
+                (message: Message) => message.id === mainMessageId || message.id === audioMessageId,
+              ),
+              false,
+            );
+            assert.equal(
+              (await request('GET', '/api/messages'))
+                .json()
+                .messages.some(
+                  (message: Message) =>
+                    message.id === mainMessageId || message.id === audioMessageId,
+                ),
+              false,
+            );
+            assert.equal(taskResult.statusCode, 200, taskResult.body);
+            const continued = taskResult.json().turnId as string;
+            await waitFor(settled(continued));
+            assert.equal(ran(continued)!.sessionId, taskId);
+            assert.equal(ran(continued)!.prompt, taskText);
+            assert.equal(await turnStatus(continued), 'succeeded');
+            transcriptionGate = undefined;
+            assert.equal(
+              (await sendAudio({ threadId, clientMessageId: audioMessageId })).statusCode,
+              409,
+            );
+            const resent = await sendAudio({ threadId, clientMessageId: randomUUID() });
+            assert.equal(resent.statusCode, 200, resent.body);
+            await waitFor(settled(resent.json().turnId));
+          } finally {
+            chatReady = previousReady;
+            releaseReading();
+            releaseAudio();
+            await Promise.allSettled([main, task, audio]);
+            transcriptionGate = undefined;
+            transcript = previousTranscript;
+            await request('POST', `/api/tasks/${taskId}/stop`);
+            await db.pool.query('UPDATE turns SET task_id=NULL WHERE session_id=$1', [taskId]);
+            await db.pool.query('DELETE FROM tasks WHERE id=$1', [taskId]);
+          }
+        },
+      );
+
+      await t.test('chat-app clear saves one visible acknowledgement in Nod', async () => {
+        const { createChannels } = await import('../src/server/channels.ts');
+        const threadId = (await thread.activeThread()).id;
+        for (const provider of ['telegram', 'whatsapp']) {
+          let pending = true;
+          const posts: string[] = [];
+          const channels = await createChannels(db.pool, {
+            ownerId,
+            transport: {
+              channels: [
+                {
+                  id: provider,
+                  status: 'configured',
+                  missing: [],
+                  accountId: 'synthetic-clear',
+                  allowedSenderIds: ['111'],
+                },
+              ],
+              poll: async (accept) => {
+                if (!pending) return;
+                pending = false;
+                await accept({
+                  channelId: provider,
+                  accountId: 'synthetic-clear',
+                  senderId: '111',
+                  messageId: randomUUID(),
+                  threadId: 'synthetic-chat',
+                  text: '/clear',
+                  sentAt: new Date(),
+                });
+              },
+              receive: async () => ({ status: 200, body: {} }),
+              post: async ({ text }) => {
+                posts.push(text);
+                return { id: 'synthetic-sent-clear' };
+              },
+              close: async () => {},
+            },
+            subscribe: () => () => {},
+            intervalMs: 600_000,
+            activeThread: (client) => thread.activeThread(client),
+            taskCommand: tasks.chatCommand,
+            submit: async () => {
+              throw new Error('Clear must not start a model turn.');
+            },
+          });
+          try {
+            await channels.drain();
+            assert.deepEqual(posts, [thread.chatClearedMessage]);
+            for (const path of ['/api/state', '/api/messages']) {
+              const messages = (await request('GET', path)).json().messages as Message[];
+              assert.equal(
+                messages.filter(
+                  ({ role, text }) => role === 'assistant' && text === thread.chatClearedMessage,
+                ).length,
+                1,
+              );
+            }
+            const boundary = (await request('GET', '/api/state')).json().chatClearedAt;
+            await channels.drain();
+            assert.equal(posts.length, 1);
+            assert.equal((await request('GET', '/api/state')).json().chatClearedAt, boundary);
+            assert.equal((await thread.activeThread()).id, threadId);
+          } finally {
+            await channels.close();
+          }
+        }
+      });
+
+      await t.test(
+        'a context restart keeps chat, files and independent work and refuses stale requests',
+        async () => {
+          await waitFor(settledThread);
+          const threadId = (await thread.activeThread()).id;
+          const backgroundPrompt = 'Synthetic independent work during context recovery';
+          const failedPrompt = 'Synthetic chat context failure';
+          block(backgroundPrompt);
+          modelErrors.set(
+            failedPrompt,
+            new ContextLimitError('Synthetic context window exceeded.'),
+          );
+          const background = await thread.enqueueTurn(backgroundPrompt, {
+            source: 'schedule',
+            background: true,
+          });
+          try {
+            await waitFor(() => Boolean(ran(background)));
+            const held = ran(background)!;
+            const file = join(held.workspacePath, 'context-recovery.txt');
+            await writeFile(file, 'Synthetic saved work');
+            const earlierPrompt = 'Synthetic completed chat before context recovery';
+            const earlier = await thread.submitUserMessage(earlierPrompt);
+            await waitFor(settled(earlier.turnId));
+            const question = await thread.submitUserMessage('ask-question');
+            await waitFor(settled(question.turnId));
+            const failed = await thread.submitUserMessage(failedPrompt);
+            await waitFor(settled(failed.turnId));
+            assert.equal(await turnStatus(failed.turnId), 'failed');
+            assert.equal(await turnStatus(question.turnId), 'waiting');
+            await waitFor(async () =>
+              Boolean(
+                (
+                  await db.pool.query('SELECT 1 FROM messages WHERE turn_id=$1 AND stream_id=$2', [
+                    failed.turnId,
+                    `context-failure:${failed.turnId}`,
+                  ])
+                ).rowCount,
+              ),
+            );
+            const state = (await request('GET', '/api/state')).json();
+            assert.deepEqual(state.chatRecovery, { turnId: failed.turnId });
+            const messageIds = state.messages.map((message: { id: string }) => message.id);
+            const restart = (input = { threadId, turnId: failed.turnId }) =>
+              request('POST', '/api/conversation/restart-context', input);
+            assert.equal(
+              (
+                await app.inject({
+                  method: 'POST',
+                  url: '/api/conversation/restart-context',
+                  headers: { host: headers.host },
+                  payload: { threadId, turnId: failed.turnId },
+                })
+              ).statusCode,
+              401,
+            );
+            for (const input of [
+              { threadId: randomUUID(), turnId: failed.turnId },
+              { threadId, turnId: randomUUID() },
+              { threadId, turnId: background },
+            ])
+              assert.equal((await restart(input)).statusCode, 409);
+            const previousNodeEnv = process.env.NODE_ENV;
+            process.env.NODE_ENV = 'production';
+            try {
+              assert.equal((await restart()).statusCode, 200);
+            } finally {
+              if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+              else process.env.NODE_ENV = previousNodeEnv;
+            }
+            const recovered = (await request('GET', '/api/state')).json();
+            assert.equal(recovered.threadId, threadId);
+            assert.equal(recovered.chatRecovery, undefined);
+            assert.ok(
+              messageIds.every((id: string) =>
+                recovered.messages.some((message: { id: string }) => message.id === id),
+              ),
+            );
+            assert.equal((await restart()).statusCode, 409);
+            assert.equal(held.signal.aborted, false);
+            assert.equal(held.contextRestart, undefined);
+            assert.equal(await turnStatus(background), 'running');
+            assert.equal(await readFile(file, 'utf8'), 'Synthetic saved work');
+            const next = await thread.submitUserMessage('Synthetic request after context recovery');
+            await waitFor(settled(next.turnId));
+            const context = ran(next.turnId)!;
+            assert.equal(context.threadId, threadId);
+            assert.equal(context.sessionId, threadId);
+            assert.equal(context.workspacePath, held.workspacePath);
+            assert.ok(context.contextRestart);
+            assert.ok(context.history.every((message) => !message.text.includes(failedPrompt)));
+            assert.ok(context.history.every((message) => !message.text.includes(earlierPrompt)));
+            assert.equal(
+              (await request('GET', '/api/messages/search?q=Synthetic%20chat%20context%20failure'))
+                .json()
+                .some((message: { turnId: string }) => message.turnId === failed.turnId),
+              true,
+            );
+            assert.equal(
+              (await db.pool.query('SELECT archived_at FROM threads WHERE id=$1', [threadId]))
+                .rows[0].archived_at,
+              null,
+            );
+          } finally {
+            modelErrors.delete(failedPrompt);
+            release(backgroundPrompt);
+            await waitFor(settled(background));
+          }
         },
       );
 
@@ -6741,6 +8264,9 @@ test(
           let version = 'v1';
           let afterRead = async () => {};
           let changeToken: string | undefined;
+          let sourceFailure: Error | undefined;
+          let sourceReads = 0;
+          let toolSource = false;
           const options = {
             pool: db.pool,
             ownerId,
@@ -6755,10 +8281,13 @@ test(
                       changeToken,
                       readable: true,
                       revision,
+                      tools: toolSource,
                     },
                   ]
                 : [],
             read: async (_turn: unknown, input: Record<string, unknown>) => {
+              sourceReads++;
+              if (sourceFailure) throw sourceFailure;
               const snapshot = {
                 checkedAt: new Date().toISOString(),
                 records: [
@@ -6829,6 +8358,9 @@ test(
             connected = true;
             revision = 'account-one';
             changeToken = undefined;
+            sourceFailure = undefined;
+            sourceReads = 0;
+            toolSource = false;
             engine.release(turnId);
             await db.pool.query('DELETE FROM proactive_issues WHERE owner_id=$1', [ownerId]);
             await db.pool.query('DELETE FROM proactive_closures WHERE owner_id=$1', [ownerId]);
@@ -6847,6 +8379,138 @@ test(
             });
           }
           try {
+            await t.test(
+              'failed service reads wait for another check and allow recovery',
+              async () => {
+                await reset();
+                sourceFailure = Object.assign(new Error('Synthetic invalid source arguments.'), {
+                  statusCode: 502,
+                  upstreamStatus: 400,
+                });
+                await assert.rejects(
+                  engine.read(ref, { sourceId }, new AbortController().signal),
+                  sourceFailure,
+                );
+                sourceFailure = undefined;
+                await engine.read(ref, { sourceId }, new AbortController().signal);
+                assert.equal(sourceReads, 2);
+                await reset();
+                sourceFailure = Object.assign(new Error('Synthetic service unavailable.'), {
+                  status: 503,
+                });
+                await assert.rejects(
+                  engine.read(ref, { sourceId }, new AbortController().signal),
+                  sourceFailure,
+                );
+                const count = sourceReads;
+                sourceFailure = undefined;
+                for (let i = 0; i < 20; i++)
+                  await assert.rejects(
+                    engine.read(ref, { sourceId }, new AbortController().signal),
+                    (error: Error) => {
+                      assert.match(error.message, /next scheduled check/);
+                      assert.match(error.message, /503/);
+                      assert.match(error.message, /Synthetic service unavailable/);
+                      return true;
+                    },
+                  );
+                assert.equal(sourceReads, count);
+                assert.equal((await engine.view()).coverage[0].status, 'unavailable');
+                const next = { turnId: randomUUID(), threadId: currentThread };
+                await db.pool.query(
+                  "INSERT INTO turns(id,owner_id,thread_id,source,prompt,status,background,proactive,started_at) VALUES($1,$2,$3,'event','Synthetic recovery check','running',true,true,now())",
+                  [next.turnId, ownerId, currentThread],
+                );
+                try {
+                  await engine.read(next, { sourceId }, new AbortController().signal);
+                  assert.equal(sourceReads, count + 1);
+                  assert.equal((await engine.view()).coverage[0].status, 'ready');
+                } finally {
+                  engine.release(next.turnId);
+                  await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [
+                    next.turnId,
+                  ]);
+                }
+                await reset();
+                await db.pool.query(
+                  "INSERT INTO proactive_sources(owner_id,source_id,label,status,revision,cursor) VALUES($1,$2,'Synthetic source','ready',$3,'synthetic-page-two')",
+                  [ownerId, sourceId, revision],
+                );
+                const until = new Date(Date.now() + 120_000);
+                sourceFailure = Object.assign(
+                  new Error(
+                    `The connection service is rate limiting this install (installation_busy, HTTP 429), so Nod is not calling it until ${until.toISOString()}. Nod did not read this source. Do not retry this source now; it is checked again after that time.`,
+                  ),
+                  { statusCode: 429, status: 429, notRun: true },
+                );
+                await assert.rejects(
+                  engine.read(ref, { sourceId }, new AbortController().signal),
+                  sourceFailure,
+                );
+                const waiting = (
+                  await db.pool.query(
+                    'SELECT status,cursor,checked_at,next_poll FROM proactive_sources WHERE owner_id=$1 AND source_id=$2',
+                    [ownerId, sourceId],
+                  )
+                ).rows[0];
+                assert.deepEqual(
+                  [waiting.status, waiting.cursor, waiting.checked_at],
+                  ['unavailable', 'synthetic-page-two', null],
+                );
+                assert.ok(waiting.next_poll > until);
+                const waitingReads = sourceReads;
+                await assert.rejects(
+                  engine.read(ref, { sourceId }, new AbortController().signal),
+                  /HTTP 429.*Do not retry this source now/,
+                );
+                assert.equal(sourceReads, waitingReads);
+              },
+            );
+            await t.test(
+              'evidence failures identify the record and preserve every save fence',
+              async () => {
+                await reset();
+                toolSource = true;
+                const earlier = randomUUID();
+                await db.pool.query(
+                  "INSERT INTO turns(id,owner_id,thread_id,source,prompt,status,background,proactive) VALUES($1,$2,$3,'event','Synthetic earlier check','succeeded',true,true)",
+                  [earlier, ownerId, currentThread],
+                );
+                const read = () =>
+                  engine.read(
+                    ref,
+                    { sourceId, query: 'Read the synthetic record.' },
+                    new AbortController().signal,
+                  );
+                for (const [table, patch, reason] of [
+                  ['proactive_evidence', `turn_id='${earlier}'`, /earlier turn/],
+                  ['proactive_evidence', "version='v2'", /version changed/],
+                  ['proactive_evidence', "checked_at=now()-interval '3 minutes'", /two minutes/],
+                  ['proactive_evidence', "source_revision='old-account'", /connection changed/],
+                  ['proactive_sources', "status='unavailable'", /not ready/],
+                ] as const) {
+                  await read();
+                  await db.pool.query(`UPDATE ${table} SET ${patch} WHERE owner_id=$1`, [ownerId]);
+                  await assert.rejects(save(), (error: Error) => {
+                    assert.match(error.message, reason);
+                    assert.ok(error.message.includes(sourceId));
+                    assert.ok(error.message.includes('thread1'));
+                    return true;
+                  });
+                  assert.equal((await engine.view()).issues.length, 0);
+                  assert.equal(await delivered(), 0);
+                }
+                await read();
+                await assert.rejects(
+                  save({ sources: [{ sourceId, id: 'missing', version }] }),
+                  /missing/,
+                );
+                assert.equal(
+                  ((await save({ delivery: 'private' })) as { status: string }).status,
+                  'prepared',
+                );
+              },
+            );
             await t.test(
               'prepared outcomes and owner controls emit only committed bounded changes',
               async () => {
@@ -6986,6 +8650,12 @@ test(
               async () => {
                 await reset();
                 await db.pool.query('DELETE FROM preferences WHERE owner_id=$1', [ownerId]);
+                assert.equal(await engine.canRun(), false);
+                await assert.rejects(
+                  engine.read(ref, { sourceId }, new AbortController().signal),
+                  /paused/,
+                );
+                await preferences.update({ proactivePaused: false });
                 await engine.read(ref, { sourceId }, new AbortController().signal);
                 assert.equal(await engine.canRun(), true);
                 await reset();
@@ -7652,290 +9322,821 @@ test(
               }
             });
             await t.test(
-              'screening ends a quiet batch and hands an escalated batch with its reads to the full check unless a read failed',
+              'source pre-checks reuse successful versions and never escalate a failed read',
               async () => {
                 await reset();
-                let verdict = false;
-                let urgent = true;
-                let tools = false;
-                let sourceRevision: string | undefined;
-                let checks = 0;
-                let owner = {};
-                let curatorId = 'fixture';
-                let fail = false;
-                let rotateSource = false;
-                let allowed = true;
-                let stopAfterCheck = false;
-                let checkedEvents = '';
-                let failRecord = false;
-                const notificationRule = (await preferences.get()).notificationRule;
-                const screening = createProactivity({
-                  ...options,
-                  read: async (turn: unknown, input: Record<string, unknown>) => {
-                    const result = await options.read(turn, input);
-                    return failRecord
-                      ? {
-                          ...result,
-                          records: result.records.map((record) => ({
-                            ...record,
-                            error: 'unavailable' as const,
-                          })),
-                        }
-                      : result;
-                  },
-                  sources: async () => {
-                    const result = (await options.sources()).map((source) => ({
-                      ...source,
-                      ...(sourceRevision ? { revision: sourceRevision } : {}),
-                      tools,
-                    }));
-                    if (rotateSource) {
-                      sourceRevision = 'screening-raced-revision';
-                      rotateSource = false;
-                    }
-                    return result;
-                  },
-                  curator: {
-                    get id() {
-                      return curatorId;
-                    },
-                    configured: true,
-                    curate: async ({ input }) => {
-                      checks++;
-                      checkedEvents = (input as { events?: string }).events ?? '';
-                      if (fail) throw new Error('Synthetic failed check');
-                      if (stopAfterCheck) allowed = false;
-                      return 'quietEnd' in (input as object) ? { urgent } : { attention: verdict };
-                    },
-                  },
-                });
-                let issueDue = false;
-                let saveMode: 'same' | 'changed' | undefined;
-                const screen = async (
-                  changeVersion = true,
-                  rotate = false,
-                  fullStatus?: 'succeeded' | 'failed' | 'cancelled',
-                ) => {
+                changeToken = 'source-token';
+                await engine.read(ref, { sourceId }, new AbortController().signal);
+                const check = async (status = 'succeeded') => {
                   const checkTurn = { ...ref, turnId: randomUUID() };
                   await db.pool.query(
                     "INSERT INTO turns(id,owner_id,thread_id,source,prompt,status,background,proactive,started_at) VALUES($1,$2,$3,'event','Synthetic source check','running',true,true,now())",
                     [checkTurn.turnId, ownerId, currentThread],
                   );
-                  if (changeVersion) version = randomUUID();
                   await db.pool.query(
                     'UPDATE proactive_sources SET claimed_turn=$3,signal_version=signal_version+1 WHERE owner_id=$1 AND source_id=$2',
                     [ownerId, sourceId, checkTurn.turnId],
                   );
-                  if (issueDue)
-                    await db.pool.query(
-                      'UPDATE proactive_issues SET claimed_turn=$2 WHERE owner_id=$1',
-                      [ownerId, checkTurn.turnId],
-                    );
-                  const context = (await screening.context(checkTurn))!;
-                  rotateSource = rotate;
-                  const result = await context.screen!(
-                    owner,
-                    new AbortController().signal,
-                    () => allowed,
-                  );
-                  const quiet = Array.isArray(result) ? 'handed' : result;
-                  if (Array.isArray(result))
-                    assert.ok(
-                      (result as Array<{ result: { records: Array<{ id: string }> } }>).every(
-                        ({ result }) => result.records.map(({ id }) => id).join() === 'thread1',
-                      ),
-                    );
-                  const { dirty } = (
-                    await db.pool.query(
-                      'SELECT signal_version>inspected_signal AS dirty FROM proactive_sources WHERE owner_id=$1 AND source_id=$2',
-                      [ownerId, sourceId],
-                    )
-                  ).rows[0];
-                  let status = fullStatus ?? (quiet === true ? 'succeeded' : 'failed');
                   try {
-                    if (fullStatus) {
-                      const full = (await context.read(
-                        { sourceId, ...(tools ? { tool: 'fixture_read', args: {} } : {}) },
-                        new AbortController().signal,
-                      )) as { remainingReads: number };
-                      assert.equal(full.remainingReads, 11);
-                    }
-                    if (fullStatus && saveMode) {
-                      const draft = proposal({ matterKey: 'screened-native-cache' });
-                      if (saveMode === 'changed') {
-                        version = randomUUID();
-                        assert.equal(
-                          (
-                            (await context.update(draft, new AbortController().signal)) as {
-                              status: string;
-                            }
-                          ).status,
-                          'source_changed',
-                        );
-                      } else await context.update(draft, new AbortController().signal);
-                    }
-                  } catch (error) {
-                    status = 'failed';
-                    throw error;
+                    const context = (await engine.context(checkTurn))!;
+                    return await context.screen!({}, new AbortController().signal);
                   } finally {
                     await db.pool.query(
                       'UPDATE turns SET status=$2,finished_at=now() WHERE id=$1',
                       [checkTurn.turnId, status],
                     );
-                    await db.pool.query('DELETE FROM messages WHERE turn_id=$1', [
-                      checkTurn.turnId,
-                    ]);
-                    screening.release(checkTurn.turnId);
+                    engine.release(checkTurn.turnId);
                   }
-                  return [quiet, dirty];
                 };
-                await transaction(
-                  (client) => engine.signal(sourceId, client, 'Meeting moved from 10:00 to 09:00.'),
-                  db.pool,
+                const initial = await check();
+                assert.ok(Array.isArray(initial));
+                assert.equal(await check(), true);
+                version = 'changed-version';
+                assert.ok(Array.isArray(await check('failed')));
+                assert.ok(Array.isArray(await check()));
+                assert.equal(await check(), true);
+                sourceFailure = new Error('Synthetic source unavailable.');
+                assert.equal(await check(), true);
+                assert.equal(
+                  (await engine.view()).coverage.find((source) => source.sourceId === sourceId)
+                    ?.status,
+                  'unavailable',
                 );
-                assert.deepEqual(await screen(), [true, false]);
-                assert.ok(checkedEvents.includes('Meeting moved from 10:00 to 09:00.'));
-                assert.ok(checkedEvents.includes('<untrusted_tool_result'));
-                checkedEvents = '';
-                await transaction(
-                  (client) =>
-                    engine.signal(sourceId, client, 'Meeting now overlaps another event.'),
-                  db.pool,
+                assert.equal(
+                  (
+                    await db.pool.query(
+                      'SELECT inspected_signal<signal_version AS pending FROM proactive_sources WHERE owner_id=$1 AND source_id=$2',
+                      [ownerId, sourceId],
+                    )
+                  ).rows[0].pending,
+                  true,
                 );
-                assert.deepEqual(await screen(), [true, false]);
-                assert.ok(checkedEvents.includes('Meeting now overlaps another event.'));
-                assert.ok(!checkedEvents.includes('Meeting moved from 10:00 to 09:00.'));
-                await transaction(
-                  (client) =>
-                    engine.signal(sourceId, client, 'A change not present in the record.'),
-                  db.pool,
-                );
-                assert.deepEqual(await screen(false, false, 'succeeded'), ['handed', false]);
-                const firstChecks = checks;
-                verdict = true;
-                assert.deepEqual(await screen(false), [true, false]);
-                assert.equal(checks, firstChecks);
-                await preferences.update({
-                  notificationRule: 'Prepare current synthetic commitments.',
-                });
-                assert.deepEqual(await screen(false), ['handed', false]);
-                assert.equal(checks, firstChecks + 1);
-                verdict = false;
-                assert.deepEqual(await screen(false), [true, false]);
-                assert.equal(checks, firstChecks + 2);
-                owner = { memory: 'The owner needs a synthetic draft for each current item.' };
-                verdict = true;
-                assert.deepEqual(await screen(false), ['handed', false]);
-                verdict = false;
-                assert.deepEqual(await screen(false), [true, false]);
-                curatorId = 'fixture-replaced';
-                verdict = true;
-                assert.deepEqual(await screen(false), ['handed', false]);
-                verdict = false;
-                assert.deepEqual(await screen(false), [true, false]);
-                const beforeRace = checks;
-                assert.deepEqual(await screen(false, true), [false, true]);
-                assert.equal(checks, beforeRace);
-                assert.deepEqual(await screen(false), [true, false]);
-                fail = true;
-                assert.deepEqual(await screen(), [false, true]);
-                const beforeRetry = checks;
-                fail = false;
-                assert.deepEqual(await screen(false), [true, false]);
-                assert.equal(checks, beforeRetry + 1);
-                failRecord = true;
-                assert.deepEqual(await screen(false), [false, true]);
-                failRecord = false;
-                assert.deepEqual(await screen(false), [true, false]);
-                verdict = true;
-                assert.deepEqual(await screen(true, false, 'succeeded'), ['handed', false]);
-                const afterFull = checks;
-                assert.deepEqual(await screen(false), [true, false]);
-                assert.equal(checks, afterFull);
-                saveMode = 'same';
-                assert.deepEqual(await screen(true, false, 'succeeded'), ['handed', false]);
-                assert.deepEqual(await screen(false), [true, false]);
-                await db.pool.query('DELETE FROM proactive_issues WHERE owner_id=$1', [ownerId]);
-                saveMode = 'changed';
-                assert.deepEqual(await screen(true, false, 'succeeded'), ['handed', false]);
-                assert.deepEqual(await screen(false), ['handed', false]);
-                saveMode = undefined;
-                for (const status of ['failed', 'cancelled'] as const) {
-                  assert.deepEqual(await screen(true, false, status), ['handed', false]);
-                  const afterFailure = checks;
-                  assert.deepEqual(await screen(false), ['handed', false]);
-                  assert.equal(checks, afterFailure + 1);
-                }
-                verdict = false;
-                assert.deepEqual(await screen(false), [true, false]);
-                for (const available of [null, false]) {
-                  await db.pool.query(
-                    'UPDATE proactive_evidence SET available=$3 WHERE owner_id=$1 AND source_id=$2',
-                    [ownerId, sourceId, available],
-                  );
-                  verdict = true;
-                  const beforeRecovery = checks;
-                  assert.deepEqual(await screen(false), ['handed', false]);
-                  assert.equal(checks, beforeRecovery + 1);
-                  verdict = false;
-                  assert.deepEqual(await screen(false), [true, false]);
-                }
-                sourceRevision = 'screening-new-revision';
-                verdict = true;
-                assert.deepEqual(await screen(false), ['handed', false]);
-                sourceRevision = undefined;
-                await preferences.update({ notificationRule });
-                verdict = false;
-                allowed = false;
-                const beforeBudget = checks;
-                assert.deepEqual(await screen(), [false, true]);
-                assert.equal(checks, beforeBudget);
-                allowed = true;
-                stopAfterCheck = true;
-                assert.deepEqual(await screen(), [false, true]);
-                assert.equal(checks, beforeBudget + 1);
-                allowed = true;
-                stopAfterCheck = false;
-                assert.deepEqual(await screen(), [true, false]);
-                verdict = true;
-                assert.deepEqual(await screen(), ['handed', false]);
-                tools = true;
+                sourceFailure = undefined;
                 await db.pool.query(
-                  'UPDATE proactive_sources SET reads=$3::jsonb WHERE owner_id=$1 AND source_id=$2',
-                  [ownerId, sourceId, JSON.stringify([{ tool: 'fixture_read', args: {} }])],
+                  'UPDATE proactive_sources SET next_poll=clock_timestamp() WHERE owner_id=$1',
+                  [ownerId],
                 );
-                verdict = false;
-                assert.deepEqual(await screen(), [true, false]);
-                verdict = true;
-                assert.deepEqual(await screen(), ['handed', false]);
-                verdict = false;
-                await save({ matterKey: 'screened-matter' });
-                assert.deepEqual(await screen(), ['handed', false]);
-                assert.deepEqual(await screen(false, false, 'succeeded'), ['handed', false]);
-                assert.deepEqual(await screen(false), [true, false]);
-                issueDue = true;
-                assert.deepEqual(await screen(false), [false, true]);
-                issueDue = false;
-                const clock = (at: number) => new Date(at).toISOString().slice(11, 16);
-                await preferences.update({
-                  timeZone: null,
-                  quietHoursEnabled: true,
-                  quietStart: clock(Date.now() - 60_000),
-                  quietEnd: clock(Date.now() + 2 * 3_600_000),
+                version = 'recovered-version';
+                assert.ok(Array.isArray(await check()));
+                const other = createProactivity({
+                  ...options,
+                  read: async (turn, input) => {
+                    const result = await options.read(turn, input);
+                    return {
+                      ...result,
+                      records: result.records.map((record) => ({
+                        ...record,
+                        error: 'unavailable' as const,
+                      })),
+                    };
+                  },
                 });
-                urgent = false;
-                assert.deepEqual(await screen(), [true, true]);
-                const held = (
+                const checkTurn = { ...ref, turnId: randomUUID() };
+                await db.pool.query(
+                  "INSERT INTO turns(id,owner_id,thread_id,source,prompt,status,background,proactive,started_at) VALUES($1,$2,$3,'event','Synthetic failed record','running',true,true,now())",
+                  [checkTurn.turnId, ownerId, currentThread],
+                );
+                await db.pool.query(
+                  'UPDATE proactive_sources SET claimed_turn=$3,signal_version=signal_version+1 WHERE owner_id=$1 AND source_id=$2',
+                  [ownerId, sourceId, checkTurn.turnId],
+                );
+                assert.equal(
+                  await (await other.context(checkTurn))!.screen!({}, new AbortController().signal),
+                  true,
+                );
+                assert.equal(
+                  (await other.view()).coverage.find((source) => source.sourceId === sourceId)
+                    ?.status,
+                  'partial',
+                );
+                assert.equal(
+                  (
+                    await db.pool.query(
+                      'SELECT inspected_signal<signal_version AS pending FROM proactive_sources WHERE owner_id=$1 AND source_id=$2',
+                      [ownerId, sourceId],
+                    )
+                  ).rows[0].pending,
+                  true,
+                );
+                await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [
+                  checkTurn.turnId,
+                ]);
+              },
+            );
+            await t.test(
+              'source prechecks collect later pages before the observer assesses the batch',
+              async () => {
+                await reset();
+                await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [turnId]);
+                const pages: Array<string | undefined> = [];
+                const paged = createProactivity({
+                  ...options,
+                  read: async (_turn, query) => {
+                    pages.push(query.cursor);
+                    const page = Number(query.cursor ?? 0);
+                    return {
+                      checkedAt: new Date().toISOString(),
+                      records: [
+                        {
+                          id: `fixture-page-${page}`,
+                          version: 'v1',
+                          available: true,
+                          data: { state: page === 3 ? 'needs_owner_choice' : 'closed' },
+                        },
+                      ],
+                      ...(page < 3 ? { nextCursor: String(page + 1) } : {}),
+                    };
+                  },
+                });
+                await transaction(
+                  (client) => paged.signal(sourceId, client, 'Synthetic paged source changed'),
+                  db.pool,
+                );
+                const id = randomUUID();
+                await db.pool.query(
+                  "INSERT INTO turns(id,owner_id,thread_id,source,prompt,status,background,proactive,started_at) VALUES($1,$2,$3,'event','Synthetic paged check','running',true,true,now())",
+                  [id, ownerId, currentThread],
+                );
+                await db.pool.query(
+                  'UPDATE proactive_sources SET claimed_turn=$3 WHERE owner_id=$1 AND source_id=$2',
+                  [ownerId, sourceId, id],
+                );
+                try {
+                  const context = await paged.context({ turnId: id, threadId: currentThread });
+                  assert.ok(context?.screen);
+                  const result = await context.screen!({}, new AbortController().signal);
+                  assert.ok(Array.isArray(result));
+                  assert.equal(result.length, 4);
+                  assert.deepEqual(pages, [undefined, '1', '2', '3']);
+                  assert.match(JSON.stringify(result), /needs_owner_choice/);
+                } finally {
+                  await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [id]);
+                }
+              },
+            );
+            await t.test(
+              'one event decision skips routine work without app reads and keeps a later report pending',
+              async () => {
+                await reset();
+                toolSource = true;
+                let decisions = 0;
+                const gated = createProactivity({
+                  ...options,
+                  curator: {
+                    id: 'fixture',
+                    configured: true,
+                    curate: async (request) => {
+                      decisions++;
+                      assert.equal(request.task, 'attention');
+                      assert.match(JSON.stringify(request.input), /Routine synthetic report/);
+                      await transaction(
+                        (client) => gated.signal(sourceId, client, 'A later synthetic report'),
+                        db.pool,
+                      );
+                      return { review: false };
+                    },
+                  },
+                });
+                await transaction(
+                  (client) => gated.signal(sourceId, client, 'Routine synthetic report'),
+                  db.pool,
+                );
+                await db.pool.query(
+                  'UPDATE proactive_sources SET claimed_turn=$3,claimed_signal=signal_version WHERE owner_id=$1 AND source_id=$2',
+                  [ownerId, sourceId, turnId],
+                );
+                const context = (await gated.context(ref))!;
+                assert.equal(await context.screen!({}, new AbortController().signal), true);
+                assert.equal(decisions, 1);
+                assert.equal(sourceReads, 0);
+                let row = (
                   await db.pool.query(
-                    'SELECT next_poll FROM proactive_sources WHERE owner_id=$1 AND source_id=$2',
+                    'SELECT inspected_signal,signal_version,scan_checkpoint FROM proactive_sources WHERE owner_id=$1 AND source_id=$2',
                     [ownerId, sourceId],
                   )
-                ).rows[0].next_poll as Date;
-                assert.ok(held.getTime() > Date.now() + 3_600_000);
-                urgent = true;
-                assert.deepEqual(await screen(), ['handed', false]);
+                ).rows[0];
+                assert.equal(Number(row.inspected_signal), 1);
+                assert.equal(Number(row.signal_version), 2);
+                assert.equal(Number(row.scan_checkpoint.inspected_signal), 0);
+                await db.pool.query("UPDATE turns SET status='failed' WHERE id=$1", [turnId]);
+                await preferences.update({ proactivePaused: true });
+                await gated.due();
+                row = (
+                  await db.pool.query(
+                    'SELECT inspected_signal FROM proactive_sources WHERE owner_id=$1 AND source_id=$2',
+                    [ownerId, sourceId],
+                  )
+                ).rows[0];
+                assert.equal(Number(row.inspected_signal), 0);
+              },
+            );
+            await t.test(
+              'a batch decision never consumes an incomplete report or a stopped turn',
+              async () => {
+                await reset();
+                toolSource = true;
+                let decisions = 0;
+                const gated = createProactivity({
+                  ...options,
+                  curator: {
+                    id: 'fixture',
+                    configured: true,
+                    curate: async () => {
+                      decisions++;
+                      await db.pool.query("UPDATE turns SET status='cancelled' WHERE id=$1", [
+                        turnId,
+                      ]);
+                      return { review: false };
+                    },
+                  },
+                });
+                await transaction((client) => gated.signal(sourceId, client), db.pool);
+                await db.pool.query(
+                  'UPDATE proactive_sources SET claimed_turn=$3,claimed_signal=signal_version WHERE owner_id=$1 AND source_id=$2',
+                  [ownerId, sourceId, turnId],
+                );
+                const context = (await gated.context(ref))!;
+                assert.equal(await context.screen!({}, new AbortController().signal), false);
+                assert.equal(decisions, 0);
+                await transaction(
+                  (client) => gated.signal(sourceId, client, 'Routine synthetic report'),
+                  db.pool,
+                );
+                await db.pool.query(
+                  'UPDATE proactive_sources SET inspected_signal=1,claimed_signal=2 WHERE owner_id=$1 AND source_id=$2',
+                  [ownerId, sourceId],
+                );
+                await assert.rejects(
+                  context.screen!({}, new AbortController().signal),
+                  /stopped|cancelled|no longer active/i,
+                );
+                assert.equal(decisions, 1);
+                assert.equal(sourceReads, 0);
+                assert.equal(
+                  Number(
+                    (
+                      await db.pool.query(
+                        'SELECT inspected_signal FROM proactive_sources WHERE owner_id=$1 AND source_id=$2',
+                        [ownerId, sourceId],
+                      )
+                    ).rows[0].inspected_signal,
+                  ),
+                  1,
+                );
+              },
+            );
+            await t.test('a failed batch decision keeps its source change pending', async () => {
+              await reset();
+              const gated = createProactivity({
+                ...options,
+                curator: {
+                  id: 'fixture',
+                  configured: true,
+                  curate: async () => {
+                    throw new Error('Synthetic attention service failed (HTTP 503).');
+                  },
+                },
+              });
+              await transaction(
+                (client) => gated.signal(sourceId, client, 'Synthetic changed record'),
+                db.pool,
+              );
+              await db.pool.query(
+                'UPDATE proactive_sources SET claimed_turn=$3,claimed_signal=signal_version WHERE owner_id=$1 AND source_id=$2',
+                [ownerId, sourceId, turnId],
+              );
+              const context = (await gated.context(ref))!;
+              await assert.rejects(
+                context.screen!({}, new AbortController().signal),
+                /Synthetic attention service failed/,
+              );
+              await db.pool.query("UPDATE turns SET status='failed' WHERE id=$1", [turnId]);
+              await preferences.update({ proactivePaused: true });
+              await gated.due();
+              const state = (
+                await db.pool.query(
+                  'SELECT inspected_signal,signal_version,change_token FROM proactive_sources WHERE owner_id=$1 AND source_id=$2',
+                  [ownerId, sourceId],
+                )
+              ).rows[0];
+              assert.equal(Number(state.inspected_signal), 0);
+              assert.equal(Number(state.signal_version), 1);
+              assert.equal(state.change_token, null);
+            });
+            await t.test(
+              'one native batch decision sees every record and a changed saved matter bypasses it',
+              async () => {
+                await reset();
+                let decisions = 0;
+                const gated = createProactivity({
+                  ...options,
+                  read: async () => ({
+                    checkedAt: new Date().toISOString(),
+                    records: Array.from({ length: 12 }, (_, i) => ({
+                      id: i === 0 ? 'thread1' : `routine-${i}`,
+                      version,
+                      available: true,
+                      data: { state: i === 0 ? 'open' : 'closed' },
+                    })),
+                  }),
+                  curator: {
+                    id: 'fixture',
+                    configured: true,
+                    curate: async (request) => {
+                      decisions++;
+                      assert.match(JSON.stringify(request.input), /thread1/);
+                      assert.equal(
+                        (request.input as { sources: Array<{ result: { records: unknown[] } }> })
+                          .sources[0]!.result.records.length,
+                        12,
+                      );
+                      return { review: false };
+                    },
+                  },
+                });
+                await transaction(
+                  (client) => gated.signal(sourceId, client, 'Synthetic records changed'),
+                  db.pool,
+                );
+                await db.pool.query(
+                  'UPDATE proactive_sources SET claimed_turn=$3,claimed_signal=signal_version WHERE owner_id=$1 AND source_id=$2',
+                  [ownerId, sourceId, turnId],
+                );
+                const context = (await gated.context(ref))!;
+                assert.equal(await context.screen!({}, new AbortController().signal), true);
+                assert.equal(decisions, 1);
+                await save();
+                version = 'v2';
+                assert.ok(Array.isArray(await context.screen!({}, new AbortController().signal)));
+                assert.equal(decisions, 1);
+              },
+            );
+            await t.test(
+              'quiet hours hold source changes for one morning batch without reads',
+              async () => {
+                await reset();
+                const clock = (offset: number) =>
+                  new Date(Date.now() + offset).toISOString().slice(11, 16);
+                await preferences.update({
+                  quietHoursEnabled: true,
+                  quietStart: clock(-60000),
+                  quietEnd: clock(3600000),
+                });
+                let decisions = 0;
+                const held = createProactivity({
+                  ...options,
+                  curator: {
+                    id: 'fixture',
+                    configured: true,
+                    curate: async () => {
+                      decisions++;
+                      return { review: true };
+                    },
+                  },
+                });
+                await transaction(
+                  (client) => held.signal(sourceId, client, 'Synthetic queued change'),
+                  db.pool,
+                );
+                await db.pool.query(
+                  "UPDATE proactive_sources SET claimed_turn=$3,claimed_signal=signal_version,next_poll=now()+interval '1 day' WHERE owner_id=$1 AND source_id=$2",
+                  [ownerId, sourceId, turnId],
+                );
+                const context = (await held.context(ref))!;
+                assert.equal(await context.screen!({}, new AbortController().signal), true);
+                assert.equal(sourceReads, 0);
+                assert.equal(decisions, 0);
+                const deferred = (
+                  await db.pool.query(
+                    'SELECT claimed_turn,claimed_token,claimed_policy,claimed_signal,next_poll FROM proactive_sources WHERE owner_id=$1 AND source_id=$2',
+                    [ownerId, sourceId],
+                  )
+                ).rows[0];
+                assert.equal(deferred.claimed_turn, null);
+                assert.equal(deferred.claimed_token, null);
+                assert.equal(deferred.claimed_policy, null);
+                assert.equal(Number(deferred.claimed_signal), 0);
+                assert.ok(deferred.next_poll.getTime() <= Date.now());
+                await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [turnId]);
+                for (let tick = 0; tick < 16; tick++) {
+                  await transaction(
+                    (client) => held.signal(sourceId, client, `Synthetic night change ${tick}`),
+                    db.pool,
+                  );
+                  assert.equal(await held.due(), undefined);
+                }
+                const row = (
+                  await db.pool.query(
+                    'SELECT inspected_signal,claimed_signal,signal_version FROM proactive_sources WHERE owner_id=$1 AND source_id=$2',
+                    [ownerId, sourceId],
+                  )
+                ).rows[0];
+                assert.equal(Number(row.inspected_signal), 0);
+                assert.equal(Number(row.signal_version), 17);
+                assert.equal(sourceReads, 0);
+                assert.equal(decisions, 0);
                 await preferences.update({ quietHoursEnabled: false });
-                screening.release(turnId);
+                let batches = 0;
+                inspectObserver = async (next) => {
+                  if (!next.prompt.startsWith('Assess the due sources')) return;
+                  batches++;
+                  return { status: 'succeeded' };
+                };
+                try {
+                  const next = await held.due();
+                  assert.ok(next && next !== turnId);
+                  await waitFor(settled(next));
+                  assert.equal(batches, 1);
+                } finally {
+                  inspectObserver = undefined;
+                }
+              },
+            );
+            await t.test(
+              'quiet hours check only known urgent matters and hold source sweeps',
+              async () => {
+                await reset();
+                const deadline = new Date(Date.now() + 1800000).toISOString();
+                await save({
+                  matterKey: 'routine-night',
+                  impact: 'medium',
+                  delivery: 'private',
+                  deadline,
+                });
+                await db.pool.query(
+                  `INSERT INTO proactive_issues(id,owner_id,identity,proposal,sources,policy)
+                  SELECT gen_random_uuid(),owner_id,'fixture-urgent-night',
+                    proposal||'{"matterKey":"urgent-night","impact":"high"}'::jsonb,sources,policy
+                  FROM proactive_issues WHERE owner_id=$1 LIMIT 1`,
+                  [ownerId],
+                );
+                await db.pool.query(
+                  "UPDATE proactive_issues SET next_check=now()-interval '1 minute' WHERE owner_id=$1",
+                  [ownerId],
+                );
+                await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [turnId]);
+                const clock = (offset: number) =>
+                  new Date(Date.now() + offset).toISOString().slice(11, 16);
+                await preferences.update({
+                  quietHoursEnabled: true,
+                  quietStart: clock(-60000),
+                  quietEnd: clock(3600000),
+                });
+                await transaction(
+                  (client) => engine.signal(sourceId, client, 'Synthetic routine night change'),
+                  db.pool,
+                );
+                inspectObserver = async (next) => {
+                  if (!next.prompt.startsWith('Assess the due sources')) return;
+                  const rows = (
+                    await db.pool.query(
+                      'SELECT proposal FROM proactive_issues WHERE owner_id=$1 AND claimed_turn=$2',
+                      [ownerId, next.turnId],
+                    )
+                  ).rows;
+                  assert.deepEqual(
+                    rows.map((row) => row.proposal.matterKey),
+                    ['urgent-night'],
+                  );
+                  assert.equal(
+                    (
+                      await db.pool.query(
+                        'SELECT 1 FROM proactive_sources WHERE owner_id=$1 AND claimed_turn=$2',
+                        [ownerId, next.turnId],
+                      )
+                    ).rowCount,
+                    0,
+                  );
+                  return { status: 'succeeded' };
+                };
+                try {
+                  const next = await engine.due();
+                  assert.ok(next && next !== turnId);
+                  await waitFor(settled(next));
+                  const held = (
+                    await db.pool.query(
+                      "SELECT next_check FROM proactive_issues WHERE owner_id=$1 AND identity<>'fixture-urgent-night'",
+                      [ownerId],
+                    )
+                  ).rows[0];
+                  assert.ok(held.next_check.getTime() > Date.now() + 50 * 60000);
+                } finally {
+                  inspectObserver = undefined;
+                }
+              },
+            );
+            await t.test(
+              '100 idle app sources start no reads or observer turns across 31 days of half-hour checks',
+              async () => {
+                await reset();
+                await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [turnId]);
+                let catalogs = 0;
+                const idle = createProactivity({
+                  ...options,
+                  sources: async () => {
+                    catalogs++;
+                    return Array.from({ length: 100 }, (_, index) => ({
+                      id: `fixture-idle:${index}`,
+                      label: 'Synthetic idle app',
+                      description: 'Synthetic idle records',
+                      readable: true,
+                      revision: 'fixture-one',
+                      pollIntervalMs: 30 * 60_000,
+                      tools: true,
+                    }));
+                  },
+                });
+                const start = performance.now();
+                for (let tick = 0; tick < 31 * 48; tick++)
+                  assert.equal(await idle.due(), undefined);
+                assert.ok(catalogs >= 31 * 48);
+                assert.equal(sourceReads, 0);
+                t.diagnostic(
+                  `Idle checks: 1488; sources: 100; reads: 0; observer turns: 0; time: ${Math.round(performance.now() - start)} ms`,
+                );
+              },
+            );
+            await t.test('preparation reservations use exact decimal boundaries', async () => {
+              const decimalOwner = `synthetic-decimal-${randomUUID()}`;
+              const exact = createLedger({ pool: db.pool, ownerId: decimalOwner });
+              await exact.initialize();
+              try {
+                await db.pool.query(
+                  'INSERT INTO preferences(owner_id,proactive_paused) VALUES($1,false)',
+                  [decimalOwner],
+                );
+                await exact.setLimits({ preparationUsd: 1 });
+                await exact.withPreparation(randomUUID(), async () => {
+                  for (let request = 0; request < 10; request++) await exact.reserve(0.1);
+                  assert.equal((await exact.preparationLimit()).reservedUsd, 1);
+                  assert.equal((await exact.preparationLimit()).reached, true);
+                  await assert.rejects(exact.reserve(1e-17), /preparation allowance/);
+                });
+                await db.pool.query('DELETE FROM preparation_reservations WHERE owner_id=$1', [
+                  decimalOwner,
+                ]);
+                const scope = randomUUID();
+                const actual = 0.1 + 0.2;
+                await exact.withPreparation(scope, async () => {
+                  const settle = await exact.reserve(0.5);
+                  await db.pool.query(
+                    'INSERT INTO model_usage(id,owner_id,cost_usd,details) VALUES($1,$2,$3,$4::jsonb)',
+                    [
+                      randomUUID(),
+                      decimalOwner,
+                      actual,
+                      JSON.stringify({ preparation: true, preparationId: scope }),
+                    ],
+                  );
+                  await settle(actual);
+                });
+                assert.equal((await exact.preparationLimit()).reservedUsd, 0);
+                assert.equal((await exact.preparationLimit()).spentUsd, actual);
+              } finally {
+                await db.pool.query('DELETE FROM model_usage WHERE owner_id=$1', [decimalOwner]);
+                await db.pool.query('DELETE FROM preparation_reservations WHERE owner_id=$1', [
+                  decimalOwner,
+                ]);
+                await db.pool.query('DELETE FROM spending_limits WHERE owner_id=$1', [
+                  decimalOwner,
+                ]);
+                await db.pool.query('DELETE FROM preferences WHERE owner_id=$1', [decimalOwner]);
+              }
+            });
+            await t.test('all spending limit changes use the preparation lock', async () => {
+              const previous = await ledger.limits();
+              const previousPreparation = await ledger.preparationLimit();
+              try {
+                const held = await db.pool.connect();
+                const pending: Array<Promise<unknown>> = [];
+                let begun = false;
+                try {
+                  await held.query('BEGIN');
+                  begun = true;
+                  await held.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [
+                    `preparation-budget:${ownerId}`,
+                  ]);
+                  const pid = (await held.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+                  pending.push(
+                    ledger.setLimits({ taskUsd: 9 }),
+                    ledger.setLimits({ monthlyUsd: 10 }),
+                    ledger.setLimits({ preparationUsd: 2 }),
+                  );
+                  await waitFor(
+                    async () =>
+                      Number(
+                        (
+                          await db.pool.query(
+                            'SELECT count(*) AS n FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid))',
+                            [pid],
+                          )
+                        ).rows[0].n,
+                      ) === 3,
+                  );
+                  await held.query('COMMIT');
+                  begun = false;
+                } finally {
+                  if (begun) await held.query('ROLLBACK').catch(() => {});
+                  held.release(begun);
+                  await Promise.all(pending);
+                }
+                const current = await ledger.limits();
+                assert.equal(current.taskUsd, 9);
+                assert.equal(current.limit?.monthlyUsd, 10);
+                assert.equal((await ledger.preparationLimit()).monthlyUsd, 2);
+              } finally {
+                await ledger.setLimits({
+                  monthlyUsd: previous.limit?.monthlyUsd ?? null,
+                  taskUsd: previous.taskUsd,
+                  preparationUsd: previousPreparation.monthlyUsd,
+                });
+              }
+            });
+            await t.test('request admission counts recorded cost above a reservation', async () => {
+              await reset();
+              const previous = await ledger.preparationLimit();
+              const scope = randomUUID();
+              const usageId = randomUUID();
+              try {
+                await ledger.setLimits({ preparationUsd: previous.spentUsd + 1 });
+                await ledger.withPreparation(scope, async () => {
+                  const settle = await ledger.reserve(0.1);
+                  await db.pool.query(
+                    'INSERT INTO model_usage(id,owner_id,cost_usd,details) VALUES($1,$2,0.3,$3::jsonb)',
+                    [usageId, ownerId, JSON.stringify({ preparation: true, preparationId: scope })],
+                  );
+                  await assert.rejects(ledger.reserve(0.8), /preparation allowance/);
+                  await settle(0.3);
+                });
+              } finally {
+                await db.pool.query('DELETE FROM model_usage WHERE id=$1', [usageId]);
+                await db.pool.query(
+                  'DELETE FROM preparation_reservations WHERE owner_id=$1 AND id=$2',
+                  [ownerId, scope],
+                );
+                await ledger.setLimits({ preparationUsd: previous.monthlyUsd });
+              }
+            });
+            await t.test(
+              'preparation reserves concurrent requests, settles usage once, and keeps chat outside its allowance',
+              async () => {
+                await reset();
+                const previous = await ledger.preparationLimit();
+                await ledger.setLimits({ preparationUsd: 1 });
+                const scope = randomUUID();
+                const lateScope = randomUUID();
+                const first = { ...ref, turnId: randomUUID() };
+                await db.pool.query(
+                  "INSERT INTO turns(id,owner_id,thread_id,source,prompt,status,background,proactive,started_at) VALUES($1,$2,$3,'event','Synthetic budget check','running',true,true,now())",
+                  [first.turnId, ownerId, currentThread],
+                );
+                try {
+                  await ledger.withPreparation(first.turnId, async () => {
+                    let estimates = 0;
+                    const settled = await ledger.reserve(() => {
+                      estimates++;
+                      return 0.75;
+                    });
+                    assert.equal(estimates, 1);
+                    const parallel = await Promise.allSettled([
+                      ledger.reserve(0.2),
+                      ledger.reserve(0.2),
+                    ]);
+                    assert.equal(parallel.filter((item) => item.status === 'fulfilled').length, 1);
+                    assert.equal(parallel.filter((item) => item.status === 'rejected').length, 1);
+                    for (const item of parallel)
+                      if (item.status === 'fulfilled') await item.value(0);
+                    await settled(0.1);
+                    await settled(0.1);
+                    await (
+                      await ledger.reserve(0.6)
+                    )(0);
+                    const curator = ledger.curator({
+                      id: 'fixture',
+                      configured: true,
+                      curate: async (_request, _signal, report) => {
+                        report?.({ id: randomUUID(), model: 'fixture', costUsd: 0.1 });
+                        return {};
+                      },
+                    });
+                    await ledger.withTurn(first.turnId, () =>
+                      curator.curate({
+                        task: 'review',
+                        instructions: 'Synthetic check',
+                        input: {},
+                      }),
+                    );
+                  });
+                  assert.equal((await ledger.preparationLimit()).spentUsd, 0.1);
+                  assert.equal(
+                    (
+                      await db.pool.query(
+                        'SELECT count(*)::int AS n FROM preparation_reservations WHERE owner_id=$1',
+                        [ownerId],
+                      )
+                    ).rows[0].n,
+                    0,
+                  );
+                  await ledger.withPreparation(scope, async () => {
+                    await assert.rejects(ledger.reserve(null), /no cost estimate/);
+                    await assert.rejects(ledger.reserve(0.95), /preparation allowance/);
+                  });
+                  assert.equal((await ledger.preparationLimit()).reached, true);
+                  await ledger.reserve(() =>
+                    assert.fail('Owner work needs no preparation estimate.'),
+                  );
+                  let releaseLate!: () => void;
+                  const gate = new Promise<void>((resolve) => {
+                    releaseLate = resolve;
+                  });
+                  let pending!: Promise<void>;
+                  await ledger.withPreparation(lateScope, async () => {
+                    const settle = await ledger.reserve(0.8);
+                    pending = (async () => {
+                      await gate;
+                      await assert.rejects(ledger.reserve(0.01), /has stopped/);
+                      await settle(0.2);
+                      await ledger
+                        .curator({
+                          id: 'fixture-late',
+                          configured: true,
+                          curate: async (_request, _signal, report) => {
+                            report?.({ id: randomUUID(), model: 'fixture', costUsd: 0.2 });
+                            return {};
+                          },
+                        })
+                        .curate({
+                          task: 'review',
+                          instructions: 'Synthetic late report',
+                          input: {},
+                        });
+                    })();
+                  });
+                  assert.equal((await ledger.preparationLimit()).reservedUsd, 0.8);
+                  await ledger.withPreparation(randomUUID(), async () => {
+                    await assert.rejects(ledger.reserve(0.2), /preparation allowance/);
+                  });
+                  releaseLate();
+                  await pending;
+                  const final = await ledger.preparationLimit();
+                  assert.ok(Math.abs(final.spentUsd - 0.3) < 1e-12);
+                  assert.equal(final.reservedUsd, 0);
+                  assert.equal(final.reached, false);
+                  await preferences.update({ proactivePaused: true });
+                  await ledger.withPreparation(randomUUID(), async () => {
+                    await assert.rejects(ledger.reserve(0.01), /preparation is paused/);
+                  });
+                  await ledger.withTurn(
+                    first.turnId,
+                    () =>
+                      ledger.withPreparation(randomUUID(), async () => {
+                        await (
+                          await ledger.reserve(0.01)
+                        )(0);
+                      }),
+                    false,
+                    false,
+                  );
+                  await preferences.update({ proactivePaused: false });
+                  const admission = await db.pool.connect();
+                  let delayed!: Promise<unknown>;
+                  let committed = false;
+                  try {
+                    await admission.query('BEGIN');
+                    await admission.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [
+                      `preparation-budget:${ownerId}`,
+                    ]);
+                    await ledger.withPreparation(randomUUID(), async () => {
+                      delayed = ledger.reserve(0.1).then(
+                        () => undefined,
+                        (error) => error,
+                      );
+                      await delay(5);
+                    });
+                    await admission.query('COMMIT');
+                    committed = true;
+                  } finally {
+                    if (!committed) await admission.query('ROLLBACK').catch(() => {});
+                    admission.release(!committed);
+                    await delayed;
+                  }
+                  assert.match(String(await delayed), /has stopped/);
+                  assert.equal((await ledger.preparationLimit()).reservedUsd, 0);
+                } finally {
+                  await ledger.setLimits({ preparationUsd: previous.monthlyUsd });
+                  await db.pool.query(
+                    "DELETE FROM model_usage WHERE turn_id=$1 OR details->>'preparationId'=$2",
+                    [first.turnId, lateScope],
+                  );
+                  await db.pool.query(
+                    'DELETE FROM preparation_reservations WHERE owner_id=$1 AND id=$2',
+                    [ownerId, lateScope],
+                  );
+                  await db.pool.query(
+                    "UPDATE turns SET status='succeeded',finished_at=now() WHERE id=$1",
+                    [first.turnId],
+                  );
+                }
               },
             );
             await t.test(
@@ -7946,23 +10147,13 @@ test(
                   const clock = (offset: number) =>
                     new Date(Date.now() + offset).toISOString().slice(11, 16);
                   await preferences.update({
-                    quietHoursEnabled: quietHours,
+                    quietHoursEnabled: false,
                     quietStart: clock(-60_000),
                     quietEnd: clock(3_600_000),
                   });
                   changeToken = 'stable-source-token';
                   const report = 'Meeting moved from 10:00 to 09:00 during the source read.';
-                  const screening = createProactivity({
-                    ...options,
-                    curator: {
-                      id: 'report-race',
-                      configured: true,
-                      curate: async ({ input }) =>
-                        'quietEnd' in (input as object)
-                          ? { urgent: (input as { events: string }).events.includes(report) }
-                          : { attention: quietHours },
-                    },
-                  });
+                  const screening = createProactivity(options);
                   await transaction((client) => engine.signal(sourceId, client), db.pool);
                   await db.pool.query(
                     'UPDATE proactive_sources SET claimed_turn=$3,claimed_signal=signal_version WHERE owner_id=$1 AND source_id=$2',
@@ -7975,7 +10166,9 @@ test(
                   let handed = false;
                   try {
                     const context = (await screening.context(ref))!;
-                    assert.equal(await context.screen!({}, new AbortController().signal), true);
+                    assert.ok(
+                      Array.isArray(await context.screen!({}, new AbortController().signal)),
+                    );
                     const pending = (
                       await db.pool.query(
                         'SELECT events,next_poll,signal_version>inspected_signal AS dirty FROM proactive_sources WHERE owner_id=$1 AND source_id=$2',
@@ -8007,6 +10200,11 @@ test(
                         );
                       return { status: 'succeeded' };
                     };
+                    if (quietHours) {
+                      await preferences.update({ quietHoursEnabled: true });
+                      assert.equal(await engine.due(), undefined);
+                      await preferences.update({ quietHoursEnabled: false });
+                    }
                     const next = await engine.due();
                     assert.ok(next && next !== turnId);
                     await waitFor(settled(next));
@@ -8870,10 +11068,9 @@ test(
           const presentedFailures: string[] = [];
           presentInterruption = async (_threadId, input) => {
             if (input.kind === 'failed') presentedFailures.push(input.error);
-            return input.kind === 'failed' && input.error.includes('503 Service Unavailable')
-              ? 'Synthetic provider failure.'
-              : '';
+            return 'Synthetic presenter text.';
           };
+          dependencies.modelAlternative = () => 'Synthetic alternative connection.';
           const prefix = 'The model request failed: openrouter / anthropic/fixture-model: ';
           const nestedQuota =
             prefix +
@@ -9156,7 +11353,7 @@ test(
                   (
                     await db.pool.query(
                       "SELECT 1 FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
-                      [submitted.turnId, `failure:${submitted.turnId}`],
+                      [submitted.turnId, `model-failure:${submitted.turnId}`],
                     )
                   ).rowCount,
                 ),
@@ -9169,18 +11366,23 @@ test(
               const shown = (
                 await db.pool.query(
                   "SELECT text FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
-                  [submitted.turnId, `failure:${submitted.turnId}`],
+                  [submitted.turnId, `model-failure:${submitted.turnId}`],
                 )
               ).rows[0].text as string;
               assert.equal(turn.status, 'failed');
-              assert.equal(presentedFailures.at(-1), turn.error);
-              assert.ok(
-                shown.includes(
-                  item.prompt === 'model-unavailable-fixture'
-                    ? 'Synthetic provider failure.'
-                    : turn.error,
-                ),
+              assert.equal(presentedFailures.length, 0);
+              assert.ok(shown.includes(turn.error));
+              assert.equal(
+                (
+                  await db.pool.query(
+                    "SELECT presentation FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
+                    [submitted.turnId, `model-failure:${submitted.turnId}`],
+                  )
+                ).rows[0].presentation,
+                null,
               );
+              assert.match(shown, /Synthetic alternative connection\./);
+              assert.equal((await request('GET', '/api/state')).json().chatRecovery, undefined);
               assert.match(shown, /\]\(\/settings\/models\)/);
               assert.ok(turn.error.length <= 2000);
               assert.ok(turn.error.startsWith(prefix));
@@ -9199,6 +11401,149 @@ test(
           } finally {
             for (const item of cases) modelErrors.delete(item.prompt);
             presentInterruption = previousPresenter;
+            delete dependencies.modelAlternative;
+          }
+        },
+      );
+
+      await t.test(
+        'a model request that found no network states that cause instead of model settings',
+        async () => {
+          dependencies.modelAlternative = () => 'Synthetic alternative connection.';
+          const prefix =
+            'The model request failed: anthropic / fixture-model: Connection error.: getaddrinfo ENOTFOUND synthetic-offline.invalid';
+          const cases = [
+            { prompt: 'offline desktop schedule fixture', code: 'ENOTFOUND', desktop: true },
+            {
+              prompt: 'offline desktop chat fixture',
+              code: 'EAI_AGAIN',
+              desktop: true,
+              chat: true,
+            },
+            { prompt: 'offline server schedule fixture', code: 'ENETUNREACH', desktop: false },
+            {
+              prompt: 'offline owner endpoint schedule fixture',
+              code: 'ENOTFOUND',
+              desktop: true,
+              provider: 'compatible',
+            },
+            {
+              prompt: 'offline azure endpoint schedule fixture',
+              code: 'EAI_AGAIN',
+              desktop: true,
+              provider: 'azure',
+            },
+            {
+              prompt: 'offline bedrock schedule fixture',
+              code: 'ENOTFOUND',
+              desktop: true,
+              provider: 'amazon-bedrock',
+            },
+          ];
+          const previousWorkModel = dependencies.workModel;
+          try {
+            for (const item of cases) {
+              const raw = `${prefix} (transport cause: ${item.code}) [request phase: request]`;
+              modelErrors.set(item.prompt, raw);
+              dependencies.desktopRuntime = item.desktop;
+              dependencies.workModel = async () => ({
+                selection: { connectionId: randomUUID(), modelId: 'fixture-model', effort: 'low' },
+                provider: item.provider ?? 'anthropic',
+                name: 'fixture-model',
+              });
+              const scheduleId = randomUUID();
+              const turnId = item.chat
+                ? (await thread.submitUserMessage(item.prompt)).turnId
+                : await transaction(async (client) => {
+                    await client.query(
+                      `INSERT INTO schedules(id,owner_id,title,prompt,cron,time_zone,next_run_at,revision)
+                       VALUES($1,$2,$3,$4,'0 8 * * *','Europe/Lisbon',now()+interval '1 day',3)`,
+                      [scheduleId, ownerId, item.prompt, item.prompt],
+                    );
+                    const id = await thread.enqueueTurn(item.prompt, {
+                      source: 'schedule',
+                      sourceId: `schedule:${scheduleId}:${randomUUID()}`,
+                      client,
+                    });
+                    await client.query(
+                      `INSERT INTO schedule_runs(id,owner_id,schedule_id,schedule_revision,job_id,title,turn_id,scheduled_for,time_zone)
+                       VALUES($1,$2,$3,0,$4,$5,$6,now()-interval '72 minutes','Europe/Lisbon')`,
+                      [randomUUID(), ownerId, scheduleId, randomUUID(), item.prompt, id],
+                    );
+                    return id;
+                  }, db.pool);
+              await waitFor(settled(turnId));
+              const streamId = `${item.provider ? 'model' : 'offline'}-failure:${turnId}`;
+              await waitFor(async () =>
+                Boolean(
+                  (
+                    await db.pool.query(
+                      "SELECT 1 FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
+                      [turnId, streamId],
+                    )
+                  ).rowCount,
+                ),
+              );
+              const turn = (
+                await db.pool.query('SELECT status,error FROM turns WHERE id=$1', [turnId])
+              ).rows[0] as { status: string; error: string };
+              const { text: shown, presentation } = (
+                await db.pool.query(
+                  "SELECT text,presentation FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
+                  [turnId, streamId],
+                )
+              ).rows[0] as { text: string; presentation: Record<string, unknown> | null };
+              const hinted = /\]\(https:\/\/nod\.n8n\.io\/docs\/deploy\/self-host\/\)/;
+              if (item.chat) assert.equal(presentation, null);
+              else
+                assert.deepEqual(
+                  {
+                    type: presentation?.type,
+                    scheduleId: presentation?.scheduleId,
+                    outcome: presentation?.outcome,
+                    code: presentation?.code,
+                    link: presentation?.link,
+                    late:
+                      Date.parse(String(presentation?.startedAt)) -
+                        Date.parse(String(presentation?.dueAt)) >
+                      600_000,
+                    next: typeof presentation?.nextRunAt,
+                    revision: presentation?.revision,
+                  },
+                  {
+                    type: 'schedule-run',
+                    scheduleId,
+                    outcome: 'failed',
+                    code: item.provider ? undefined : item.code,
+                    link: item.provider ? 'models' : item.desktop ? 'server' : undefined,
+                    late: true,
+                    next: 'string',
+                    revision: 0,
+                  },
+                );
+              assert.equal(turn.status, 'failed');
+              assert.ok(shown.includes(turn.error));
+              if (item.provider) {
+                assert.equal(turn.error, raw);
+                assert.match(shown, /\]\(\/settings\/models\)/);
+                assert.doesNotMatch(shown, hinted);
+                continue;
+              }
+              assert.match(turn.error, /\bAnthropic\b/);
+              assert.ok(turn.error.includes(`(${item.code})`));
+              assert.doesNotMatch(
+                turn.error,
+                /transport cause|request phase|getaddrinfo|synthetic-offline/,
+              );
+              assert.doesNotMatch(shown, /settings\/models|Synthetic alternative connection/);
+              if (item.desktop && !item.chat) assert.match(shown, hinted);
+              else assert.doesNotMatch(shown, hinted);
+            }
+          } finally {
+            for (const item of cases) modelErrors.delete(item.prompt);
+            delete dependencies.modelAlternative;
+            delete dependencies.desktopRuntime;
+            dependencies.workModel = previousWorkModel;
           }
         },
       );
@@ -9336,6 +11681,118 @@ test(
           assert.equal(sends, 3);
         },
       );
+
+      await t.test(
+        'expired sign-in links reach the next turn without closing another session',
+        async () => {
+          await waitFor(settledThread);
+          const originalObserver = inspectObserver;
+          const mainPrompt = 'Synthetic Google sign-in request';
+          const otherPrompt = 'Synthetic separate sign-in request';
+          const mainOrigin = 'https://lab897-main.test';
+          const otherOrigin = 'https://lab897-other.test';
+          const links = new Map<string, string>();
+          inspectObserver = async (context) => {
+            if (context.prompt !== mainPrompt && context.prompt !== otherPrompt) return;
+            const main = context.prompt === mainPrompt;
+            const { url } = await vault.request(
+              { threadId: context.threadId, turnId: context.turnId, browserId: context.sessionId },
+              ownerId,
+              {
+                origin: main ? mainOrigin : otherOrigin,
+                label: main ? 'Synthetic Google sign-in' : 'Synthetic other sign-in',
+                kind: 'password',
+                passwordSelector: '#password',
+              },
+            );
+            links.set(context.prompt, url);
+            return {
+              status: 'waiting_credentials',
+              waitingFor: 'credentials',
+              message: `Sign in. [Continue](${url})`,
+            };
+          };
+          const formStatus = async (url: string) =>
+            (await request('GET', url.replace('/vault/', '/api/credential-requests/'))).json()
+              .status as string;
+          try {
+            const signIn = await thread.submitUserMessage(mainPrompt);
+            await waitFor(settled(signIn.turnId));
+            assert.equal(await turnStatus(signIn.turnId), 'waiting');
+            const mainLink = links.get(mainPrompt)!;
+            assert.equal(await formStatus(mainLink), 'pending');
+
+            const other = await thread.enqueueTurn(otherPrompt, {
+              source: 'event',
+              sessionId: randomUUID(),
+            });
+            await waitFor(settled(other));
+            assert.equal(await turnStatus(other), 'waiting');
+            const otherLink = links.get(otherPrompt)!;
+            assert.equal(await formStatus(otherLink), 'pending');
+
+            const next = await thread.submitUserMessage('Synthetic reminder follow-up');
+            await waitFor(settled(next.turnId));
+            assert.equal(await formStatus(mainLink), 'expired');
+            assert.equal(await formStatus(otherLink), 'pending');
+            assert.ok(ran(next.turnId)!.history.some(({ text }) => text.includes(mainLink)));
+            assert.deepEqual(
+              (ran(next.turnId)!.credentialRequests ?? []).filter(
+                (item) => item.origin === mainOrigin || item.origin === otherOrigin,
+              ),
+              [
+                {
+                  turnId: signIn.turnId,
+                  origin: mainOrigin,
+                  label: 'Synthetic Google sign-in',
+                  kind: 'password',
+                  status: 'expired',
+                },
+              ],
+            );
+            const instruction = firstInstruction(ran(next.turnId)!, true, new Set());
+            const requestData = JSON.parse(
+              instruction.split('Request data (JSON):\n')[1]!.split('\n\n')[0]!,
+            ) as { credentialRequests: string };
+            assert.match(requestData.credentialRequests, /lab897-main\.test/);
+            assert.match(requestData.credentialRequests, /"status":"expired"/);
+
+            const batchId = randomUUID();
+            const added = await db.pool.query<{ id: string }>(
+              `INSERT INTO credential_requests (
+                 id,token_hash,owner_id,thread_id,turn_id,root_turn_id,origin,label,kind,
+                 status,selectors,inspection,browser_id,flow_id,flow_expires_at,created_at
+               ) SELECT md5($2||':'||series.n::text),md5($2||':token:'||series.n::text),
+                 r.owner_id,r.thread_id,r.turn_id,r.root_turn_id,
+                 'https://lab897-extra-'||series.n::text||'.test','Synthetic previous sign-in',r.kind,
+                 'superseded',r.selectors,r.inspection,r.browser_id,r.flow_id,r.flow_expires_at,
+                 r.created_at+series.n*interval '1 second'
+               FROM credential_requests r CROSS JOIN generate_series(1,30) AS series(n)
+               WHERE r.turn_id=$1 RETURNING id`,
+              [signIn.turnId, batchId],
+            );
+            try {
+              const sessionId = (
+                await db.pool.query<{ session_id: string }>(
+                  'SELECT session_id FROM turns WHERE id=$1',
+                  [signIn.turnId],
+                )
+              ).rows[0]!.session_id;
+              const statuses = await vault.requestStatuses(signIn.threadId, sessionId, [
+                signIn.turnId,
+              ]);
+              assert.equal(statuses.length, 31);
+              assert.equal(statuses.find((item) => item.origin === mainOrigin)?.status, 'expired');
+            } finally {
+              await db.pool.query('DELETE FROM credential_requests WHERE id=ANY($1::text[])', [
+                added.rows.map((row) => row.id),
+              ]);
+            }
+          } finally {
+            inspectObserver = originalObserver;
+          }
+        },
+      );
     } finally {
       for (const resolve of gates.values()) resolve();
       events.off('event', onEvent);
@@ -9415,7 +11872,7 @@ test(
   { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
   async () => {
     const { pool, ownerId, store, post, memory, close } = await memoryFixture();
-    const { state, curator } = scriptedCurator();
+    const { calls, state, curator } = scriptedCurator();
     const learning = createMemoryLearning({ pool, ownerId, memory, curator });
     const add = (area: string, slug: string, text: string) => (m: number) => ({
       op: 'add',
@@ -9443,6 +11900,17 @@ test(
         archived: [],
       });
       assert.equal(await memory.context(), `${path}: ${short}`);
+      const invented = randomUUID();
+      const asked = calls.length;
+      await assert.rejects(
+        learning.remember({ messages: [invented] }, first.sourceMessageId),
+        (error: Error) => error.message.includes(invented),
+      );
+      await assert.rejects(
+        learning.remember({ messages: [short] }, first.sourceMessageId),
+        (error: Error) => error.name !== 'ZodError' && !error.message.includes(short),
+      );
+      assert.equal(calls.length, asked);
       const reopened = createMemoryService({ pool, ownerId, store });
       assert.equal(((await reopened.read({ path })) as { text: string }).text, short);
       const detailed = 'Make progress reports detailed from now on.';
@@ -9545,6 +12013,55 @@ test(
       await remember([add('about', 'before-clear', beforeClear)], beforeClearMessage);
       assert.equal((await memory.view()).notes.length, 1);
       curator.curate = curate;
+
+      const tea = 'I drink synthetic green tea every morning.';
+      const unquoted = add('about', 'coffee', 'Drinks synthetic black coffee.');
+      const secret = 'The store key is sk-fixturefixture1234.';
+      const leaked = (m: number) => ({ ...add('about', 'key', secret)(m), quote: tea });
+      const notesBefore = (await memory.view()).notes.length;
+      await assert.rejects(
+        remember([unquoted, leaked], await post(tea)),
+        (error: Error) =>
+          /quote/.test(error.message) &&
+          /secret/.test(error.message) &&
+          /Nothing was saved/.test(error.message) &&
+          !error.message.includes('sk-fixture'),
+      );
+      assert.equal((await memory.view()).notes.length, notesBefore);
+      await assert.rejects(
+        remember([add('about', 'tea', tea), unquoted], await post(tea)),
+        /quote/,
+      );
+      assert.equal((await memory.view()).notes.length, notesBefore);
+      await remember([add('about', 'tea', tea)], await post(tea));
+      const moved = 'I switched from synthetic green tea to coffee.';
+      await assert.rejects(
+        remember(
+          [
+            (m: number) => ({
+              op: 'archive',
+              path: 'about/tea',
+              reason: 'obsolete',
+              m: [m],
+              quote: moved,
+            }),
+            unquoted,
+            add('about', 'switch', moved),
+          ],
+          await post(moved),
+        ),
+        /Nothing was saved/,
+      );
+      assert.ok((await memory.view()).notes.some((note) => note.path === 'about/tea'));
+
+      const older = await post('My synthetic library card renews in March.');
+      for (let index = 0; index < 10; index++) await post(`Synthetic filler ${index}.`);
+      const renewal = await post('Remember that renewal month.');
+      state.answer = () => ({ ops: [] });
+      await learning.remember({}, renewal.sourceMessageId);
+      assert.doesNotMatch(JSON.stringify(calls.at(-1)!.input), /renews in March/);
+      await learning.remember({ messages: [older.id] }, renewal.sourceMessageId);
+      assert.match(JSON.stringify(calls.at(-1)!.input), /renews in March/);
     } finally {
       await close();
     }
@@ -9946,6 +12463,119 @@ test(
 );
 
 test(
+  'bug report drafts send their stored summary once, after a rejected attempt, and only for their owner',
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
+  async (t) => {
+    const f = await feedbackFixture(t);
+    await f.pool.query(`CREATE TABLE IF NOT EXISTS feedback_drafts (
+      id uuid PRIMARY KEY, owner_id text NOT NULL, thread_id uuid NOT NULL,
+      summary text NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
+    )`);
+    const owner = await f.open();
+    const other = await f.open();
+    const id = randomUUID();
+    await f.pool.query(
+      'INSERT INTO feedback_drafts(id,owner_id,thread_id,summary) VALUES($1,$2,$3,$4)',
+      [id, owner.ownerId, randomUUID(), 'Synthetic draft summary.'],
+    );
+    const send = {
+      method: 'POST' as const,
+      url: `/api/feedback/drafts/${id}/send`,
+      payload: { reportId: null },
+    };
+    assert.equal(
+      (await other.app.inject({ method: 'GET', url: `/api/feedback/drafts/${id}` })).statusCode,
+      404,
+    );
+    assert.equal((await other.app.inject(send)).statusCode, 404);
+    assert.equal(f.state.envelopes.length, 0);
+    f.state.receiptStatus = 'rejected';
+    assert.equal((await owner.app.inject(send)).json().status, 'rejected');
+    assert.equal(
+      (await owner.app.inject({ method: 'GET', url: `/api/feedback/drafts/${id}` })).json().receipt,
+      null,
+    );
+    assert.equal(
+      (await owner.app.inject({ method: 'GET', url: `/api/feedback/${id}` })).json().status,
+      'rejected',
+    );
+    f.state.receiptStatus = 'submitted';
+    assert.equal((await owner.app.inject(send)).json().status, 'submitted');
+    assert.equal((await owner.app.inject(send)).json().status, 'submitted');
+    assert.equal(f.state.envelopes.length, 2);
+    assert.equal(f.state.envelopes[1]!.submissionId, id);
+    assert.equal(f.state.envelopes[1]!.feedback, 'Synthetic draft summary.');
+    assert.equal(
+      (await owner.app.inject({ method: 'GET', url: `/api/feedback/drafts/${id}` })).json().receipt
+        .status,
+      'submitted',
+    );
+    const uncertain = randomUUID();
+    await f.pool.query(
+      'INSERT INTO feedback_drafts(id,owner_id,thread_id,summary) VALUES($1,$2,$3,$4)',
+      [uncertain, owner.ownerId, randomUUID(), 'Synthetic uncertain summary.'],
+    );
+    const resend = { ...send, url: `/api/feedback/drafts/${uncertain}/send` };
+    f.state.receiptStatus = 'unknown';
+    assert.equal((await owner.app.inject(resend)).json().status, 'unknown');
+    f.state.receiptStatus = 'submitted';
+    assert.equal((await owner.app.inject(resend)).json().status, 'unknown');
+    assert.equal(f.state.envelopes.length, 3);
+    const claimed = randomUUID();
+    await f.pool.query(
+      'INSERT INTO feedback_drafts(id,owner_id,thread_id,summary) VALUES($1,$2,$3,$4)',
+      [claimed, owner.ownerId, randomUUID(), 'Synthetic claimed summary.'],
+    );
+    assert.equal(
+      (await owner.app.inject({ method: 'GET', url: `/api/feedback/${claimed}` })).json().status,
+      'rejected',
+    );
+    assert.equal(
+      (await owner.app.inject({ ...send, url: `/api/feedback/drafts/${claimed}/send` })).json()
+        .status,
+      'submitted',
+    );
+    assert.equal(f.state.envelopes.length, 4);
+    await f.pool.query(
+      "UPDATE feedback_submissions SET created_at=now()-interval '10 minutes' WHERE owner_id=$1 AND id=$2",
+      [owner.ownerId, uncertain],
+    );
+    const held: Array<() => void> = [];
+    let arrived = () => {};
+    const holding = (count: number) =>
+      new Promise<void>((done) => {
+        arrived = () => held.length >= count && done();
+        arrived();
+      });
+    f.state.beforeDeliver = () =>
+      held.length < 3
+        ? new Promise<void>((done) => {
+            held.push(done);
+            arrived();
+          })
+        : Promise.resolve();
+    f.state.receiptStatus = 'rejected';
+    const check = () => owner.app.inject({ method: 'GET', url: `/api/feedback/${uncertain}` });
+    const early = check();
+    await holding(1);
+    const late = check();
+    await holding(2);
+    held[0]!();
+    assert.equal((await early).json().status, 'rejected');
+    const retry = owner.app.inject(resend);
+    await holding(3);
+    held[1]!();
+    assert.equal((await late).json().status, 'unknown');
+    f.state.receiptStatus = 'submitted';
+    assert.equal((await owner.app.inject(resend)).json().status, 'unknown');
+    assert.equal(f.state.envelopes.length, 5);
+    held[2]!();
+    assert.equal((await retry).json().status, 'submitted');
+    f.state.beforeDeliver = undefined;
+  },
+);
+
+test(
   'feedback reports and their delivery status stay with their owner',
   { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
   async (t) => {
@@ -10201,13 +12831,18 @@ test(
       CREATE TABLE app_connections(id uuid,owner_id text,slug text,account_id text,account_active boolean,revoked boolean,callback_expires timestamptz,triggers_enabled boolean,watch_failures integer,inbox_failed boolean,inbox_reconnect_required boolean,account_checked_at timestamptz,inbox_checked_at timestamptz,created_at timestamptz DEFAULT now());
       CREATE TABLE browser_connections(id uuid,owner_id text,state text,checked_at timestamptz,created_at timestamptz DEFAULT now());
       CREATE TABLE discovered_connections(id uuid,owner_id text,reconnect_required boolean,replaced_at timestamptz,paths jsonb,created_at timestamptz DEFAULT now());
-      CREATE TABLE model_connections(id uuid,owner_id text,provider text,method text,status text,managed boolean,created_at timestamptz DEFAULT now());
+      CREATE TABLE model_connections(id uuid,owner_id text,provider text,method text,status text,managed boolean,models jsonb,request_failures jsonb,created_at timestamptz DEFAULT now());
+      CREATE TABLE model_settings(owner_id text,selection jsonb,routes jsonb);
+      CREATE TABLE preferences(owner_id text,notification_rule text,time_zone text,quiet_start text,quiet_end text,quiet_hours_enabled boolean,locale text,hour_cycle text,rules text,speech_reply text,proactive_paused boolean,local_files_enabled boolean);
+      CREATE TABLE spending_limits(owner_id text,monthly_usd double precision,task_usd double precision,preparation_usd double precision);
+      CREATE TABLE channel_settings(owner_id text,provider text,enabled boolean,summary jsonb,updated_at timestamptz DEFAULT now());
       CREATE TABLE integration_events(id text,owner_id text,slug text,state text,created_at timestamptz DEFAULT now());
       CREATE TABLE schedules(id uuid,owner_id text,kind text,enabled boolean,delivery_channel text,next_run_at timestamptz,created_at timestamptz DEFAULT now());
       CREATE TABLE schedule_runs(id uuid,owner_id text,schedule_id uuid,turn_id uuid,created_at timestamptz DEFAULT now());
       CREATE TABLE channel_inbox(source_id text,owner_id text,provider text,state text,turn_id uuid,created_at timestamptz DEFAULT now());
       CREATE TABLE channel_outbox(source_id text,state text,reason text,updated_at timestamptz DEFAULT now());
     `);
+    let modelConnection = '';
     const ownerId = randomUUID();
     const otherOwner = randomUUID();
     const turnId = randomUUID();
@@ -10347,8 +12982,31 @@ test(
         ],
       );
       await f.pool.query(
-        `INSERT INTO model_connections(id,owner_id,provider,method,status,managed) VALUES($1,$2,$3,'api_key','reconnect',false)`,
-        [randomUUID(), owner, privateText],
+        `INSERT INTO model_connections(id,owner_id,provider,method,status,managed,models,request_failures) VALUES($1,$2,$3,'api_key','reconnect',false,$4,'{}')`,
+        [
+          (modelConnection = randomUUID()),
+          owner,
+          privateText,
+          JSON.stringify([
+            { id: 'qwen2.5-coder:7b', name: privateText, contextWindow: 8192, efforts: ['low'] },
+            { id: 'models/Marta Vidal/private.gguf', contextWindow: 4096 },
+            { id: 'C:/Users/owner/private.gguf', contextWindow: 4096 },
+            { id: 'customer-jane/private-model', contextWindow: 4096 },
+          ]),
+        ],
+      );
+      await f.pool.query(`INSERT INTO model_settings VALUES($1,$2,'{"background":"light"}')`, [
+        owner,
+        { connectionId: modelConnection, modelId: 'qwen2.5-coder:7b', effort: 'low' },
+      ]);
+      await f.pool.query(
+        `INSERT INTO preferences VALUES($1,$2,'Europe/Lisbon','22:00','08:00',true,'pt-PT','auto',$2,'auto',true,false)`,
+        [owner, privateText],
+      );
+      await f.pool.query(`INSERT INTO spending_limits VALUES($1,200,5,5)`, [owner]);
+      await f.pool.query(
+        `INSERT INTO channel_settings(owner_id,provider,enabled,summary) VALUES($1,'whatsapp',true,$2)`,
+        [owner, { accountName: privateText, linkMode: 'self-chat', connectionState: 'logged_out' }],
       );
       await f.pool.query(
         `INSERT INTO integration_events(id,owner_id,slug,state) VALUES($1,$2,'gmail','processing')`,
@@ -10385,11 +13043,130 @@ test(
       ownerId,
       sanitize: redactor.value,
     });
+    const failureJournal = await createFeedbackLog({
+      dataRoot: logRoot,
+      ownerId,
+      name: 'failures',
+      sanitize: redactor.value,
+    });
     t.after(async () => {
       await journal.close();
+      await failureJournal.close();
       await rm(logRoot, { recursive: true, force: true });
     });
+    await mkdir(join(logRoot, 'logs'));
+    await writeFile(
+      join(logRoot, 'logs', 'startup.log'),
+      `${new Date(Date.now() - 5000).toISOString()} update check result=offered version=9.9.9 for Marta Vidal\n`,
+    );
     const scope = { turnId, sessionId, runId: childRun, parentRunId: mainRun, callId };
+    const { createBrowserWorkerFixture } = await import('./browser-fixture.ts');
+    const { withFailureLog } = await import('../src/ports/failure-log.ts');
+    let pickerGuard = 'control_covered';
+    const refusePicker = async () => {
+      throw Object.assign(new Error(privateText), {
+        signInGuard: pickerGuard,
+        cause: privateText,
+      });
+    };
+    const bridge = await createBrowserWorkerFixture({
+      computer: fakeComputer({
+        signInMethods: refusePicker,
+        selectSignInMethod: refusePicker,
+      }),
+    });
+    try {
+      const client = bridge.client('/synthetic/diagnostic-picker');
+      for (const [method, guard] of [
+        ['signInMethods', 'control_covered'],
+        ['signInMethods', 'control_changed'],
+        ['selectSignInMethod', 'control_changed'],
+      ]) {
+        pickerGuard = guard;
+        await assert.rejects(
+          withFailureLog(
+            (event, error, context) =>
+              failureJournal.record('failure', { event, error, context }, scope),
+            () =>
+              method === 'signInMethods'
+                ? client.signInMethods!('task', 'https://example.test', [
+                    { label: privateValues[0], selector: `[data-account="${privateValues[1]}"]` },
+                  ])
+                : client.selectSignInMethod!('task', {
+                    origin: 'https://example.test',
+                    document: 'synthetic-document',
+                    methodId: randomUUID(),
+                  }),
+          ),
+          (error: unknown) => {
+            assert.equal(Object(error).signInGuard, guard);
+            assert.ok(privateValues.every((value) => !Object(error).message.includes(value)));
+            return true;
+          },
+        );
+      }
+    } finally {
+      await bridge.close();
+    }
+    const { createDecisionModel } = await import('../src/providers/decisions.ts');
+    const { createMailCheck } = await import('../src/server/mail-check.ts');
+    const { privateEmailResult } = await import('../src/server/integration-result.ts');
+    for (const response of [
+      () => Response.json({ error: { message: privateText, code: privateText } }, { status: 503 }),
+      () => new Response(`{"private":${JSON.stringify(privateText)}`, { status: 200 }),
+      () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(new Error(privateText));
+            },
+          }),
+          { status: 200 },
+        ),
+    ]) {
+      const model = createDecisionModel({
+        resolve: async () => ({ provider: 'openrouter', key: privateText }),
+        fetch: async () => response(),
+      });
+      const check = createMailCheck({
+        decisions: model,
+        curator: {
+          id: 'unused',
+          configured: false,
+          async curate() {
+            assert.fail('A failed decision must not use another model.');
+          },
+        },
+      });
+      const result = await withFailureLog(
+        (event, error) => failureJournal.record('failure', { event, error }, scope),
+        () =>
+          privateEmailResult(
+            {
+              messages: [
+                {
+                  id: 'synthetic-mail',
+                  from: 'sender@example.test',
+                  subject: privateText,
+                  body: privateText,
+                },
+              ],
+            },
+            check,
+          ),
+      );
+      assert.ok(privateValues.every((value) => !JSON.stringify(result).includes(value)));
+    }
+    for (let index = 0; index < 3; index++)
+      failureJournal.record(
+        'failure',
+        {
+          event: 'browser_bridge_failed',
+          error: new Error('bridge exited'),
+          context: { reason: 'exit', exitCode: 137, count: 2 },
+        },
+        scope,
+      );
     journal.record(
       'tool_start',
       {
@@ -10442,6 +13219,11 @@ test(
         },
       ],
       logs: () => journal.snapshot(),
+      failures: () => failureJournal.snapshot(),
+      dataRoot: logRoot,
+      trustModel: 'llm',
+      client: { stream: 'closed' as const, savedMessages: 4, renderedMessages: 3 },
+      environment: { NOD_OS_VERSION: '15.1.0', NOD_ELECTRON_VERSION: privateText },
       errors: [
         {
           type: 'render' as const,
@@ -10476,8 +13258,9 @@ test(
       'future-message',
     ])
       assert.ok(!encoded.includes(omitted), omitted);
-    assert.doesNotMatch(encoded, /\d{4}-\d{2}-\d{2}T/);
     const report = JSON.parse(encoded);
+    assert.doesNotMatch(encoded.replace(report.generatedAt, ''), /\d{4}-\d{2}-\d{2}T/);
+    assert.ok(Math.abs(Date.parse(report.generatedAt) - Date.now()) < 60_000);
     assert.equal(report.format, 'nod-feedback-report-v3');
     assert.equal(report.coverage.contentIncluded, true);
     assert.equal(report.coverage.redaction, 'best-effort');
@@ -10540,14 +13323,86 @@ test(
     );
     assert.equal(report.modelUsage.length, 1);
     assert.equal(report.modelUsage[0].runId, child.runId);
-    assert.equal(report.logs.length, 3);
+    assert.equal(report.logs.length, 2);
     assert.equal(report.logs[0].runId, child.runId);
     assert.equal(report.logs[0].parentRunId, child.parentRunId);
     assert.equal(report.logs[0].callId, report.logs[1].callId);
     assert.equal(report.logs[0].data.tool, 'apps');
     assert.equal(report.logs[0].data.input.query, 'Find the failed workflow');
     assert.equal(report.logs[1].data.output.statusCode, 503);
-    assert.match(report.logs[2].data.error.message, /Gmail fetch failed with HTTP 503/);
+    assert.equal(report.failures.length, 8);
+    const mailFailures = report.failures.filter(
+      (row: any) => row.data.event === 'mail_check_failed',
+    );
+    assert.equal(mailFailures.length, 3);
+    assert.deepEqual(
+      mailFailures.map((row: any) => [row.data.error.code, row.data.error.status]).sort(),
+      [
+        ['decision_http', 503],
+        ['decision_json', 200],
+        ['decision_response', 200],
+      ],
+    );
+    assert.ok(mailFailures.every((row: any) => row.runId === child.runId && row.count === 1));
+    const requestFailure = report.failures.find((row: any) => row.data.event === 'request_failed');
+    const bridgeFailure = report.failures.find(
+      (row: any) =>
+        row.data.event === 'browser_bridge_failed' && row.data.context.reason === 'exit',
+    );
+    const pickerFailure = report.failures.find(
+      (row: any) => row.data.context?.signInGuard === 'control_covered',
+    );
+    const pickerFailures = report.failures.filter((row: any) => row.data.context?.signInGuard);
+    assert.deepEqual(
+      pickerFailures
+        .map((row: any) => [row.data.context.method, row.data.context.signInGuard, row.count])
+        .sort(),
+      [
+        ['selectSignInMethod', 'control_changed', 1],
+        ['signInMethods', 'control_changed', 1],
+        ['signInMethods', 'control_covered', 1],
+      ],
+    );
+    assert.equal(pickerFailure.data.error.code, 'unavailable');
+    assert.equal(pickerFailure.data.context.method, 'signInMethods');
+    assert.equal(pickerFailure.data.context.reason, 'error_response');
+    assert.equal(pickerFailure.count, 1);
+    assert.equal(pickerFailure.runId, child.runId);
+    assert.match(requestFailure.data.error.message, /Gmail fetch failed with HTTP 503/);
+    assert.equal(requestFailure.count, 1);
+    assert.equal(bridgeFailure.data.context.exitCode, 137);
+    assert.equal(bridgeFailure.count, 6);
+    assert.equal(bridgeFailure.runId, child.runId);
+    assert.equal(report.startupLog.length, 1);
+    assert.match(report.startupLog[0].line, /^update check result=offered version=9\.9\.9/);
+    assert.ok(report.startupLog[0].ageMs >= 5000);
+    assert.equal(report.system.osVersion, '15.1.0');
+    assert.equal(report.system.electron, null);
+    assert.ok(report.system.memoryMb > 0);
+    assert.deepEqual(report.client, { stream: 'closed', savedMessages: 4, renderedMessages: 3 });
+    assert.deepEqual(report.modelSettings, [
+      {
+        selection: {
+          connection: report.modelConnections[0].id,
+          model: 'qwen2.5-coder:7b',
+          effort: 'low',
+        },
+        schedule: null,
+        background: 'light',
+      },
+    ]);
+    assert.deepEqual(report.modelConnections[0].models, [
+      { id: 'qwen2.5-coder:7b', contextWindow: 8192, images: false, efforts: ['low'] },
+      { id: null, contextWindow: 4096, images: false, efforts: [] },
+      { id: null, contextWindow: 4096, images: false, efforts: [] },
+      { id: null, contextWindow: 4096, images: false, efforts: [] },
+    ]);
+    assert.equal(report.modelUsageSummary[0].requests, 1);
+    assert.equal(report.settings[0].timeZone, 'Europe/Lisbon');
+    assert.equal(report.settings[0].notificationRuleSet, true);
+    assert.equal(report.settings[0].monthlyLimitUsd, 200);
+    assert.equal(report.channelSettings[0].linkMode, 'self-chat');
+    assert.equal(report.channelSettings[0].connectionState, 'logged_out');
     assert.equal(report.clientErrors.length, 1);
     assert.match(report.clientErrors[0].data.message, /Could not open account/);
     for (const input of [
@@ -10566,7 +13421,12 @@ test(
     assert.equal(report.modelUsage[0].durationMs, 4321);
     assert.equal(report.modelUsage[0].costUsd, 0.01234);
     assert.equal(report.modelUsage[0].estimateUsd, 0.04567);
-    assert.deepEqual(report.runtime, { provider: 'other', modelFamily: 'custom' });
+    assert.deepEqual(report.runtime, {
+      provider: 'other',
+      modelFamily: 'custom',
+      model: null,
+      trustModel: 'llm',
+    });
     assert.equal(report.environment.appVersion, '1.2.3');
     assert.equal(report.environment.appRelease, null);
     assert.equal(report.environment.platform, null);
@@ -10639,6 +13499,10 @@ test(
       assert.equal(fallback.coverage.redaction, 'unavailable');
       assert.equal(fallback.coverage.sections.clientErrors.status, 'unavailable');
       assert.equal(fallback.coverage.sections.logs.status, 'unavailable');
+      assert.equal(fallback.coverage.sections.failures.status, 'unavailable');
+      assert.equal(fallback.coverage.sections.startupLog.status, 'unavailable');
+      assert.deepEqual(fallback.failures, []);
+      assert.deepEqual(fallback.startupLog, []);
       assert.equal(readLogs, false);
       assert.deepEqual(fallback.clientErrors, []);
       assert.deepEqual(fallback.logs, []);
@@ -10669,6 +13533,47 @@ test(
     );
   },
 );
+
+test('feedback original spans remove private data before journal persistence and reload', async (t) => {
+  const { createFeedbackLog } = await import('../src/server/feedback-log.ts');
+  const { createFeedbackRedactor } = await import('../src/server/feedback-redaction.ts');
+  const root = await mkdtemp(join(tmpdir(), 'feedback-original-spans-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const redactor = createFeedbackRedactor({
+    secrets: ['/', '@', 'Author'],
+    profile: { names: [] },
+  });
+  const options = { dataRoot: root, ownerId: 'synthetic-owner', sanitize: redactor.value };
+  const log = await createFeedbackLog(options);
+  t.after(() => log.close());
+  log.record('failure', {
+    status: 503,
+    reason: 'Engine request failed',
+    message: '/Users/Synthetic Owner/PrivateLedger.docx',
+    detail: 'PrivateMailbox%40synthetic.invalid',
+    headers: ['Authorization', 'PrivateOpaqueValue'],
+  });
+  const snapshot = await log.snapshot();
+  assert.equal(snapshot.entries.length, 1);
+  assert.equal((snapshot.entries[0].data as { status: number }).status, 503);
+  const parent = join(root, 'feedback-logs');
+  const [directory] = await readdir(parent);
+  const persisted = await readFile(join(parent, directory, 'journal-0.jsonl'), 'utf8');
+  for (const privatePart of [
+    'Synthetic Owner',
+    'PrivateLedger',
+    'PrivateMailbox',
+    'synthetic.invalid',
+    'PrivateOpaqueValue',
+  ]) {
+    assert.ok(!persisted.includes(privatePart), privatePart);
+    assert.ok(!JSON.stringify(snapshot).includes(privatePart), privatePart);
+  }
+  await log.close();
+  const reopened = await createFeedbackLog(options);
+  t.after(() => reopened.close());
+  assert.deepEqual((await reopened.snapshot()).entries, snapshot.entries);
+});
 
 test('feedback journal redacts before persistence, survives restart, rotates and expires within its owner', async (t) => {
   const { createFeedbackLog } = await import('../src/server/feedback-log.ts');
@@ -11060,6 +13965,136 @@ test(
   },
 );
 
+test('transaction runs afterRollback callbacks when aborted before commit', async () => {
+  const { afterCommit, afterRollback, transaction } = await import('../src/server/transaction.ts');
+  const controller = new AbortController();
+  const reason = new Error('cancelled');
+  const released: Array<boolean | undefined> = [];
+  const client = {
+    async query(_sql: string) {
+      return { rows: [] };
+    },
+    release(destroy?: boolean) {
+      released.push(destroy);
+    },
+  };
+  const database = {
+    async connect() {
+      return client;
+    },
+  } as unknown as pg.Pool;
+  let rolledBack = 0;
+  let committed = 0;
+  await assert.rejects(
+    transaction(
+      async (tx) => {
+        afterRollback(tx, () => {
+          rolledBack++;
+        });
+        afterCommit(tx, () => {
+          committed++;
+        });
+        controller.abort(reason);
+      },
+      database,
+      controller.signal,
+    ),
+    (error) => error === reason,
+  );
+  assert.equal(rolledBack, 1);
+  assert.equal(committed, 0);
+  assert.deepEqual(released, [true]);
+
+  const afterCommitController = new AbortController();
+  const releasedAfterCommit: Array<boolean | undefined> = [];
+  const commitClient = {
+    async query(_sql: string) {
+      return { rows: [] };
+    },
+    release(destroy?: boolean) {
+      releasedAfterCommit.push(destroy);
+    },
+  };
+  let postCommitRollbacks = 0;
+  await transaction(
+    async (tx) => {
+      afterRollback(tx, () => {
+        postCommitRollbacks++;
+      });
+      afterCommit(tx, () => {
+        afterCommitController.abort(reason);
+      });
+    },
+    {
+      async connect() {
+        return commitClient;
+      },
+    } as unknown as pg.Pool,
+    afterCommitController.signal,
+  );
+  assert.equal(postCommitRollbacks, 0);
+  assert.deepEqual(releasedAfterCommit, [undefined]);
+});
+
+test(
+  'a transaction stopped while its commit is pending does not run its rollback callbacks',
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
+  async (t) => {
+    const { afterRollback, transaction } = await import('../src/server/transaction.ts');
+    const schema = `test_commit_stop_${randomUUID().replaceAll('-', '')}`;
+    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const pool = new pg.Pool({
+      connectionString: process.env.TEST_DATABASE_URL,
+      options: `-c search_path=${schema}`,
+    });
+    let pid = 0;
+    t.after(async () => {
+      await pool.end();
+      if (pid) await admin.query('SELECT pg_terminate_backend($1)', [pid]);
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    });
+    await pool.query(`
+      CREATE TABLE held(id int);
+      CREATE FUNCTION hold_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN PERFORM pg_sleep(20); RETURN NULL; END $$;
+      CREATE CONSTRAINT TRIGGER hold_commit AFTER INSERT ON held
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION hold_commit();
+    `);
+    const controller = new AbortController();
+    let rolledBack = 0;
+    const pending = transaction(
+      async (client) => {
+        pid = (await client.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+        await client.query('INSERT INTO held VALUES (1)');
+        afterRollback(client, () => {
+          rolledBack++;
+        });
+      },
+      pool,
+      controller.signal,
+    );
+    const rejected = assert.rejects(pending);
+    let committing = false;
+    for (const deadline = Date.now() + 10_000; !committing && Date.now() < deadline;) {
+      committing = Boolean(
+        (
+          await admin.query(
+            "SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND state='active' AND query='COMMIT'",
+            [pid],
+          )
+        ).rowCount,
+      );
+      if (!committing) await delay(10);
+    }
+    assert.ok(committing);
+    controller.abort(new Error('Synthetic Stop'));
+    await rejected;
+    assert.equal(rolledBack, 0);
+  },
+);
+
 test('a first task stays open after its chat turn ends and follows its own saved task', () => {
   const messages = [
     { id: 'old-request', role: 'user' as const, text: 'Draft the reply', turnId: 'old-turn' },
@@ -11090,6 +14125,23 @@ test('a first task stays open after its chat turn ends and follows its own saved
   assert.equal(status(), 'sent');
 });
 
+test('the onboarding brief masks each link and keeps the fields after it', async () => {
+  const { masked } = await import('../src/server/onboarding-suggestions.ts');
+  const event = {
+    htmlLink: 'https://calendar.example.test/event?eid=abc',
+    start: { dateTime: '2026-10-24T09:00:00Z' },
+    end: { dateTime: '2026-10-24T09:30:00Z' },
+    summary: 'Planning',
+  };
+  assert.deepEqual(JSON.parse(masked(JSON.stringify({ items: [event, event] }))), {
+    items: [event, event].map((item) => ({ ...item, htmlLink: '[link]' })),
+  });
+  const quoted = { note: 'Open https://files.example.test/a"b?token=zzz then reply', next: 'kept' };
+  const brief = masked(JSON.stringify(quoted));
+  assert.deepEqual(JSON.parse(brief), { note: 'Open [link] then reply', next: 'kept' });
+  assert.ok(!brief.includes('zzz'));
+});
+
 test(
   'the live line uses an active tool label, drops old steps, and keeps work Nod started apart',
   { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
@@ -11107,7 +14159,8 @@ test(
         CREATE TABLE tasks(id uuid PRIMARY KEY, owner_id text NOT NULL, session_id uuid, title text, now_text text,
           message_id uuid, created_at timestamptz DEFAULT now());
         CREATE TABLE turn_events(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), turn_id uuid, type text, summary text DEFAULT '',
-          site text, call_id uuid, created_at timestamptz DEFAULT now());
+          site text, call_id uuid, run_id uuid, created_at timestamptz DEFAULT now());
+        CREATE INDEX turn_events_progress ON turn_events(turn_id,created_at,id) WHERE type IN ('step','steered');
         CREATE TABLE messages(id uuid PRIMARY KEY, owner_id text, turn_id uuid, role text, created_at timestamptz DEFAULT now())`);
       const { createActivity } = await import('../src/server/activity.ts');
       const owner = 'activity-fixture-owner';
@@ -11210,6 +14263,59 @@ test(
       item = await live();
       assert.equal(item.step, null);
       assert.ok(item.tool);
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,site) VALUES($1,'tool_complete','apps','Gmail'),($1,'tool_complete','files','Local files')",
+        [chat],
+      );
+      const recentActions = (await live()).recent;
+      assert.ok(
+        recentActions?.some(
+          (entry) => entry.summary === 'Used a connected app' && entry.site === 'Gmail',
+        ),
+      );
+      assert.ok(
+        recentActions?.some(
+          (entry) => entry.summary === 'Handled local files' && entry.site === 'Local files',
+        ),
+      );
+      const mainRun = randomUUID();
+      const helperRun = randomUUID();
+      const recentCall = randomUUID();
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,run_id) VALUES($1,'step','Checking the synthetic report',$2)",
+        [chat, mainRun],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,run_id) VALUES($1,'step','Checking a separate helper source',$2)",
+        [chat, helperRun],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,run_id,call_id) VALUES($1,'tool_start','read',$2,$3)",
+        [chat, mainRun, recentCall],
+      );
+      const completed = await pool.query<{ id: string }>(
+        "INSERT INTO turn_events(turn_id,type,summary,run_id,call_id) VALUES($1,'tool_complete','read',$2,$3) RETURNING id",
+        [chat, mainRun, recentCall],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary) VALUES($1,'tool_failed','Synthetic failed operation'),($1,'tool_complete','set status')",
+        [chat],
+      );
+      item = await live();
+      assert.equal(item.recent?.length, 4);
+      assert.deepEqual(item.recent?.[0], {
+        id: completed.rows[0]!.id,
+        summary: 'Checking the synthetic report',
+        site: null,
+      });
+      assert.equal(
+        item.recent?.some((entry) => entry.summary.includes('failed')),
+        false,
+      );
+      assert.equal(
+        item.recent?.some((entry) => entry.summary === 'set status'),
+        false,
+      );
       const taskSession = randomUUID();
       const taskTurn = randomUUID();
       const observerTurn = randomUUID();
@@ -11228,7 +14334,195 @@ test(
         items.some((entry) => entry.turnId === observerTurn),
         false,
       );
+      const foreignThread = randomUUID();
+      const foreignTurn = randomUUID();
+      await pool.query("INSERT INTO threads(id,owner_id) VALUES($1,'other-activity-owner')", [
+        foreignThread,
+      ]);
+      await pool.query(
+        "INSERT INTO turns(id,owner_id,thread_id,session_id,source,status,started_at) VALUES($1,'other-activity-owner',$2,$2,'user','running',now())",
+        [foreignTurn, foreignThread],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary) VALUES($1,'tool_complete','Synthetic task operation'),($2,'tool_complete','Synthetic foreign operation')",
+        [taskTurn, foreignTurn],
+      );
+      const scoped = await activity.read();
+      assert.equal(
+        scoped.some((entry) => entry.turnId === foreignTurn),
+        false,
+      );
+      assert.equal(
+        scoped.find((entry) => entry.turnId === chat)?.recent?.[0]?.id,
+        completed.rows[0]!.id,
+      );
+      assert.equal(
+        scoped.find((entry) => entry.turnId === taskTurn)?.recent?.[0]?.summary,
+        'Synthetic task operation',
+      );
+      await pool.query('DELETE FROM turn_events WHERE turn_id=$1', [chat]);
+      const completedSteps: string[] = [];
+      let eventTime = Date.now() - 60_000;
+      const record = async (
+        type: string,
+        callId: string | null,
+        site: string | null,
+        runId = mainRun,
+      ) => {
+        const result = await pool.query<{ id: string }>(
+          `INSERT INTO turn_events(turn_id,type,summary,run_id,call_id,site,created_at)
+            VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+          [
+            chat,
+            type,
+            type === 'step' ? 'Checking synthetic notes' : 'read',
+            runId,
+            callId,
+            site,
+            new Date(eventTime++),
+          ],
+        );
+        return result.rows[0]!.id;
+      };
+      for (let step = 0; step < 5; step++) {
+        await record('step', null, null);
+        let latest = '';
+        for (let call = 0; call < (step === 4 ? 6 : 1); call++) {
+          const callId = randomUUID();
+          const site = call % 2 ? 'example.test' : null;
+          await record('tool_start', callId, site);
+          latest = await record('tool_complete', callId, site);
+        }
+        completedSteps.unshift(latest);
+      }
+      const eventCount = (
+        await pool.query('SELECT count(*) FROM turn_events WHERE turn_id=$1', [chat])
+      ).rows[0].count;
+      const grouped = (await live()).recent;
+      assert.deepEqual(
+        grouped?.map((entry) => entry.id),
+        completedSteps.slice(0, 4),
+        'Each completed step appears once, with earlier steps retained before the four-entry limit',
+      );
+      assert.equal(grouped?.[0]?.site, 'example.test');
+      assert.equal(
+        (await pool.query('SELECT count(*) FROM turn_events WHERE turn_id=$1', [chat])).rows[0]
+          .count,
+        eventCount,
+      );
+      await record('step', null, null, helperRun);
+      const runCompletions = new Map<string, string>();
+      for (let call = 0; call < 2; call++)
+        for (const runId of [mainRun, helperRun]) {
+          const callId = randomUUID();
+          await record('tool_start', callId, null, runId);
+          runCompletions.set(runId, await record('tool_complete', callId, null, runId));
+        }
+      assert.deepEqual(
+        (await live()).recent?.slice(0, 2).map((entry) => entry.id),
+        [runCompletions.get(helperRun), runCompletions.get(mainRun)],
+        'A helper progress update cannot group the parent run with its helper',
+      );
+      const ungrouped = async () => {
+        const completions: string[] = [];
+        for (let call = 0; call < 2; call++) {
+          const callId = randomUUID();
+          await record('tool_start', callId, null);
+          completions.unshift(await record('tool_complete', callId, null));
+        }
+        assert.deepEqual(
+          (await live()).recent?.slice(0, 2).map((entry) => entry.id),
+          completions,
+          'Operations without a current step keep their individual activity entries',
+        );
+      };
+      await record('steered', null, null);
+      await ungrouped();
+      for (const summary of ['   ', '\t\n', '\u00a0', '\u2007', '\u202f', '\ufeff']) {
+        await pool.query('UPDATE turn_events SET summary=$2 WHERE id=$1', [
+          await record('step', null, null),
+          summary,
+        ]);
+        await ungrouped();
+      }
     } finally {
+      await pool.end();
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    }
+  },
+);
+
+test(
+  'the desktop is told the owner has work running for any running turn, and rechecks until it ends',
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
+  async () => {
+    const schema = `test_working_${randomUUID().replaceAll('-', '').slice(0, 16)}`;
+    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const url = new URL(process.env.TEST_DATABASE_URL!);
+    url.searchParams.set('options', `-c search_path=${schema}`);
+    const pool = new pg.Pool({ connectionString: url.href });
+    const { createActivity } = await import('../src/server/activity.ts');
+    const { refresh } = await import('../src/server/events.ts');
+    const owner = 'working-fixture-owner';
+    const seen: boolean[] = [];
+    const activity = createActivity({
+      pool,
+      ownerId: owner,
+      keepAwake: { set: (working) => seen.push(working) },
+      recheckMs: 50,
+    });
+    const until = async (count: number) => {
+      for (let attempt = 0; attempt < 200 && seen.length < count; attempt++) await delay(10);
+    };
+    try {
+      await pool.query(`CREATE TABLE threads(id uuid PRIMARY KEY, owner_id text NOT NULL, archived_at timestamptz);
+        CREATE TABLE turns(id uuid PRIMARY KEY, owner_id text NOT NULL, thread_id uuid, session_id uuid, source text,
+          status text, channel text DEFAULT 'web', message_id uuid, created_at timestamptz DEFAULT now(), started_at timestamptz);
+        CREATE TABLE tasks(id uuid PRIMARY KEY, owner_id text NOT NULL, session_id uuid, title text, now_text text,
+          message_id uuid, created_at timestamptz DEFAULT now());
+        CREATE TABLE turn_events(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), turn_id uuid, type text, summary text DEFAULT '',
+          site text, call_id uuid, run_id uuid, created_at timestamptz DEFAULT now());
+        CREATE TABLE messages(id uuid PRIMARY KEY, owner_id text, turn_id uuid, role text, created_at timestamptz DEFAULT now())`);
+      const threadId = randomUUID();
+      const scheduled = randomUUID();
+      await pool.query('INSERT INTO threads(id,owner_id,archived_at) VALUES($1,$2,now())', [
+        threadId,
+        owner,
+      ]);
+      await pool.query(
+        "INSERT INTO turns(id,owner_id,thread_id,session_id,source,status) VALUES($1,'another-owner',$1,$1,'user','running'),($2,$3,$4,$2,'user','queued')",
+        [randomUUID(), randomUUID(), owner, threadId],
+      );
+      activity.start();
+      refresh();
+      await delay(400);
+      assert.deepEqual(seen, []);
+      await pool.query(
+        "INSERT INTO turns(id,owner_id,thread_id,session_id,source,status,started_at) VALUES($1,$2,$3,$1,'schedule','running',now())",
+        [scheduled, owner, threadId],
+      );
+      assert.deepEqual(await activity.read(), []);
+      refresh();
+      await until(1);
+      assert.deepEqual(seen, [true]);
+      await pool.query('ALTER TABLE turns RENAME TO turns_unavailable');
+      await until(2);
+      assert.deepEqual(seen, [true, false]);
+      await pool.query('ALTER TABLE turns_unavailable RENAME TO turns');
+      await until(3);
+      assert.deepEqual(seen, [true, false, true]);
+      await pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [scheduled]);
+      await until(4);
+      assert.deepEqual(seen, [true, false, true, false]);
+      activity.close();
+      await pool.query("UPDATE turns SET status='running' WHERE id=$1", [scheduled]);
+      refresh();
+      await delay(400);
+      assert.deepEqual(seen, [true, false, true, false]);
+    } finally {
+      activity.close();
       await pool.end();
       await admin.query(`DROP SCHEMA ${schema} CASCADE`);
       await admin.end();

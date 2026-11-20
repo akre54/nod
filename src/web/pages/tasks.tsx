@@ -12,12 +12,20 @@ import {
   Globe2,
   Hourglass,
   LoaderCircle,
+  LockKeyhole,
   MessageCircle,
   MessageSquare,
 } from '../components/icons';
-import type { Activity, Schedule, Task, TaskDetail } from '../../shared/contracts';
+import type {
+  Activity,
+  Schedule,
+  Task,
+  TaskDetail,
+  WorkspaceCommand,
+} from '../../shared/contracts';
 import { taskHeadline, taskLabels } from '../../shared/task-status';
 import { InlineName } from '../components/inline-name';
+import { WorkspaceCommandDialog, WorkspaceCommandLine } from '../components/workspace-command';
 import { pageDataCache } from '../lib/page-data-cache';
 import { api } from '../lib/api';
 import { PageTitle } from '../components/page-title';
@@ -31,6 +39,7 @@ import { post, errorMessage } from '../lib/api';
 import { ScheduleRow } from './schedule';
 import { LiveLine } from '../components/live-line';
 import { BrowserWatch } from '../components/browser-watch';
+import { WorkModel } from '../components/model-choices';
 
 const icons = {
   queued: Clock,
@@ -93,6 +102,44 @@ function TaskActivity({ id }: { id: string }) {
   );
 }
 
+function TaskCommands({ id }: { id: string }) {
+  const data = usePageData<{ commands: WorkspaceCommand[] }>(`/api/tasks/${id}/commands`);
+  const commands = data.data?.commands ?? [];
+  const [selected, setSelected] = useState<string | null>(null);
+  return (
+    <section className="task-commands" aria-label="Workspace commands">
+      <p className="task-commands-where">
+        <LockKeyhole size={14} aria-hidden="true" />
+        Nod runs these in its isolated workspace. You can view them here.
+      </p>
+      {data.error ? (
+        <Notice>{data.error}</Notice>
+      ) : !data.data ? (
+        <Loading label="Loading commands…" />
+      ) : !commands.length ? (
+        <p className="task-preview-meta">No commands yet.</p>
+      ) : (
+        <ol role="list">
+          {commands.map((command) => (
+            <li
+              key={command.id}
+              className={
+                command.state === 'failed' || (command.exitCode !== null && command.exitCode !== 0)
+                  ? 'is-failed'
+                  : undefined
+              }
+            >
+              {command.helper && <small>Helper</small>}
+              <WorkspaceCommandLine command={command} onOpen={() => setSelected(command.id)} />
+            </li>
+          ))}
+        </ol>
+      )}
+      {selected && <WorkspaceCommandDialog id={selected} onClose={() => setSelected(null)} />}
+    </section>
+  );
+}
+
 export function TaskCard({
   task,
   live,
@@ -105,11 +152,7 @@ export function TaskCard({
   onReply?(): void;
 }) {
   const headingId = useId();
-  const stuck = task.status === 'failed';
-  const [expanded, setExpanded] = useState(stuck);
-  useEffect(() => {
-    if (stuck) setExpanded(true);
-  }, [stuck]);
+  const [expanded, setExpanded] = useState(false);
   const card = useRef<HTMLElement>(null);
   const inChat = Boolean(onReply);
   useEffect(() => {
@@ -136,6 +179,7 @@ export function TaskCard({
   useEffect(() => {
     if (task.status !== 'working') setWatching(false);
   }, [task.status]);
+  const [showCommands, setShowCommands] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [error, setError] = useState('');
   const format = useDateFormat();
@@ -175,7 +219,7 @@ export function TaskCard({
       <h2 className="task-preview-heading">
         <button
           type="button"
-          className="task-preview-head"
+          className={`task-preview-head${showLive ? ' task-preview-head-live' : ''}`}
           aria-expanded={expanded}
           aria-controls={`${headingId}-body`}
           onClick={() => {
@@ -197,17 +241,20 @@ export function TaskCard({
             </span>
             {chevron}
           </span>
-          <span className="task-preview-line">
-            {showLive ? (
-              <LiveLine item={showLive} />
-            ) : (
+          {!showLive && (
+            <span className="task-preview-line">
               <Markdown allowedElements={[]} unwrapDisallowed>
                 {line}
               </Markdown>
-            )}
-          </span>
+            </span>
+          )}
         </button>
       </h2>
+      {showLive && (
+        <div className="task-preview-live-line">
+          <LiveLine item={showLive} />
+        </div>
+      )}
       <div
         className="task-preview-disclosure"
         id={`${headingId}-body`}
@@ -293,6 +340,7 @@ export function TaskCard({
                 )}
               </ul>
             )}
+            {!closed(task) && task.work && <WorkModel task={task} />}
             {(task.revision ?? 0) > (task.appliedRevision ?? 0) && !closed(task) && (
               <p className="task-preview-meta">Owner update queued</p>
             )}
@@ -360,6 +408,17 @@ export function TaskCard({
                   {watching ? 'Hide browser' : 'Watch browser'}
                 </Button>
               )}
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-expanded={showCommands}
+                onClick={() => {
+                  if (!showCommands) captureAnalytics('task_action', { action: 'show_commands' });
+                  setShowCommands(!showCommands);
+                }}
+              >
+                {showCommands ? 'Hide commands' : 'Show commands'}
+              </Button>
               {!closed(task) && (
                 <Button
                   variant="ghost"
@@ -387,6 +446,7 @@ export function TaskCard({
               <BrowserWatch taskId={task.id} title={task.title} />
             )}
             {showActivity && <TaskActivity id={task.id} />}
+            {showCommands && <TaskCommands id={task.id} />}
             {task.status === 'done' && <ScheduleTask taskId={task.id} onCreated={onScheduled} />}
           </div>
         </div>
@@ -436,6 +496,14 @@ export function Scheduled({
     .filter((schedule) => schedule.enabled && schedule.nextRun)
     .sort((a, b) => a.nextRun!.localeCompare(b.nextRun!) || a.id.localeCompare(b.id));
   const inactive = (schedules.data ?? []).filter((schedule) => !upcoming.includes(schedule));
+  const inactiveGroup = useRef<HTMLDetailsElement>(null);
+  const showInactiveByDefault = upcoming.length === 0;
+  const hasActiveInactiveSchedule = inactive.some(
+    (schedule) => schedule.activeRun || activity.some((item) => item.scheduleId === schedule.id),
+  );
+  useEffect(() => {
+    if (hasActiveInactiveSchedule && inactiveGroup.current) inactiveGroup.current.open = true;
+  }, [hasActiveInactiveSchedule, showInactiveByDefault]);
   const empty = Boolean(schedules.data && !schedules.data.length);
   return (
     <div className="content-page secondary-page tasks-page">
@@ -473,7 +541,12 @@ export function Scheduled({
           {upcoming.length ? (
             <div className="saved-plan-list">
               {upcoming.map((schedule) => (
-                <ScheduleRow key={schedule.id} schedule={schedule} onAsk={onAsk} />
+                <ScheduleRow
+                  key={schedule.id}
+                  schedule={schedule}
+                  activity={activity}
+                  onAsk={onAsk}
+                />
               ))}
             </div>
           ) : empty ? (
@@ -493,14 +566,19 @@ export function Scheduled({
             <p className="muted">No upcoming schedules.</p>
           )}
           {inactive.length > 0 && (
-            <details className="schedule-inactive" open={!upcoming.length}>
+            <details className="schedule-inactive" ref={inactiveGroup} open={showInactiveByDefault}>
               <summary>
                 Inactive <span>{inactive.length}</span>
                 <ChevronDown size={16} aria-hidden="true" />
               </summary>
               <div className="saved-plan-list">
                 {inactive.map((schedule) => (
-                  <ScheduleRow key={schedule.id} schedule={schedule} onAsk={onAsk} />
+                  <ScheduleRow
+                    key={schedule.id}
+                    schedule={schedule}
+                    activity={activity}
+                    onAsk={onAsk}
+                  />
                 ))}
               </div>
             </details>

@@ -169,10 +169,10 @@ flowchart TB
   <a href="docs/src/assets/readme/heading-next.webp#gh-light-mode-only"><img src="docs/src/assets/readme/heading-next.webp" alt="Next on the list" width="316" /></a>
 </p>
 
-- **Run while your machine is asleep.** Hosted, so the morning brief still arrives.
-- **Call businesses on the phone.** For the errands that still need a voice.
-- **One Nod for your team.** Today one owner per Nod. Next, a few people sharing one.
-- **Make it your own.** Change how Nod works in the open code, and send it back.
+- **Managed hosting.** An always-on Nod, hosted for you.
+- **Make phone calls.** For the errands that still need a voice.
+- **Nod for your team.** Share one Nod, with its apps and memory.
+- **Make it your own.** Add your own skills and tools without touching the core.
 
 <br />
 
@@ -276,6 +276,8 @@ See [Install from source](https://nod.n8n.io/docs/get-started/install-from-sourc
 </p>
 
 <p align="center">Nod is open source, from the team behind <a href="https://n8n.io">n8n</a>.<br />Read <a href="CONTRIBUTING.md">CONTRIBUTING</a> to send your first change.</p>
+
+<p align="center"><a href="https://nod.n8n.io/docs/contribute/apps/">Creating your own connectors</a><br />Use MCP, an HTTP API, or a CLI. Add an app folder, run the required tests, and submit a PR.<br />The guide includes an AI builder skill, approval requirements, and shareable app pages.<br /><a href="https://nod.n8n.io/docs/connect/community-apps/">Browse custom connections</a></p>
 
 <p align="center">
   <a href="https://github.com/n8n-io/nod/issues/new/choose">Report a bug</a> · <a href="https://github.com/n8n-io/nod/discussions">Share an idea</a> · <a href="https://discord.gg/n8n">Discord</a> · <a href="https://community.n8n.io/c/n8n-labs/48">Forum</a> · <a href="SECURITY.md">Security</a>

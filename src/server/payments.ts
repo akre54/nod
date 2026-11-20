@@ -94,7 +94,10 @@ export async function createPayments(
     ownerId: string;
     analytics?: CaptureAnalytics;
     uses: Awaited<ReturnType<typeof createVaultUses>>;
-    present(turn: TurnRef, input: { kind: string; [key: string]: unknown }): Promise<string>;
+    present(
+      turn: TurnRef,
+      input: { kind: string; [key: string]: unknown },
+    ): Promise<{ question: string; action: string }>;
     page(threadId: string): Promise<BrowserPage>;
     destinations(
       threadId: string,
@@ -103,7 +106,7 @@ export async function createPayments(
     capture(threadId: string): Promise<Uint8Array>;
     cards(): Promise<VaultPaymentCard[]>;
     card(id: string, version: string, client: PoolClient): Promise<CardEntry['card']>;
-    fill(input: CardEntry): Promise<void>;
+    fill(input: CardEntry, signal?: AbortSignal): Promise<void>;
     resume(turnId: string, prompt: string, client?: PoolClient): Promise<void>;
     record(
       turn: TurnRef,
@@ -156,7 +159,7 @@ export async function createPayments(
     const cards = await options.cards();
     if (!cards.length)
       throw new PaymentError(
-        'Ask the owner to open Nod on desktop and [add a card in Vault](/vault?add=card), then tell you to continue. Do not ask for card details in chat.',
+        'Ask the owner to open Nod and [add a card in Vault](/vault?add=card), then tell you to continue. Do not ask for card details in chat.',
       );
     const named = hint?.toLowerCase();
     const matches = named
@@ -180,6 +183,7 @@ export async function createPayments(
       {
         id: row.id,
         ownerId,
+        turnId: row.turn_id,
         origin: row.origin,
         kind: 'card',
         itemId: card.id,
@@ -202,20 +206,23 @@ export async function createPayments(
           if (!claimed.rowCount) throw new PaymentError('This payment request is no longer open.');
           value = await options.card(row.card_id, row.card_version, client);
         },
-        perform: async () => {
+        perform: async (signal) => {
           captureSecureEntry(
             options.analytics,
             { kind: 'payment', origin: row.origin, payment: spent(row) },
             'approved',
           );
-          await options.fill({
-            threadId: row.browser_id ?? row.thread_id,
-            fields: row.fields,
-            document: row.document,
-            destinations: row.destinations,
-            submitSelector: row.submit_selector ?? undefined,
-            card: { ...value, securityCode },
-          });
+          await options.fill(
+            {
+              threadId: row.browser_id ?? row.thread_id,
+              fields: row.fields,
+              document: row.document,
+              destinations: row.destinations,
+              submitSelector: row.submit_selector ?? undefined,
+              card: { ...value, securityCode },
+            },
+            signal,
+          );
         },
         complete: async (client) => {
           await record(
@@ -249,6 +256,7 @@ export async function createPayments(
   }
 
   async function fail(row: Row, error: unknown) {
+    if (error instanceof VaultUseError && error.notEntered) return error.message;
     if (!(error instanceof VaultUseError) || error.statusCode !== 502)
       return 'This payment request is no longer open. Check the order or payment state before a new attempt.';
     await record(
@@ -314,11 +322,19 @@ export async function createPayments(
       currency,
       card: cardFacts(card),
       destinations: [...new Set(Object.values(destinations))],
-      requires: 'desktop_private_form',
+      requires: 'private_form',
     };
-    const question = await options.present({ ...turn }, structuredClone(details));
+    const { question, action } = await options.present({ ...turn }, structuredClone(details));
     if (typeof question !== 'string' || !question.trim() || question.length > 12_000)
       throw new PaymentError('The payment model did not produce a valid question.');
+    if (
+      typeof action !== 'string' ||
+      !action.trim() ||
+      action.length > 64 ||
+      /[\r\n]/.test(action) ||
+      !/[\p{L}\p{N}]/u.test(action)
+    )
+      throw new PaymentError('The payment model did not produce a valid action.');
     const closed = await uses.transaction(async (client) => {
       const active = await client.query(
         `SELECT 1 FROM turns u JOIN threads th ON th.id=u.thread_id AND th.owner_id=u.owner_id
@@ -377,7 +393,7 @@ export async function createPayments(
       { kind: 'payment', origin, payment: spent(row) },
       'requested',
     );
-    return { image, question, url: `/payments/${row.id}` };
+    return { image, question, action, url: `/payments/${row.id}` };
   }
 
   async function submitCode(turnId: string, code: string, paymentId: string) {
@@ -389,7 +405,10 @@ export async function createPayments(
     } catch (error) {
       if (error instanceof VaultUseError && error.statusCode === 502)
         await options.resume(row.turn_id, await fail(row, error));
-      return { status: 'unavailable' as const };
+      return {
+        status: 'unavailable' as const,
+        ...(error instanceof VaultUseError && error.notEntered ? { notEntered: true } : {}),
+      };
     }
     return { status: 'submitted' as const };
   }
@@ -401,8 +420,13 @@ export async function createPayments(
         reply.header('Cache-Control', 'no-store');
         if (!z.uuid().safeParse(request.params.id).success)
           return reply.code(404).send({ error: 'This payment request is unavailable.' });
-        const result = await pool.query<{ status: string; card_id: string; card_version: string }>(
-          `SELECT p.card_id,p.card_version,CASE WHEN v.status='running' THEN 'entering' WHEN v.status IS NOT NULL THEN v.status
+        const result = await pool.query<{
+          status: string;
+          card_id: string;
+          card_version: string;
+          not_entered: boolean;
+        }>(
+          `SELECT p.card_id,p.card_version,v.status='not_entered' AS not_entered,CASE WHEN v.status='not_entered' THEN 'expired' WHEN v.status='running' THEN 'entering' WHEN v.status IS NOT NULL THEN v.status
            WHEN p.status='pending' AND EXISTS(SELECT 1 FROM turns u JOIN threads th ON th.id=u.thread_id AND th.owner_id=u.owner_id
              WHERE u.id=p.turn_id AND u.owner_id=p.owner_id AND th.archived_at IS NULL AND ${currentTurnSql}) THEN 'pending'
            ELSE 'expired' END AS status
@@ -420,7 +444,7 @@ export async function createPayments(
           )
         )
           return { status: 'expired' };
-        return { status: row.status };
+        return { status: row.status, ...(row.not_entered ? { notEntered: true } : {}) };
       },
     );
     app.get<{ Params: { id: string } }>('/api/payment-requests/:id', async (request, reply) => {

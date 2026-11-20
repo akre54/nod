@@ -4,6 +4,46 @@
 .model-current-section {
   margin-bottom: 28px;
 }
+.model-sentences {
+  display: grid;
+  gap: 4px;
+  font-size: 20px;
+}
+.model-sentences > p {
+  margin: 0;
+}
+.model-picker.model-picker-inline {
+  display: inline;
+}
+.model-sentences-note {
+  margin: 12px 0 0;
+  color: var(--muted-foreground);
+  font-size: var(--text-control);
+  line-height: 1.5;
+}
+.work-model {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  color: var(--text-secondary);
+  font-size: var(--text-control);
+  line-height: 1.6;
+}
+.work-model-label {
+  color: var(--muted-foreground);
+}
+.work-model-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.work-model-value > strong {
+  color: var(--foreground);
+  font-weight: 500;
+}
+.work-model > .model-picker {
+  margin-left: auto;
+}
 .model-current-section > h3,
 .model-section-heading > h3 {
   margin: 0;

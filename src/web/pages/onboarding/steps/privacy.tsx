@@ -17,13 +17,13 @@ export function Privacy({ arrived, onNext, onBack, nextLabel, traces, usageShare
             14 days, never used to train AI.
           </Bubble>,
         ]
-      : [<Bubble>Conversation traces aren’t available in this version of Nod.</Bubble>]),
+      : []),
     ...(usageShared
       ? [
           <Bubble>
-            {traces ? 'I also share' : 'I share'} basic usage data, including your fixed About you
-            choices and the screens you open, but never your messages or screen recordings. You can
-            turn it off in Settings.
+            {traces ? 'I also share' : 'I share'} basic usage data, including your About you choices
+            and the screens you open, but never your messages or screen recordings. You can turn it
+            off in Settings.
           </Bubble>,
         ]
       : []),

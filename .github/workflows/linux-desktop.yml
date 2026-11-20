@@ -18,8 +18,10 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
+      - '.github/workflows/linux-desktop.yml'
       - 'desktop/flatpak/**'
       - 'desktop/scripts/*linux*.mjs'
+      - 'desktop/scripts/*linux*.py'
       - 'desktop/test/*linux*.test.mjs'
 
 permissions:
@@ -58,9 +60,8 @@ jobs:
             desktop/pnpm-lock.yaml
       - name: Install build tools and Flatpak runtimes
         run: |
-          sudo add-apt-repository --yes ppa:flatpak/stable
           sudo apt-get update
-          sudo apt-get install -y dbus flatpak flatpak-builder zstd
+          sudo apt-get install -y dbus flatpak flatpak-builder python3-dbusmock zstd
           if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
@@ -125,6 +126,8 @@ jobs:
             const sharp = (await import("sharp")).default;
             await sharp({ create: { width: 2, height: 2, channels: 4, background: "#ff0000" } }).png().toBuffer();
           '
+      - name: Check power services through the installed Flatpak
+        run: /usr/bin/python3 desktop/scripts/check-linux-power.py
       - name: Split and verify release files
         run: |
           NOD_FLATPAK_COMMIT="$(flatpak info --user --show-commit io.n8n.Nod)"

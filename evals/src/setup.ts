@@ -22,12 +22,19 @@ async function call(
 }
 
 export async function prepare(stack: Stack, world: World, timeZone: string) {
+  const preferences = await (await call(stack, 'GET', '/api/preferences')).json();
   await call(stack, 'PATCH', '/api/preferences', {
     timeZone,
     quietHoursEnabled: false,
+    ...('proactivePaused' in preferences ? { proactivePaused: false } : {}),
     notificationRule: world.notificationRule ?? '',
     ...(world.rules ? { rules: world.rules } : {}),
   });
+  if (stack.home)
+    await stack.pool.query('UPDATE preferences SET local_files_enabled=true, local_keep_out=$1', [
+      ['/Volumes', '/media', '/run/media'],
+    ]);
+  if (world.desktop) await call(stack, 'PATCH', '/api/computer-use', { enabled: true });
   const slugs = world.apps?.services ?? [];
   for (const slug of slugs) {
     await call(stack, 'POST', `/api/apps/${slug}/connect`, { returnTo: 'apps' });

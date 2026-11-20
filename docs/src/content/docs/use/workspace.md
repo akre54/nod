@@ -44,8 +44,33 @@ flowchart LR
 - **The browser.** Nod's browser runs in its own container. The workspace can't read its saved sign-ins.
 
 :::caution
-The workspace can reach the internet. Code that Nod runs there can download files and call websites.
+The workspace can reach the internet. Code that Nod runs there can download files and call websites. Commands run without a [trust check](/trust/approvals/#workspace-commands), because the workspace holds no keys or sign-ins. A command can still send files that are in the workspace to an outside site.
 :::
+
+## Watch Nod's commands
+
+You can watch the commands a task runs in the workspace. Open the task's preview in chat and select **Show commands**.
+
+Each row shows the command and its status. Select a row to open the command and its saved output.
+
+| Status                | What it means                                                               |
+| --------------------- | --------------------------------------------------------------------------- |
+| **Exit 0**            | The command finished without an error                                       |
+| **Exit** and a number | The command finished with that exit code. A nonzero code indicates an error |
+| **Finished**          | The command finished, but Nod did not record an exit code                   |
+| **Running**           | The command has not reported back, and its turn is still running            |
+| **Failed**            | The command failed before Nod could record an exit code                     |
+| **Interrupted**       | The turn ended before Nod could record the command's result                 |
+
+Commands from a task's helpers have a **Helper** label. The task shows the latest 200 commands. Each output keeps at most the last 16,000 characters of the redacted command output. The exit code is saved when available. Output is saved when a command ends or fails. It does not stream while the command runs.
+
+The view is read-only. Commands run in Nod's isolated workspace. To stop a running command, stop the task.
+
+You can also open **Usage** and select a request to see its commands in the [step log](/use/spending/#see-your-spending). Select a command to open the same detail view. **Export** includes the recorded command, exit code, status and saved output in the CSV file. Older commands without a saved command record still appear as a Bash step.
+
+Before Nod saves an entry, it removes known secrets from the command and output. This includes provider keys, tokens and values assigned to names such as `password`. Nod cannot identify every secret. Private file content can remain in the saved output and the CSV export.
+
+The display limits do not delete older records. The command records remain in your local or self-hosted database until you [remove all data](/trust/privacy/#delete-your-data).
 
 ## Give Nod files
 
@@ -63,7 +88,7 @@ The panel remembers reading state for up to eight recently viewed files, with a 
 
 - **Use in message** adds an existing file to your draft.
 - **Copy image** copies raster image data where the clipboard supports it. **Download** keeps the original file format.
-- In the desktop app, drag a file card, image, or preview file icon to a folder to copy the file. **Save to Downloads** shows **Open** and **Show in folder** after the save completes. The file menu uses the system menu.
+- In the desktop app, drag a file card, image, or preview file icon to a folder to copy the file. **Save to Downloads** shows **Open** and **Show in folder** after the save completes. The file menu uses the system menu. Right-click a file card, a preview in chat, or an image, video or PDF in the panel to show the file menu. Links, fields and selected text keep their own menu.
 
 Desktop file actions prepare private copies in the system temporary folder, up to eight files. They're removed when the cache needs room or the app quits. A forced stop can leave one behind. Saving creates a separate file in Downloads.
 
@@ -84,7 +109,7 @@ HTML files run in a sandbox, apart from Nod. Their scripts work, but they can't 
 
 Previews have size limits: 4 MB for text, Markdown, HTML and spreadsheets, 25 MB for Word documents and 60 MB for presentations. Download larger files to open them.
 
-When Nod puts a full workspace file path in a link or inline code in a reply, the server checks the file and attaches it. The link opens the attachment. A missing or unavailable file prevents that reply from being saved. File paths in code blocks remain examples.
+When Nod puts a full workspace file path in a link or inline code in a reply, the server checks the file and attaches it. The link opens the attachment. A path the server can't attach, such as a folder, a missing file or a location outside this conversation's workspace, stays as plain text and the rest of the reply still arrives. File paths in code blocks remain examples.
 
 Files Nod saves along the way stay private in the workspace until it shares them. Ask for one by name if you want it. Telegram and the WhatsApp QR connection receive shared files up to 50 MB each. With the WhatsApp Cloud API, open Nod to get files. See [Telegram and WhatsApp](/use/channels/).
 
