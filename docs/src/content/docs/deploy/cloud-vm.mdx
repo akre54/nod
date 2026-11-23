@@ -28,7 +28,8 @@ This page puts the steps in order and links to the full instructions for each on
 
 4. Choose how you reach the server:
    - **Private:** [open an SSH tunnel](/deploy/self-host/#open-a-remote-server-without-a-domain) from your computer and use `http://localhost:4310`. You don't open any port other than SSH.
-   - **Public:** point a domain at the VM, allow inbound TCP 80 and 443, and [add HTTPS](/deploy/self-host/#add-public-https) or [use your own proxy](/deploy/self-host/#use-an-existing-proxy). Your address looks like `https://nod.example.com`.
+   - **Public with bundled HTTPS:** point a domain at the VM, allow inbound TCP 80 and 443, and [add HTTPS](/deploy/self-host/#add-public-https). Your address looks like `https://nod.example.com`.
+   - **Public with your own proxy:** point a domain at the VM, allow inbound traffic on the proxy's HTTPS port, and [use your own proxy](/deploy/self-host/#use-an-existing-proxy). The address can use a custom port, such as `https://nod.example.com:8443`.
 
 5. Open the `.env` file in the installation folder on the VM and copy the value of `NOD_AUTH_TOKEN`.
 
@@ -38,11 +39,12 @@ This page puts the steps in order and links to the full instructions for each on
 
 ## Connect your devices
 
-Use the same address and token on each device:
+Use the same address and token in each browser and desktop app:
 
 - **Browser:** open the address and enter the token.
 - **Desktop app:** choose **Connect to a server** on the setup screen. See [Connect the desktop app](/deploy/self-host/#connect-the-desktop-app).
-- **Telegram or WhatsApp:** connect them in **Channels**. See [Connect Telegram or WhatsApp](/deploy/self-host/#connect-telegram-or-whatsapp).
+
+To use Telegram or WhatsApp, connect them on the server's **Channels** page. See [Connect Telegram or WhatsApp](/deploy/self-host/#connect-telegram-or-whatsapp).
 
 Connecting the desktop app doesn't move its local assistant or its data to the server. To switch back, choose **Replay onboarding… → Change server → Use this computer**.
 

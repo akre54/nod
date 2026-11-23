@@ -251,7 +251,8 @@ function ConnectionSetup() {
             aria-describedby="server-address-help"
           />
           <p id="server-address-help" className="server-help">
-            Use the server’s HTTPS address. Through an SSH tunnel, use http://localhost:4310.
+            Use the server’s HTTPS address. Through an SSH tunnel, use {'http://localhost:<port>'}{' '}
+            with the tunnel’s local port, 4310 by default.
           </p>
           <label htmlFor="server-token">Authentication token</label>
           <PasswordInput

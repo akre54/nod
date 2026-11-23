@@ -52,7 +52,7 @@ export function ServerAccess({ onConnected }: { onConnected(): Promise<boolean> 
         </header>
         <Field
           label="Authentication token"
-          hint="Find NOD_AUTH_TOKEN in the server’s .env file, created when you installed Nod."
+          hint="On a self-hosted server, find NOD_AUTH_TOKEN in its .env file. For a local source install, use the access link printed when Nod starts."
         >
           <Input
             type="password"
