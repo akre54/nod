@@ -269,6 +269,7 @@ export interface ThreadDependencies {
     newAccount?: boolean,
     query?: string,
     connectionId?: string,
+    signal?: AbortSignal,
   ) => Promise<unknown>;
   browserConnection?: (
     request: BrowserConnectionRequest,
@@ -2482,7 +2483,7 @@ async function executeTurn(turn: any, dependencies: ThreadDependencies) {
       connections:
         connections &&
         fenced((action, service, proposal, newAccount, query, connectionId) =>
-          connections(action, service, ref, proposal, newAccount, query, connectionId),
+          connections(action, service, ref, proposal, newAccount, query, connectionId, signal),
         ),
       browserConnection:
         browserConnection &&

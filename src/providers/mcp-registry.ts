@@ -78,7 +78,7 @@ export function createMcpRegistry({
         ...(signal ? [signal] : []),
       ]);
       const timedOut = () => !signal?.aborted && deadline.aborted;
-      const url = new URL('/v0/servers', origin);
+      const url = new URL('/v0.1/servers', origin);
       url.searchParams.set('search', query);
       url.searchParams.set('version', 'latest');
       url.searchParams.set('limit', String(requested));
@@ -134,35 +134,28 @@ export function createMcpRegistry({
       });
       const checked = await Promise.all(
         candidates.slice(0, requested).map(async (server) => {
-          const remotes = (
-            await Promise.all(
-              (server.remotes ?? [])
-                .filter(
-                  (remote) =>
-                    (remote.type === 'streamable-http' || remote.type === 'sse') &&
-                    !/[{}]/.test(remote.url),
-                )
-                .slice(0, 3)
-                .map(async (remote) => {
-                  const endpoint = await Promise.race([
-                    validate(remote.url),
-                    aborted(deadline),
-                  ]).catch(() => undefined);
-                  if (!endpoint) return [];
-                  const required = (remote.headers ?? [])
-                    .filter((header) => header.isRequired)
-                    .map((header) => header.name)
-                    .slice(0, 5);
-                  return [
-                    {
-                      transport: remote.type as 'streamable-http' | 'sse',
-                      url: endpoint,
-                      ...(required.length ? { requiredHeaders: required } : {}),
-                    },
-                  ];
-                }),
+          const remotes: McpRegistryServer['remotes'] = [];
+          for (const remote of server.remotes ?? []) {
+            if (remotes.length === 3 || deadline.aborted) break;
+            if (
+              (remote.type !== 'streamable-http' && remote.type !== 'sse') ||
+              /[{}]/.test(remote.url)
             )
-          ).flat();
+              continue;
+            const endpoint = await Promise.race([validate(remote.url), aborted(deadline)]).catch(
+              () => undefined,
+            );
+            if (!endpoint) continue;
+            const required = (remote.headers ?? [])
+              .filter((header) => header.isRequired)
+              .map((header) => header.name)
+              .slice(0, 5);
+            remotes.push({
+              transport: remote.type,
+              url: endpoint,
+              ...(required.length ? { requiredHeaders: required } : {}),
+            });
+          }
           if (!remotes.length) return [];
           const result: McpRegistryServer = {
             name: server.name,

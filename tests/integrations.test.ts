@@ -1424,6 +1424,14 @@ test('MCP Registry search keeps only public HTTPS remote servers and keeps the r
         remote('https://mcp.example.test/stream', 'sse'),
       ],
     }),
+    entry('test.synthetic/later', {
+      remotes: [
+        remote('https://internal.example.test/one'),
+        remote('https://internal.example.test/two'),
+        remote('https://internal.example.test/three'),
+        remote('https://mcp.example.test/later'),
+      ],
+    }),
     entry('test.synthetic/private', { remotes: [remote('https://internal.example.test/mcp')] }),
     entry('test.synthetic/address', { remotes: [remote('https://10.1.2.3/mcp')] }),
     entry('test.synthetic/plain', { remotes: [remote('http://mcp.example.test/mcp')] }),
@@ -1472,10 +1480,15 @@ test('MCP Registry search keeps only public HTTPS remote servers and keeps the r
         { transport: 'sse', url: 'https://mcp.example.test/stream' },
       ],
     },
+    {
+      name: 'test.synthetic/later',
+      version: '1.0.0',
+      remotes: [{ transport: 'streamable-http', url: 'https://mcp.example.test/later' }],
+    },
   ]);
   const sent = new URL(requests[0].url);
   assert.equal(sent.origin, 'https://registry.modelcontextprotocol.io');
-  assert.equal(sent.pathname, '/v0/servers');
+  assert.equal(sent.pathname, '/v0.1/servers');
   assert.equal(sent.searchParams.get('search'), 'synthetic');
   assert.equal(sent.searchParams.get('version'), 'latest');
   answer = async () =>
@@ -1531,6 +1544,7 @@ test(
       },
     });
     const searched: string[] = [];
+    const signals: Array<AbortSignal | undefined> = [];
     let registryFailure: Error | undefined;
     const provider = fakeProvider({
       id: 'unused',
@@ -1546,8 +1560,10 @@ test(
       baseUrl: 'http://localhost:4310',
       wake: async () => {},
       registry: {
-        search: async (query) => {
+        search: async (query, signal) => {
           searched.push(query);
+          signals.push(signal);
+          signal?.throwIfAborted();
           if (registryFailure) throw registryFailure;
           return [
             {
@@ -1560,7 +1576,7 @@ test(
         },
       },
     });
-    const discover = async (query: string) =>
+    const discover = async (query: string, signal?: AbortSignal) =>
       JSON.parse(
         JSON.stringify(
           await integrations.manageConnections(
@@ -1570,6 +1586,8 @@ test(
             undefined,
             undefined,
             query,
+            undefined,
+            signal,
           ),
         ),
       );
@@ -1612,6 +1630,10 @@ test(
       (await discover('registry fixture')).registry.error,
       'The MCP Registry did not answer within 5 seconds.',
     );
+    const stop = new AbortController();
+    stop.abort(new Error('Synthetic stop.'));
+    await assert.rejects(discover('registry fixture', stop.signal), { message: 'Synthetic stop.' });
+    assert.equal(signals.at(-1), stop.signal);
     const turn = { threadId: randomUUID(), turnId: randomUUID() };
     const proposed = (await integrations.manageConnections('propose', undefined, turn, {
       service: 'registry-fixture',

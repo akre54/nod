@@ -3052,6 +3052,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
       newAccount?: boolean,
       query?: string,
       connectionId?: string,
+      signal?: AbortSignal,
     ) => {
       if (connectionId !== undefined && (action !== 'connect' || newAccount === true))
         throw new IntegrationError(
@@ -3113,14 +3114,17 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
           hasMore: matches.length > 30,
           ...(!matches.length && search && options.registry
             ? {
-                registry: await options.registry.search(search).then(
+                registry: await options.registry.search(search, signal).then(
                   (servers) => ({ source: 'MCP Registry', verified: false, servers }),
-                  (error: unknown) => ({
-                    error:
-                      error instanceof McpRegistryError
-                        ? error.message
-                        : `The MCP Registry could not be searched: ${error instanceof Error ? error.message : String(error)}`,
-                  }),
+                  (error: unknown) => {
+                    signal?.throwIfAborted();
+                    return {
+                      error:
+                        error instanceof McpRegistryError
+                          ? error.message
+                          : `The MCP Registry could not be searched: ${error instanceof Error ? error.message : String(error)}`,
+                    };
+                  },
                 ),
               }
             : {}),
