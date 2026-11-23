@@ -378,6 +378,19 @@ test(
           await expectMonthly(0.01);
           pricing = { ...original, input: 2.2 };
           await expectMonthly((1.94 + 0.24) / 2);
+
+          const taskTurn = await thread.enqueueTurn('Synthetic task sample', {
+            source: 'task',
+            background: true,
+          });
+          sampleTurns.push(taskTurn);
+          await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [taskTurn]);
+          await db.pool.query(
+            `INSERT INTO model_usage(id,owner_id,turn_id,cost_usd,details)
+             VALUES($1,$2,$3,0.1,'{"category":"agent","inputTokens":50000}')`,
+            [randomUUID(), ownerId, taskTurn],
+          );
+          await expectMonthly(0.11);
         } finally {
           await request('DELETE', `/api/schedules/${schedule.id}`);
           await db.pool.query('DELETE FROM model_usage WHERE turn_id=ANY($1::uuid[])', [
@@ -1418,6 +1431,34 @@ test(
           await expectRunCost(0.15);
         },
       );
+      await t.test('run history returns the finished reply and the shared files', async () => {
+        const before = clock;
+        const schedule = await create({ cron: '*/15 * * * *' });
+        const job = await jobFor(schedule.id);
+        clock = new Date(job.data.scheduledFor);
+        await deliver([job]);
+        const [run] = await runs(schedule.id);
+        await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [run!.turnId]);
+        const [reportId, fileId] = [randomUUID(), randomUUID()];
+        const file = { id: randomUUID(), name: 'fixture.csv', mimeType: 'text/csv', size: 13 };
+        for (const [id, text, seconds, attachments] of [
+          [randomUUID(), 'Checking the synthetic report.', 0, []],
+          [reportId, 'The synthetic report is complete.', 1, []],
+          [fileId, '', 2, [{ ...file, url: `/api/artifacts/${file.id}` }]],
+        ] as const)
+          await db.pool.query(
+            `INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text,created_at,attachments)
+             SELECT $1,owner_id,thread_id,id,'assistant',$3,now()+$4 * interval '1 second',$5::jsonb
+             FROM turns WHERE id=$2`,
+            [id, run!.turnId, text, seconds, JSON.stringify(attachments)],
+          );
+        const [result] = await runs(schedule.id);
+        assert.equal(result!.messageId, reportId);
+        assert.equal(result!.messageText, 'The synthetic report is complete.');
+        assert.equal(result!.attachmentMessageId, fileId);
+        await request('DELETE', `/api/schedules/${schedule.id}`);
+        clock = before;
+      });
       await t.test(
         'a recurring schedule starts no run while its last run is busy or waiting on the owner',
         async () => {
@@ -1521,6 +1562,21 @@ test(
           clock = before;
         },
       );
+      await t.test('changing a watched schedule to one-time drops its watch', async () => {
+        const account = randomUUID();
+        watched.set(account, 'constant');
+        const schedule = await create({ cron: '*/15 * * * *', watch: [account] });
+        const patch = async (body: Record<string, unknown>) => {
+          const response = await request('PATCH', `/api/schedules/${schedule.id}`, body);
+          assert.equal(response.statusCode, 200, response.body);
+        };
+        await patch({ title: 'Still watched' });
+        assert.deepEqual((await saved(schedule.id)).watch, [account]);
+        await patch({ kind: 'once', runAt: new Date(clock.getTime() + 60_000).toISOString() });
+        await patch({ kind: 'recurring', cron: '*/15 * * * *' });
+        assert.equal((await saved(schedule.id)).watch, null);
+        await request('DELETE', `/api/schedules/${schedule.id}`);
+      });
       await t.test('stale watched jobs do not poll accounts or start runs', async () => {
         const before = clock;
         const account = randomUUID();
@@ -1708,6 +1764,83 @@ test(
           }
           assert.equal(await fire(), 2);
           await request('DELETE', `/api/schedules/${schedule.id}`);
+          clock = before;
+        },
+      );
+      await t.test('renaming a schedule keeps the skips recorded for its next run', async () => {
+        const before = clock;
+        const schedule = await create({ cron: '*/15 * * * *' });
+        modelPaused = true;
+        for (let i = 0; i < 2; i++) {
+          const job = await jobFor(schedule.id);
+          clock = new Date(job.data.scheduledFor);
+          await deliver([job]);
+        }
+        modelPaused = false;
+        const next = (await jobFor(schedule.id)).data.scheduledFor;
+        const renamed = await request('PATCH', `/api/schedules/${schedule.id}`, {
+          title: 'Renamed schedule',
+        });
+        assert.equal(renamed.statusCode, 200, renamed.body);
+        const job = await jobFor(schedule.id);
+        assert.equal(job.data.scheduledFor, next);
+        clock = new Date(next);
+        await deliver([job]);
+        const [run] = await runs(schedule.id);
+        const { skipped } = (
+          await db.pool.query('SELECT skipped FROM schedule_runs WHERE turn_id=$1', [run!.turnId])
+        ).rows[0];
+        assert.equal(skipped.length, 2);
+        await request('DELETE', `/api/schedules/${schedule.id}`);
+        clock = before;
+      });
+      await t.test(
+        'a resumed scheduled run records its observation on the original run',
+        async () => {
+          const before = clock;
+          const schedule = await create({ cron: '0 9 * * 1' });
+          clock = new Date(schedule.nextRun!);
+          await deliver([await jobFor(schedule.id)]);
+          const [run] = await runs(schedule.id);
+          const observation = {
+            status: 'verified',
+            sourceUrl: 'https://watch.example.test/pricing',
+            value: 'Pro 39 EUR',
+            summary: 'Synthetic pricing observation.',
+          };
+          const record = (turnId: string, service = personal) =>
+            thread.withTurnLock(turnId, (client) =>
+              service.manage(
+                'schedule_record_observation',
+                observation,
+                { sourceMessageId: null, turnId },
+                { client },
+              ),
+            );
+          const [continuation, unrelated] = [randomUUID(), randomUUID()];
+          await db.pool.query("UPDATE turns SET status='waiting' WHERE id=$1", [run!.turnId]);
+          await db.pool.query(
+            `INSERT INTO turns(id,owner_id,thread_id,session_id,parent_turn_id,source,status,prompt)
+           SELECT v.id,u.owner_id,u.thread_id,COALESCE(v.session,u.session_id),v.parent,v.source,'running','Synthetic work'
+           FROM turns u,(VALUES($2::uuid,NULL::uuid,$1::uuid,'resume'),($3::uuid,$3::uuid,NULL::uuid,'user'))
+             AS v(id,session,parent,source)
+           WHERE u.id=$1`,
+            [run!.turnId, continuation, unrelated],
+          );
+          await assert.rejects(record(unrelated), /no active scheduled run/);
+          const other = createPersonalService({
+            pool: db.pool,
+            ownerId: 'another-owner',
+            scheduler: thread.boss,
+            enqueueTurn: thread.enqueueTurn,
+            refresh() {},
+          });
+          await assert.rejects(record(continuation, other), /no active scheduled run/);
+          await record(continuation);
+          assert.equal((await runs(schedule.id))[0]!.observation?.value, 'Pro 39 EUR');
+          await db.pool.query("UPDATE turns SET status='cancelled' WHERE id=ANY($1::uuid[])", [
+            [run!.turnId, continuation, unrelated],
+          ]);
           clock = before;
         },
       );
@@ -2316,8 +2449,14 @@ test('scheduled controls reconcile pause and delete after a client timeout', asy
   );
   for (const [key, value] of Object.entries(globals))
     Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
-  const nativeTimeout = AbortSignal.timeout.bind(AbortSignal);
-  t.mock.method(AbortSignal, 'timeout', (duration: number) => nativeTimeout(duration / 50));
+  t.mock.method(AbortSignal, 'timeout', (duration: number) => {
+    const controller = new AbortController();
+    setTimeout(
+      () => controller.abort(new DOMException('The operation timed out.', 'TimeoutError')),
+      duration / 50,
+    );
+    return controller.signal;
+  });
   const schedule: Schedule = {
     id: randomUUID(),
     title: 'Delayed schedule',
@@ -2401,6 +2540,7 @@ test('scheduled controls reconcile pause and delete after a client timeout', asy
   const { PauseSwitch, PlanToast, ScheduleEditor, useDirectChange } =
     await import('../src/web/components/plan-controls.tsx');
   const { DeletePlan } = await import('../src/web/components/delete-plan.tsx');
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   pageDataCache.clear();
   pageDataCache.update('/api/schedules', () => [schedule]);
   const root = createRoot(dom.window.document.getElementById('root')!);
@@ -2452,10 +2592,12 @@ test('scheduled controls reconcile pause and delete after a client timeout', asy
     await act(async () => commit());
   };
   const waitFor = async (ready: () => boolean, name: string, timeoutMs = 5000) => {
-    const deadline = Date.now() + timeoutMs;
-    while (!ready()) {
-      if (Date.now() >= deadline) assert.fail(`Timed out waiting for ${name}`);
-      await act(async () => new Promise((resolve) => setTimeout(resolve, 50)));
+    for (let waited = 0; !ready(); waited += 50) {
+      if (waited >= timeoutMs) assert.fail(`Timed out waiting for ${name}`);
+      await act(async () => {
+        t.mock.timers.tick(50);
+        await new Promise((resolve) => setImmediate(resolve));
+      });
     }
   };
   await click('[role="switch"]');
@@ -2704,6 +2846,7 @@ test('waiting scheduled runs open their pending question without starting anothe
     messageId: randomUUID(),
     messagePreview: 'Synthetic report ready.',
     messageText: 'Synthetic report ready.',
+    attachmentMessageId: null,
   };
   const queued: ScheduleRun = {
     ...completed,

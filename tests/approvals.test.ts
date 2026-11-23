@@ -26,6 +26,7 @@ import { unified } from 'unified';
 import type { ProductAnalytics } from '../src/ports/analytics.ts';
 import type { MemoryCurator } from '../src/ports/memory-curator.ts';
 import { IntegrationConnectionError } from '../src/ports/integrations.ts';
+import { telegramText, whatsappText } from '../src/providers/chat-sdk/format.ts';
 import { createAnalytics, snapshotAnalytics } from '../src/server/analytics.ts';
 import {
   accessCookie,
@@ -798,6 +799,66 @@ test('confirmation keeps copied page links visible without making them active', 
   );
 });
 
+test('confirmation keeps bold on checked values and escapes every other Markdown', async () => {
+  const strange = 'https://train.example.test/a**b**c';
+  const question = [
+    'Buy **EC 279** on **2 December, 11:37** for **jane@example.test** at **https://train.example.test/buy**?',
+    `Open ${strange} then **https://unlisted.example.test/pay**, and **https://safe.example.test**@other.example.test/** now?`,
+    '次の**12月2日**の便ですか？',
+    '_Note_ # [review](https://outside.example.test) ** loose',
+  ].join('\n\n');
+  const communication = createCommunication({
+    pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+    ownerId: 'synthetic-owner',
+    review: async () => ({ text: question, question, action: 'Buy the ticket' }),
+  });
+  const result = await communication.describe({
+    turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+    action: 'NOD_browser',
+    args: {
+      website: 'https://train.example.test/buy',
+      step: 'click',
+      control: [{ role: 'button', name: 'Buy' }],
+    },
+    details: { pageText: 'EC 279 departs 11:37 on 2 December' },
+  });
+  const nodes = markdownNodes(result.question);
+  const strong = nodes
+    .filter((node) => node.type === 'strong')
+    .map((node) =>
+      (node.children as Array<{ value?: string }>).map((child) => child.value).join(''),
+    );
+  assert.deepEqual(strong, [
+    'EC 279',
+    '2 December, 11:37',
+    'jane@example.test',
+    'https://train.example.test/buy',
+    'https://unlisted.example.test/pay',
+  ]);
+  assert.deepEqual(
+    nodes.filter((node) => node.type === 'inlineCode').map((node) => node.value),
+    [
+      'jane@example.test',
+      'https://train.example.test/buy',
+      strange,
+      'https://unlisted.example.test/pay',
+      'https://safe.example.test**@other.example.test/**',
+      'https://outside.example.test',
+    ],
+  );
+  const visible = visibleMarkdownText(result.question);
+  assert.match(visible, /次の12月2日の便ですか？/);
+  assert.match(visible, /_Note_ # review \(https:\/\/outside\.example\.test\) \*\* loose/);
+  assert.equal(
+    nodes.some((node) => ['emphasis', 'heading', 'link', 'html'].includes(node.type)),
+    false,
+  );
+  for (const text of [telegramText(result.question), whatsappText(result.question)]) {
+    assert.match(text, /\*EC 279\* on \*2 December, 11:37\* for \*`jane@example\.test`\*/);
+    assert.match(text, /次の12月2日の便ですか？/);
+  }
+});
+
 test('Gmail deletion names verified identity without model wording', async () => {
   const communication = createCommunication({
     pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
@@ -1548,7 +1609,7 @@ test('HTML approval previews show the actual link destination', () => {
 
 test(
   'approvals preserve explicit-request authority, execute confirmed snapshots once and fence owners',
-  { skip: !process.env.TEST_DATABASE_URL, timeout: 60_000 },
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 180_000 },
   async (t) => {
     const fixtureRoot = await realpath(await mkdtemp(join(tmpdir(), 'nod-approvals-')));
     const previousDirectory = process.cwd();
@@ -2872,6 +2933,64 @@ test(
           assert.equal(reviews.length, reviewed + 1);
         },
       );
+
+      await t.test('a follow-up task sees the task result the owner answered', async (t) => {
+        const start = async (parent: { threadId: string; turnId: string }, title: string) => {
+          const task = (await tasks.execute(
+            parent,
+            {
+              action: 'start',
+              title,
+              message: `Starting ${title}.`,
+              doneWhen: `${title} is done`,
+              now: 'Working',
+            },
+            (await row(parent.turnId)).message_id,
+          )) as { id: string };
+          t.after(async () => {
+            await db.pool.query(
+              "UPDATE turns SET task_id=NULL,status='cancelled',finished_at=now() WHERE task_id=$1",
+              [task.id],
+            );
+            await db.pool.query('DELETE FROM tasks WHERE id=$1', [task.id]);
+          });
+          await finish(parent.turnId, 'succeeded');
+          const worker = await running(
+            (
+              await db.pool.query("SELECT id FROM turns WHERE task_id=$1 AND source='task'", [
+                task.id,
+              ])
+            ).rows[0].id,
+          );
+          await tasks.inherit(worker);
+          return worker;
+        };
+        const drafting = await start(
+          await begin('Draft a reply to Ana saying the synthetic report is ready.'),
+          'Synthetic draft',
+        );
+        const draft = 'Saved an unsent draft to ana@example.test: The synthetic report is ready.';
+        await db.pool.query(
+          "INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text) VALUES($1,$2,$3,$4,'assistant',$5)",
+          [randomUUID(), ownerId, drafting.threadId, drafting.turnId, draft],
+        );
+        await finish(drafting.turnId, 'succeeded');
+        const sending = await start(await begin('Looks good, send it.'), 'Synthetic send');
+        const marked = async () => (await row(sending.turnId)).outside_action_at instanceof Date;
+        assert.equal(
+          (await trust.check(sending, 'GMAIL_SEND_EMAIL', email('ana@example.test'))).confirm,
+          true,
+        );
+        assert.equal(reviews.at(-1)?.assistantMessageBeforeLatestUserMessage, draft);
+        assert.equal(await marked(), false);
+        aligned = true;
+        assert.equal(
+          (await trust.check(sending, 'GMAIL_SEND_EMAIL', email('ana@example.test'))).confirm,
+          false,
+        );
+        assert.equal(await marked(), true);
+        await finish(sending.turnId, 'cancelled');
+      });
 
       await t.test('replies do not borrow authority from other assistant messages', async (t) => {
         const turnIds: string[] = [];
@@ -4317,7 +4436,7 @@ test(
       );
 
       await t.test(
-        'revision replies leave the addressed proposal open and reach its session',
+        'revision replies close the addressed proposal and reach its session',
         async () => {
           for (const explicit of [false, true]) {
             const before = calls.length;
@@ -4337,8 +4456,8 @@ test(
             });
             const resumed = await row(revised.turnId);
             assert.equal(resumed.source, 'user');
-            assert.equal((await stored(id)).status, 'pending');
-            assert.equal(await turnStatus(origin.turnId), 'waiting');
+            assert.equal((await stored(id)).status, explicit ? 'expired' : 'pending');
+            assert.equal(await turnStatus(origin.turnId), explicit ? 'cancelled' : 'waiting');
             assert.equal(resumed.background, explicit);
             assert.equal(resumed.parent_turn_id, explicit ? origin.turnId : null);
             if (explicit) assert.equal(resumed.session_id, (await row(origin.turnId)).session_id);

@@ -106,6 +106,7 @@ interface ChannelOptions {
       approvalId: string;
       channel: string;
       approved: boolean;
+      label?: string;
       stopSignal?: AbortSignal;
     },
   ) => Promise<void>;
@@ -545,8 +546,14 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
   }
 
   async function pendingTelegramApproval(database: Pool | PoolClient, messageId: string) {
-    const { rows } = await database.query<{ approval_id: string; thread_id: string; text: string }>(
-      `SELECT a.id AS approval_id,m.thread_id,m.text FROM messages m
+    const { rows } = await database.query<{
+      approval_id: string;
+      thread_id: string;
+      text: string;
+      title: string | null;
+      decline: string | null;
+    }>(
+      `SELECT a.id AS approval_id,m.thread_id,m.text,a.title,a.decline FROM messages m
        JOIN approvals a ON a.confirmation_message_id=m.id AND a.owner_id=m.owner_id
          AND a.thread_id=m.thread_id AND a.turn_id=m.turn_id
        JOIN turns u ON u.id=m.turn_id AND u.owner_id=m.owner_id AND u.thread_id=m.thread_id
@@ -611,6 +618,12 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
             approvalId: approval.approval_id,
             channel: conversationChannel(identity),
             approved: input.approved,
+            label:
+              approval.title && approval.decline
+                ? input.approved
+                  ? approval.title
+                  : approval.decline
+                : undefined,
             stopSignal: stop,
           });
           return 'recorded';
@@ -1440,7 +1453,14 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
           accountId: row.account_id,
           threadId: row.thread_id,
           text,
-          ...(approval ? { approval: true as const } : {}),
+          ...(approval
+            ? {
+                approval:
+                  approval.title && approval.decline
+                    ? { approve: approval.title, decline: approval.decline }
+                    : { approve: 'Approve', decline: 'Cancel' },
+              }
+            : {}),
           ...(attachments
             ? {
                 attachments,

@@ -1,6 +1,7 @@
 import {
   InMemoryCredentialStore,
   getSupportedThinkingLevels,
+  isRetryableAssistantError,
   type Api,
   type AssistantMessage,
   type Context,
@@ -143,7 +144,8 @@ export function createPiMemoryCurator(options: {
     ) {
       signal?.throwIfAborted();
       const traceTurnId = crypto.randomUUID();
-      const bounded = task === 'classify' || task === 'attention' || task === 'check';
+      const bounded =
+        task === 'classify' || task === 'attention' || task === 'check' || task === 'activity';
       const turnBound =
         signal !== undefined && ['review', 'access', 'skill', 'remember'].includes(task);
       if (options.resolve) loaded = undefined;
@@ -302,7 +304,7 @@ export function createPiMemoryCurator(options: {
         const label =
           task === 'vision'
             ? 'The image model is unavailable.'
-            : task === 'classify' || task === 'attention'
+            : task === 'classify' || task === 'attention' || task === 'activity'
               ? 'The classification model is unavailable.'
               : task === 'review' || task === 'access'
                 ? 'The action review model is unavailable.'
@@ -318,7 +320,12 @@ export function createPiMemoryCurator(options: {
         const status = [...(reply.errorMessage ?? '').matchAll(/\(HTTP (\d{3})\)/g)].at(-1)?.[1];
         throw Object.assign(
           new Error(`${label} Task: ${task}. Model: ${model.provider}/${model.id}.${detail}`),
-          status ? { providerStatus: Number(status) } : {},
+          status
+            ? {
+                providerStatus: Number(status),
+                providerRetryable: isRetryableAssistantError(reply),
+              }
+            : {},
         );
       }
       return json(

@@ -30,8 +30,7 @@ import { classifyVerificationReply, securityCodeIn } from '../../shared/verifica
 import { ChatTools } from '../components/chat-tools';
 import { ServiceLogo } from '../components/service-logo';
 import { Composer, type ComposerHandle, type ComposerSendResult } from '../components/composer';
-import { TaskCard } from './tasks';
-import { MessageBubble, type MessageWork } from '../components/message';
+import { MessageBubble, WorkLabel, type MessageWork } from '../components/message';
 import { conversationFiles } from '../components/attachment-card';
 import { ArtifactWorkspace } from '../components/artifact-drawer';
 import { PrivateEntryWorkspace } from '../components/private-entry';
@@ -53,7 +52,7 @@ import {
 import { formatDayLabel, isSameDay, useDateFormat } from '../lib/date-format';
 import { NodGlyph, Rise, prefersReducedMotion } from '../components/motion';
 import { LiveLine } from '../components/live-line';
-import { TaskDots } from '../components/task-dots';
+import { TaskChip, TaskLine, TaskStackCard } from '../components/task-stack';
 import { recordingSource } from '../lib/recording';
 import { money } from '../lib/money';
 import type { ImagePreview } from '../components/attachment-images';
@@ -133,12 +132,14 @@ function Working({
   sending = false,
   writing = false,
   quiet = true,
+  routed,
 }: {
   items?: Activity[];
   label?: string;
   sending?: boolean;
   writing?: boolean;
   quiet?: boolean;
+  routed?: MessageWork;
 }) {
   const found = items.find((item) => !item.background && !item.taskId);
   const chat = found?.doing === 'queued' ? undefined : found;
@@ -146,6 +147,15 @@ function Working({
   const receipt = items.some((item) => !item.background && item.received)
     ? 'Got your message. I’ll read it after this step.'
     : null;
+  if (!thinking && !label && !receipt && routed)
+    return (
+      <div className="thinking">
+        <NodGlyph size={28} mode="thinking" />
+        <div className="working-details">
+          <WorkLabel work={routed} />
+        </div>
+      </div>
+    );
   if (!thinking && !label && !receipt && !found) return null;
   return (
     <div className="thinking" hidden={!thinking && !label && !receipt}>
@@ -153,7 +163,7 @@ function Working({
       <div className="working-details">
         <div className="working-text">
           <div hidden={!thinking}>
-            <LiveLine item={chat} quiet={quiet && thinking} />
+            <LiveLine item={chat} quiet={quiet && thinking} clipped />
           </div>
           {!thinking && (
             <span className="live-line-current" role="status">
@@ -767,22 +777,71 @@ export function Chat({
   const chatWork = connected
     ? live.find((item) => !item.background && !item.taskId && !item.runId)
     : undefined;
+  const lastOwner = allMessages.findLast((message) => message.role === 'user');
+  const routedWork = !chatWork && lastOwner?.work?.kind === 'task' ? lastOwner.work : undefined;
+  const routedItem = routedWork
+    ? live.find(
+        (entry) =>
+          entry.taskId === routedWork.id &&
+          (entry.turnId === routedWork.turnId || entry.turnId === lastOwner!.turnId) &&
+          !allMessages.some(
+            (message) =>
+              message.role === 'assistant' &&
+              message.turnId === entry.turnId &&
+              message.createdAt > lastOwner!.createdAt,
+          ),
+      )
+    : undefined;
   const workOf = (message: Message): MessageWork | undefined => {
-    const work = message.work;
+    const work = message.role === 'assistant' ? message.work : undefined;
     if (!work) return undefined;
     const item = live.find((entry) =>
       work.kind === 'task' ? entry.taskId === work.id : entry.runId === work.id,
     );
+    const moved = work.kind === 'task' && routedItem?.taskId === work.id;
+    return labelOf(
+      work,
+      message.approval?.state === 'pending' || message.answerChoicesPending
+        ? 'needs_you'
+        : item && !moved
+          ? 'working'
+          : 'idle',
+      moved ? undefined : item,
+    );
+  };
+  const startedTask = (message: Message) =>
+    message.role === 'assistant'
+      ? state.tasks?.find((task) => task.messageId === message.id)
+      : undefined;
+  const approvalTask = (message: Message) =>
+    message.approval && message.work?.kind === 'task'
+      ? state.tasks?.find((task) => task.id === message.work!.id)
+      : undefined;
+  const chipOf = (message: Message) => {
+    const task = startedTask(message);
+    if (!task) return undefined;
+    const answer = allMessages.findLast(
+      (item) => item.role === 'assistant' && item.replyToMessageId === message.id,
+    );
+    return (
+      <TaskChip
+        task={task}
+        running={live.some((item) => item.taskId === task.id)}
+        answerId={answer?.id}
+      />
+    );
+  };
+  const labelOf = (
+    work: NonNullable<Message['work']>,
+    status: MessageWork['status'],
+    item: Activity | undefined,
+  ): MessageWork => {
     const task =
       work.kind === 'task' ? state.tasks?.find((entry) => entry.id === work.id) : undefined;
     return {
       title: work.title,
-      status:
-        message.approval?.state === 'pending' || message.answerChoicesPending
-          ? 'needs_you'
-          : item
-            ? 'working'
-            : 'idle',
+      status,
+      ...(task?.status === 'done' ? { done: true } : {}),
       live: item,
       ...(task?.messageId
         ? {
@@ -801,6 +860,7 @@ export function Chat({
         : {}),
     };
   };
+  const routed = routedWork && routedItem ? labelOf(routedWork, 'working', routedItem) : undefined;
   const lastChatWork = useRef<{ threadId: string; item: Activity } | null>(null);
   if (chatWork) lastChatWork.current = { threadId, item: chatWork };
   const finishing = lastChatWork.current?.threadId === threadId ? lastChatWork.current.item : null;
@@ -1154,26 +1214,6 @@ export function Chat({
     };
     window.addEventListener('nod:focus-message', focusMessage);
     return () => window.removeEventListener('nod:focus-message', focusMessage);
-  }, []);
-  useEffect(() => {
-    const openTask = (event: Event) => {
-      const id = (event as CustomEvent<{ taskId?: unknown }>).detail?.taskId;
-      const element = scroll.current;
-      const card = Array.from(element?.querySelectorAll<HTMLElement>('[data-task-id]') ?? []).find(
-        (item) => item.dataset.taskId === id,
-      );
-      if (!element || !card?.getClientRects().length) return;
-      const view = element.getBoundingClientRect();
-      const box = card.getBoundingClientRect();
-      if (box.top >= view.top && box.bottom <= view.bottom) return;
-      stickToBottom.current = false;
-      card.scrollIntoView({
-        block: 'center',
-        behavior: prefersReducedMotion() ? 'auto' : 'smooth',
-      });
-    };
-    window.addEventListener('nod:open-task', openTask);
-    return () => window.removeEventListener('nod:open-task', openTask);
   }, []);
   useEffect(() => {
     if (!visible || !focusTarget || loadingHistory) return;
@@ -2329,28 +2369,20 @@ export function Chat({
                         void send(task.title, [], null, 'task_card');
                       }}
                     />
-                  ) : state.tasks?.some((task) => task.messageId === message.id) ? (
-                    state.tasks
-                      ?.filter((task) => task.messageId === message.id)
-                      .map((task) => (
-                        <TaskCard
-                          key={task.id}
-                          task={task}
-                          live={live.find((item) => item.taskId === task.id)}
-                          onReply={() => {
-                            const target =
-                              allMessages.find((item) => item.id === task.questionMessageId) ??
-                              message;
-                            taskReply.current = target.id;
-                            setReplyTo(target);
-                            composer.current?.focus();
-                          }}
-                        />
-                      ))
                   ) : (
                     <MessageBubble
                       message={message}
-                      work={workOf(message)}
+                      work={startedTask(message) ? undefined : workOf(message)}
+                      task={chipOf(message)}
+                      onStopTask={
+                        approvalTask(message)
+                          ? async () => {
+                              captureAnalytics('task_action', { action: 'stop' });
+                              await post(`/api/tasks/${approvalTask(message)!.id}/stop`);
+                            }
+                          : undefined
+                      }
+                      taskStopped={approvalTask(message)?.status === 'cancelled'}
                       answersDisabled={sending || !state.configuration.llmReady || welcoming}
                       onAnswer={async (value, answer) => {
                         if (replyTo?.id === message.id && composer.current?.hasDraft()) {
@@ -2458,6 +2490,36 @@ export function Chat({
                   sending={sending}
                   writing={Boolean(streamEntries.length) && finishing?.doing !== 'tool'}
                   quiet={!streamEntries.length}
+                  routed={connected ? routed : undefined}
+                />
+              )}
+              {connected && (
+                <TaskLine
+                  tasks={state.tasks ?? []}
+                  live={live}
+                  card={(task, close, back) => {
+                    const target =
+                      allMessages.find((item) => item.id === task.questionMessageId) ??
+                      allMessages.find((item) => item.id === task.messageId);
+                    return (
+                      <TaskStackCard
+                        key={task.id}
+                        task={task}
+                        live={live.find((item) => item.taskId === task.id)}
+                        onClose={close}
+                        onBack={back}
+                        onReply={
+                          target &&
+                          (() => {
+                            taskReply.current = target.id;
+                            setReplyTo(target);
+                            close();
+                            composer.current?.focus();
+                          })
+                        }
+                      />
+                    );
+                  }}
                 />
               )}
             </div>
@@ -2465,7 +2527,6 @@ export function Chat({
           </div>
         </div>
         <div className="chat-bottom conversation-column">
-          {connected && <TaskDots tasks={state.tasks ?? []} />}
           {(canReturn || away || onReturnToMemory) && (
             <div className="chat-jump-actions">
               {onReturnToMemory && (

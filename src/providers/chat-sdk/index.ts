@@ -149,7 +149,12 @@ class Telegram extends TelegramAdapter {
     );
   }
 
-  async postApproval(threadId: string, markdown: string, replyToMessageId?: string) {
+  async postApproval(
+    threadId: string,
+    markdown: string,
+    labels: { approve: string; decline: string },
+    replyToMessageId?: string,
+  ) {
     const thread = this.decodeThreadId(threadId);
     const { text, plainText } = this.renderMessageBodies({ markdown }, null, 'MarkdownV2');
     const sent = await this.sendRegularMessage(
@@ -160,8 +165,8 @@ class Telegram extends TelegramAdapter {
       {
         inline_keyboard: [
           [
-            { text: 'Approve', callback_data: approveData },
-            { text: 'Cancel', callback_data: declineData },
+            { text: labels.approve, callback_data: approveData },
+            { text: labels.decline, callback_data: declineData },
           ],
         ],
       },
@@ -918,6 +923,7 @@ export function createChatSdkTransport(
           const id = await telegram.postApproval(
             input.threadId,
             telegramParts[0]!,
+            input.approval,
             input.replyToMessageId,
           );
           return { id, ids: [id], approvalButtons: true };

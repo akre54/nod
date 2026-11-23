@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { syncBuiltinESMExports } from 'node:module';
 import { setTimeout as delay } from 'node:timers/promises';
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import pg from 'pg';
 import { z } from 'zod';
 import { createElement } from 'react';
@@ -104,10 +104,20 @@ function syntheticConfirmation(input: Record<string, unknown>) {
   return { text, action: label };
 }
 
-test(
+const inParts =
+  (name: string, options: object, cases: (t: TestContext, part: number) => Promise<void>) =>
+  (part: 1 | 2 | 3) => {
+    test(`${name} (${part}/3)`, options, (t) => cases(t, part));
+  };
+
+export const approvalCases = inParts(
   'personal approvals revalidate targets before execution',
   { skip: !process.env.TEST_DATABASE_URL, timeout: 240_000 },
-  async (t) => {
+  async (t, part) => {
+    let section = 1;
+    const inPart = async (name: string, run: (t: TestContext) => Promise<void>) => {
+      if (section === part) await t.test(name, run);
+    };
     const suffix = randomUUID().replaceAll('-', '').slice(0, 16);
     const schema = `test_personal_review_${suffix}`;
     const bossSchema = `test_personal_review_boss_${suffix}`;
@@ -567,7 +577,10 @@ test(
                   const name =
                     plan.tool === 'synthetic_mcp'
                       ? options.tools.find((item) => item.name.endsWith('__execute_workflow'))!.name
-                      : (plan.tool ?? 'manage_personal_context');
+                      : (plan.tool ??
+                        (/^(memory_|history_search|notification_preferences_)/.test(plan.action)
+                          ? 'memory'
+                          : 'nod'));
                   const pending = activePlan.run(instruction, () =>
                     options.tools
                       .find((tool) => tool.name === name)!
@@ -612,6 +625,7 @@ test(
             };
             if (input.op === 'locate') return { bundle: app.bundle, name: app.name };
             if (input.op === 'apps') return { apps: [app] };
+            if (input.op === 'windows') return { windows: app.windows };
             if (input.op === 'permissions') return {};
             const tree = {
               role: 'window',
@@ -622,6 +636,7 @@ test(
             if (input.op === 'inspect')
               return {
                 tree,
+                context: JSON.stringify(tree),
                 state: createHash('sha256').update(JSON.stringify(tree)).digest('hex'),
               };
             desktopSteps.push(input.op);
@@ -813,7 +828,7 @@ test(
           },
         },
       },
-      { channels: false },
+      { channels: false, rateLimit: false },
     );
     integrationFixture.register(application.app);
     const headers = {
@@ -821,20 +836,11 @@ test(
       origin: `http://localhost:${port}`,
       cookie: `${accessCookie(port)}=${await accessKey(dataRoot)}`,
     };
-    let messagesAvailableAt = 0;
-    const request = async (
+    const request = (
       method: 'GET' | 'POST' | 'PATCH' | 'DELETE',
       path: string,
       payload?: Record<string, unknown>,
-    ) => {
-      const message = method === 'POST' && path === '/api/messages';
-      if (message && messagesAvailableAt > Date.now())
-        await delay(messagesAvailableAt - Date.now());
-      const response = await application.app.inject({ method, url: path, headers, payload });
-      if (message && Number(response.headers['x-ratelimit-remaining']) === 0)
-        messagesAvailableAt = Date.now() + Number(response.headers['x-ratelimit-reset']) * 1000;
-      return response;
-    };
+    ) => application.app.inject({ method, url: path, headers, payload });
     async function waitFor(id: string, status: string) {
       for (let attempt = 0; attempt < 300; attempt++) {
         const turn = (await pool.query('SELECT status,error FROM turns WHERE id=$1', [id])).rows[0];
@@ -847,6 +853,50 @@ test(
         `Synthetic turn did not become ${status}; status=${turn.status}, error=${turn.error ?? 'none'}.`,
       );
     }
+    async function taskTurn(
+      text: string,
+      taskCalls?: FixtureCall[],
+      options: { sequential?: boolean; wait?: string | false } = {},
+    ) {
+      const title = `Synthetic task ${randomUUID()}`;
+      batches.set(text, {
+        subagents: false,
+        sequential: options.sequential ?? true,
+        chatOnly: true,
+        calls: [
+          {
+            tool: 'task',
+            action: 'start',
+            args: {
+              title,
+              message: `I’ll handle ${title}.`,
+              doneWhen: 'The synthetic step is handled.',
+              now: 'Working on it',
+            },
+          },
+        ],
+        ...(taskCalls ? { taskCalls } : {}),
+      });
+      const response = await request('POST', '/api/messages', { text });
+      assert.equal(response.statusCode, 200, response.body);
+      ids.push(response.json().threadId as string);
+      await waitFor(response.json().turnId, 'succeeded');
+      const task = (
+        await pool.query<{ turn_id: string }>(
+          'SELECT turn_id FROM tasks WHERE owner_id=$1 AND title=$2',
+          [ownerId, title],
+        )
+      ).rows[0];
+      assert.ok(task);
+      const { session_id: sessionId } = (
+        await pool.query<{ session_id: string }>('SELECT session_id FROM turns WHERE id=$1', [
+          task.turn_id,
+        ])
+      ).rows[0]!;
+      if (options.wait !== false) await waitFor(task.turn_id, options.wait ?? 'waiting|succeeded');
+      return { turnId: task.turn_id, sessionId, rootTurnId: response.json().turnId as string };
+    }
+    const taskTools = new Set(['browser', 'sign_in', 'pay', 'browser_session', 'computer']);
     async function propose(
       action: string,
       args: Record<string, unknown>,
@@ -854,6 +904,7 @@ test(
       text = `Synthetic proposal ${randomUUID()}`,
     ) {
       plans.set(text, { tool, action, args });
+      if (tool && taskTools.has(tool)) return (await taskTurn(text)).turnId;
       const response = await request('POST', '/api/messages', { text });
       assert.equal(response.statusCode, 200);
       const id = response.json().turnId as string;
@@ -916,7 +967,7 @@ test(
       );
     }
     const calendarRetry = () =>
-      t.test(
+      inPart(
         'an iCloud calendar retry checks the app and saves the requested event once (LAB-1467)',
         async (t) => {
           const origin = 'https://calendar.example.test';
@@ -1065,7 +1116,7 @@ test(
       );
 
     try {
-      await t.test(
+      await inPart(
         'Stop cancels schedule reviews before a confirmation or schedule is saved',
         async () => {
           for (const purpose of [undefined]) {
@@ -1115,7 +1166,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'schedule approval displays and saves the complete checked instruction once',
         async () => {
           const title = `Synthetic checked schedule ${randomUUID()}`;
@@ -1233,7 +1284,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'model settings use the trust check and save only the approved selection',
         async () => {
           const before = models.view().selection;
@@ -1265,9 +1316,9 @@ test(
             sequential: true,
             chatOnly: true,
             calls: [
-              { tool: 'manage_personal_context', action: 'model_select', args: { args: before! } },
+              { tool: 'nod', action: 'model_select', args: { args: before! } },
               {
-                tool: 'manage_personal_context',
+                tool: 'nod',
                 action: 'model_select',
                 args: { args: { scope: 'background', use: 'light' } },
               },
@@ -1541,19 +1592,21 @@ test(
           );
         },
       );
-      await t.test(
+      {
+        const connect = await request('POST', '/api/apps/gmail/connect', {});
+        assert.equal(connect.statusCode, 200, connect.body);
+        const accountId = new URL(connect.json().url).pathname.split('/').pop();
+        const consent = await application.app.inject({
+          method: 'POST',
+          url: `/e2e/connect/${accountId}`,
+          headers,
+        });
+        const callback = new URL(String(consent.headers.location));
+        await application.app.inject({ url: `${callback.pathname}${callback.search}`, headers });
+      }
+      await inPart(
         'a compromised agent cannot send outside the account until the owner confirms',
         async () => {
-          const connect = await request('POST', '/api/apps/gmail/connect', {});
-          assert.equal(connect.statusCode, 200, connect.body);
-          const accountId = new URL(connect.json().url).pathname.split('/').pop();
-          const consent = await application.app.inject({
-            method: 'POST',
-            url: `/e2e/connect/${accountId}`,
-            headers,
-          });
-          const callback = new URL(String(consent.headers.location));
-          await application.app.inject({ url: `${callback.pathname}${callback.search}`, headers });
           const email = (to: string) => ({
             recipient_email: to,
             subject: 'Synthetic invoices',
@@ -1642,7 +1695,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'an unwritable question falls back to a fixed one, keeps earlier receipts and dispatches nothing',
         async (t) => {
           const completed = (
@@ -1701,7 +1754,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'an action the connection service does not offer asks for no approval',
         async () => {
           const writes = integrationFixture.writes.length;
@@ -1725,7 +1778,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'an approved action runs once, a failure returns to its task, and an unsaved access path is never asked about',
         async () => {
           const held = await propose(
@@ -1832,22 +1885,19 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'an unidentified coordinate returns to inspection without an approval',
         async () => {
           const text = `Synthetic unidentified click ${randomUUID()}`;
           const before = browserActs.filter((act) => act.action === 'click').length;
           const errors = batchErrors.length;
-          batches.set(text, {
-            subagents: false,
-            calls: [{ tool: 'browser', action: 'click', args: { x: 0.5, y: 0.5 } }],
-          });
           browserControls = [{ role: 'RootWebArea', name: 'Synthetic bank' }];
           try {
-            const response = await request('POST', '/api/messages', { text });
-            assert.equal(response.statusCode, 200, response.body);
-            const turnId = response.json().turnId;
-            await waitFor(turnId, 'succeeded');
+            const { turnId } = await taskTurn(
+              text,
+              [{ tool: 'browser', action: 'click', args: { x: 0.5, y: 0.5 } }],
+              { sequential: false, wait: 'succeeded' },
+            );
             assert.deepEqual(await approvalsFor(turnId), []);
             assert.equal(browserActs.filter((act) => act.action === 'click').length, before);
             assert.match(batchErrors.slice(errors).join('\n'), /click target is not identified/);
@@ -1857,7 +1907,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'a task browser repeat needs a new approval before its second click',
         async () => {
           const title = `Synthetic bank task ${randomUUID()}`;
@@ -1965,7 +2015,7 @@ test(
         },
       );
 
-      await t.test('a legacy browser repeat checks its target before wording', async (t) => {
+      await inPart('a legacy browser repeat checks its target before wording', async (t) => {
         for (const [kind, command] of [
           ['y coordinate', { y: 0.5 }],
           [
@@ -2065,7 +2115,19 @@ test(
           });
       });
 
-      await t.test(
+      await inPart('a reply to a task that is not an answer closes its open approval', async () => {
+        const held = await propose('click', { selector: '@e7' }, 'browser');
+        const [card] = await approvalsFor(held);
+        assert.equal(card?.status, 'pending');
+        const reply = await request('POST', '/api/messages', {
+          text: `Use the savings account instead ${randomUUID()}.`,
+          replyToMessageId: card.confirmation_message_id,
+        });
+        assert.equal(reply.statusCode, 200, reply.body);
+        assert.equal((await approvalsFor(held))[0]?.status, 'expired');
+      });
+
+      await inPart(
         'a labeled click keeps its replay command out of wording and waits for approval',
         async () => {
           const before = browserActs.filter((act) => act.action === 'click').length;
@@ -2122,7 +2184,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'unidentified coordinate, selector and Enter steps return to inspection before approval',
         async () => {
           const seen: BrowserAction[] = [];
@@ -2230,11 +2292,10 @@ test(
               const { action, ...args } = entry.step;
               const errors = batchErrors.length;
               const before = seen.length;
-              batches.set(text, { subagents: false, calls: [{ tool: 'browser', action, args }] });
-              const response = await request('POST', '/api/messages', { text });
-              assert.equal(response.statusCode, 200, response.body);
-              await waitFor(response.json().turnId, 'waiting|succeeded');
-              assert.deepEqual(await approvalsFor(response.json().turnId), []);
+              const { turnId } = await taskTurn(text, [{ tool: 'browser', action, args }], {
+                sequential: false,
+              });
+              assert.deepEqual(await approvalsFor(turnId), []);
               assert.equal(seen.length, before);
               assert.match(batchErrors.slice(errors).join('\n'), /target is not identified/);
               if (entry.step.action === 'type')
@@ -2318,7 +2379,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'a browser step the owner did not ask for runs only after a bound yes, once, on the same page',
         async () => {
           const clicks = () =>
@@ -2380,11 +2441,7 @@ test(
           );
           const log = JSON.stringify(
             results.get(
-              await propose(
-                'usage_get',
-                { from: '2000-01-01', to: '2099-12-31' },
-                'manage_personal_context',
-              ),
+              await propose('usage_get', { from: '2000-01-01', to: '2099-12-31' }, 'nod'),
             ),
           );
           assert.match(log, /untrusted_tool_result source=\\"usage\\"/);
@@ -2453,7 +2510,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'connection service waits stop automatic app reads and preserve owner reads',
         async () => {
           const schedule = await reminder({ prompt: 'Synthetic automatic parent' });
@@ -2529,7 +2586,7 @@ test(
         const automaticDue = application.proactivity.due;
         application.proactivity.due = async () => undefined;
         try {
-          await t.test(
+          await inPart(
             'a proactive read the checker would hold asks nobody and reads nothing',
             async () => {
               const previous = await application.triage.getPreferences();
@@ -2576,7 +2633,7 @@ test(
               }
             },
           );
-          await t.test(
+          await inPart(
             'a proactive app read runs only what the read-only check calls a read',
             async () => {
               const previous = await application.triage.getPreferences();
@@ -2686,7 +2743,7 @@ test(
           application.proactivity.due = automaticDue;
         }
       }
-      await t.test('an old proactive approval cannot enable a connected write', async () => {
+      await inPart('an old proactive approval cannot enable a connected write', async () => {
         const before = integrationFixture.writes.length;
         const held = await propose(
           'GMAIL_SEND_EMAIL',
@@ -2710,7 +2767,7 @@ test(
         assert.equal(integrationFixture.writes.length, before);
         assert.equal((await approvalsFor(held))[0].status, 'expired');
       });
-      await t.test(
+      await inPart(
         'a server-owned confirmation stays bound to an email draft before consent',
         async () => {
           const writes = integrationFixture.writes.length;
@@ -2756,7 +2813,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'a rule-save confirmation keeps its schema through repair and saves only after approval',
         async () => {
           const previous = (
@@ -2766,16 +2823,17 @@ test(
           let drafts = 0;
           confirmationModel = (_input, schema) => {
             drafts++;
-            assert.deepEqual(schema?.required, ['text', 'action']);
+            assert.deepEqual(schema?.required, ['text', 'action', 'question', 'decline']);
             assert.equal(schema?.additionalProperties, false);
             return drafts === 1
               ? { text: 'Save the synthetic development rule?' }
-              : { text: `Save this rule: ${rules}`, action: 'Save rule' };
+              : { text: `Save this rule: ${rules}`, action: 'Save rule', decline: 'Keep my rules' };
           };
           try {
             const turn = await propose('notification_preferences_update', { rules });
             const [approval] = await approvalsFor(turn);
             assert.equal(approval.status, 'pending');
+            assert.equal(approval.decline, 'Keep my rules');
             assert.equal(drafts, 2);
             assert.equal(
               (await pool.query('SELECT rules FROM preferences WHERE owner_id=$1', [ownerId]))
@@ -2812,7 +2870,7 @@ test(
         },
       );
 
-      await t.test('Gmail deletion confirmation names the verified email', async () => {
+      await inPart('Gmail deletion confirmation names the verified email', async () => {
         const writes = integrationFixture.writes.length;
         const reads = executedApps.filter(
           (action) => action === 'GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID',
@@ -2825,6 +2883,7 @@ test(
         const [approval] = await approvalsFor(turn);
         assert.equal(approval.status, 'pending');
         assert.equal(approval.action, 'GMAIL_DELETE_MESSAGE');
+        assert.equal(approval.details.earlierActions, undefined);
         const question = await confirmationFor(approval);
         assert.doesNotMatch(question, /fixture-mail-1/);
         assert.match(question, /permanently delete/i);
@@ -2850,7 +2909,7 @@ test(
         await waitFor(declined.json().turnId, 'succeeded');
         assert.equal(integrationFixture.writes.length, writes);
       });
-      await t.test(
+      await inPart(
         'a failed Gmail send followed by draft cleanup identifies the unsent draft before consent',
         async () => {
           const email = {
@@ -2902,6 +2961,12 @@ test(
           const [approval] = await approvalsFor(turn);
           assert.equal(approval.status, 'pending');
           assert.equal(approval.action, 'GMAIL_DELETE_DRAFT');
+          assert.deepEqual(approval.details.earlierActions, [
+            {
+              action: 'Gmail: create email draft',
+              target: 'cleanup@example.test · Synthetic team summary',
+            },
+          ]);
           const question = await confirmationFor(approval);
           assert.equal(question.includes(created), false);
           assert.match(question, /permanently delete.*unsent Gmail draft/i);
@@ -3038,7 +3103,7 @@ test(
           );
         },
       );
-      await t.test('Gmail deletion stops when the target cannot be verified', async () => {
+      await inPart('Gmail deletion stops when the target cannot be verified', async () => {
         const writes = integrationFixture.writes.length;
         const prompt = `Synthetic missing message ${randomUUID()}`;
         plans.set(prompt, {
@@ -3054,7 +3119,7 @@ test(
         assert.deepEqual(await approvalsFor(turnId), []);
         assert.equal(integrationFixture.writes.length, writes);
       });
-      await t.test('Gmail deletion reports the specific metadata-read failure', async () => {
+      await inPart('Gmail deletion reports the specific metadata-read failure', async () => {
         const writes = integrationFixture.writes.length;
         const prompt = `Synthetic Gmail metadata outage ${randomUUID()}`;
         plans.set(prompt, {
@@ -3078,7 +3143,7 @@ test(
           appOutage = false;
         }
       });
-      await t.test('an exact owner-authorized Gmail message ID keeps the direct path', async () => {
+      await inPart('an exact owner-authorized Gmail message ID keeps the direct path', async () => {
         const deletes = executedApps.filter((action) => action === 'GMAIL_DELETE_MESSAGE').length;
         const reads = executedApps.filter(
           (action) => action === 'GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID',
@@ -3109,7 +3174,7 @@ test(
           asked.delete(prompt);
         }
       });
-      await t.test('Gmail deletion does not read targets against an ask-first rule', async () => {
+      await inPart('Gmail deletion does not read targets against an ask-first rule', async () => {
         const writes = integrationFixture.writes.length;
         const reads = executedApps.filter(
           (action) => action === 'GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID',
@@ -3165,7 +3230,7 @@ test(
           ]);
         }
       });
-      await t.test('Gmail deletion stops if the verified account binding changes', async () => {
+      await inPart('Gmail deletion stops if the verified account binding changes', async () => {
         const writes = integrationFixture.writes.length;
         const turn = await propose(
           'GMAIL_DELETE_MESSAGE',
@@ -3202,7 +3267,7 @@ test(
           );
         }
       });
-      await t.test(
+      await inPart(
         'Gmail deletion refuses an account rebound while building its confirmation',
         async () => {
           const primary = (
@@ -3341,7 +3406,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         "spending limits the owner didn't ask for change only after their yes",
         async () => {
           const limits = async () => {
@@ -3376,7 +3441,8 @@ test(
         },
       );
 
-      await t.test(
+      section = 2;
+      await inPart(
         "memory forgets a note or stops saving only after the owner's yes when they didn't ask",
         async () => {
           const memory = async () => (await request('GET', '/api/memory')).json();
@@ -3441,7 +3507,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'schedule pause and edit confirmations cannot mutate a revision edited after the question was saved',
         async () => {
           for (const action of ['schedule_pause', 'schedule_update']) {
@@ -3525,7 +3591,7 @@ test(
         },
       );
 
-      await t.test('manual schedule runs deliver once and cannot create schedules', async () => {
+      await inPart('manual schedule runs deliver once and cannot create schedules', async () => {
         const schedule = await reminder();
         const input = { requestId: randomUUID(), expectedRevision: 0 };
         const response = await request('POST', `/api/schedules/${schedule.id}/run`, input);
@@ -3588,7 +3654,7 @@ test(
         await request('DELETE', `/api/schedules/${schedule.id}`);
       });
 
-      await t.test(
+      await inPart(
         'unavailable schedule evidence fails before the model and posts the named failure',
         async () => {
           const title = 'Synthetic unavailable schedule';
@@ -3660,7 +3726,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'direct schedule pause or deletion retires an outstanding chat confirmation',
         async () => {
           for (const method of ['PATCH', 'DELETE'] as const) {
@@ -3775,7 +3841,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'retiring a schedule confirmation leaves its saved task open with a reply target',
         async () => {
           const schedule = await reminder({ kind: 'recurring', cron: '0 0 * * 0', runAt: null });
@@ -3917,7 +3983,7 @@ test(
         },
       );
 
-      await t.test('state counts all hidden messages while bounding recent IDs', async () => {
+      await inPart('state counts all hidden messages while bounding recent IDs', async () => {
         const beforeResponse = await request('GET', '/api/state');
         assert.equal(beforeResponse.statusCode, 200, beforeResponse.body);
         const before = beforeResponse.json<AppState>();
@@ -4003,7 +4069,7 @@ test(
         }
       });
 
-      await t.test(
+      await inPart(
         'direct schedule pause waits for a channel confirmation already in flight',
         async () => {
           const schedule = await reminder({ kind: 'recurring', cron: '0 0 * * 0', runAt: null });
@@ -4185,7 +4251,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'legacy schedule approvals without a saved revision cannot execute',
         async () => {
           const schedule = await reminder();
@@ -4214,7 +4280,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'legacy schedule cancellation approval still pauses the saved schedule',
         async () => {
           const schedule = await reminder({ kind: 'recurring', cron: '0 0 * * 0', runAt: null });
@@ -4241,7 +4307,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'legacy approval does not call a completed one-time schedule paused',
         async () => {
           const schedule = await reminder();
@@ -4286,7 +4352,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'a read the checker holds runs only after the bound approval is accepted',
         async () => {
           const before = executedApps.filter((action) => action === 'GMAIL_FETCH_EMAILS').length;
@@ -4318,14 +4384,14 @@ test(
         },
       );
 
-      await t.test('tool discovery runs without waiting for the checker', async () => {
+      await inPart('tool discovery runs without waiting for the checker', async () => {
         const turn = await propose('SEARCH_TOOLS', { query: 'gmail email' }, 'apps');
         const result = results.get(turn);
         assert.ok(result);
         assert.equal((await approvalsFor(turn)).length, 0);
       });
 
-      await t.test(
+      await inPart(
         'large tool catalogs retain exact schema lookup without an action check',
         async () => {
           const schema = { type: 'object', properties: { value: { type: 'string' } } };
@@ -4373,7 +4439,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'a schedule pause steered into a confirmed turn uses the fresh owner request',
         async () => {
           const schedule = await reminder();
@@ -4436,7 +4502,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'the small LLM checks actions and replies while the server writes confirmations',
         async () => {
           const reset = await request('POST', '/api/conversation/reset', { threadId: ids.at(-1) });
@@ -4540,7 +4606,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'one authorization review per action stops later tools at the task check-in',
         async () => {
           for (const item of [
@@ -4618,7 +4684,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'a file attached to an action that asks is uploaded only after the owner approves it',
         async () => {
           const sends = () =>
@@ -4659,7 +4725,7 @@ test(
           assert.equal(sends(), before + 1);
         },
       );
-      await t.test(
+      await inPart(
         'a failed approved attachment upload keeps its safe reason on the original card',
         async (t) => {
           t.after(() => {
@@ -4734,7 +4800,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'sign-in method selection needs exact-origin consent before binding controls',
         async () => {
           const input = {
@@ -4791,7 +4857,7 @@ test(
           }
         },
       );
-      await t.test(
+      await inPart(
         'HTTP confirmations describe the exact request and bind it to the selected account',
         async () => {
           const { createAppGrantVault } = await import('../src/server/vault-app-grants.ts');
@@ -5122,7 +5188,7 @@ test(
         },
       );
 
-      await t.test(
+      await inPart(
         'MCP confirmations use the selected tool definition and exact input',
         async () => {
           const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
@@ -5371,7 +5437,7 @@ test(
           }
         },
       );
-      await t.test('sign-in approval preserves its exact displayed origin', async () => {
+      await inPart('sign-in approval preserves its exact displayed origin', async () => {
         const origin = 'https://bank.example.test';
         const input = {
           origin,
@@ -5423,7 +5489,7 @@ test(
           repeatAfterConfirm = undefined;
         }
       });
-      await t.test('MCP approval preserves the saved endpoint and dispatches once', async () => {
+      await inPart('MCP approval preserves the saved endpoint and dispatches once', async () => {
         const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
         const { StreamableHTTPServerTransport } =
           await import('@modelcontextprotocol/sdk/server/streamableHttp.js');
@@ -5529,7 +5595,7 @@ test(
           await new Promise<void>((resolve) => server.close(() => resolve()));
         }
       });
-      await t.test('Stop cancels private entry in running and waiting turns', async () => {
+      await inPart('Stop cancels private entry in running and waiting turns', async () => {
         const origin = 'https://bank.example.test';
         const input = {
           origin,
@@ -5598,11 +5664,10 @@ test(
                     }
                   : { ...input, ...(login ? { savedLoginId: login } : {}) },
             });
-            const response = await request('POST', '/api/messages', { text });
-            assert.equal(response.statusCode, 200, response.body);
-            const turnId = response.json().turnId as string;
+            const { turnId, rootTurnId } = await taskTurn(text, undefined, {
+              wait: source === 'saved' ? false : 'waiting',
+            });
             if (source !== 'saved') {
-              await waitFor(turnId, 'waiting');
               const messages = JSON.stringify(
                 (
                   await pool.query('SELECT text,presentation FROM messages WHERE turn_id=$1', [
@@ -5657,7 +5722,7 @@ test(
                   source === 'card'
                     ? 'SELECT status FROM vault_uses WHERE id=$1'
                     : 'SELECT status FROM vault_uses WHERE root_turn_id=$1',
-                  [source === 'card' ? token : turnId],
+                  [source === 'card' ? token : rootTurnId],
                 )
               ).rows[0]?.status;
               if (status !== 'uncertain') await delay(20);
@@ -5680,7 +5745,7 @@ test(
         await propose('Enter saved login', { ...input, savedLoginId: login }, 'sign_in', text);
         assert.equal(injected.length, before + 1);
       });
-      await t.test(
+      await inPart(
         'saved login consent keeps the account name and enters a code only with exact-origin consent',
         async () => {
           const origin = 'https://bank.example.test';
@@ -5779,7 +5844,7 @@ test(
         },
       );
 
-      await t.test('a root login approval does not approve its www destination', async (t) => {
+      await inPart('a root login approval does not approve its www destination', async (t) => {
         const previousOrigin = browserOrigin;
         const previousUrl = browserUrl;
         t.after(() => {
@@ -5870,7 +5935,7 @@ test(
         );
       });
 
-      await t.test(
+      await inPart(
         'an explicit MCP workflow repeat asks again and returns the new execution',
         async () => {
           const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
@@ -6166,7 +6231,7 @@ test(
           }
         },
       );
-      await t.test(
+      await inPart(
         'a connect whose sign-in label cannot be written leaves no attempt behind',
         async () => {
           const pending = async () =>
@@ -6202,7 +6267,7 @@ test(
           assert.equal(await pending(), 1);
         },
       );
-      await t.test(
+      await inPart(
         'local files open only in work the owner started, and opening needs their words',
         async () => {
           const folder = await mkdtemp(join(localHome, 'files-'));
@@ -6358,7 +6423,7 @@ test(
           assert.ok(!letIn.json().paths.includes(join(folder, 'sorted')));
         },
       );
-      await t.test(
+      await inPart(
         'changed and legacy local reads return no result and permit a fresh checked read',
         async () => {
           await request('PATCH', '/api/preferences', { localFilesEnabled: true });
@@ -6408,7 +6473,7 @@ test(
             }
         },
       );
-      await t.test(
+      await inPart(
         'a failed approved file open permits a fresh read in the same request',
         async () => {
           const folder = await mkdtemp(join(localHome, 'failed-open-'));
@@ -6472,7 +6537,7 @@ test(
           }
         },
       );
-      await t.test(
+      await inPart(
         'a file path check failure after reading keeps the uncertain repeat fence',
         async () => {
           const enabled = await request('PATCH', '/api/preferences', { localFilesEnabled: true });
@@ -6567,7 +6632,7 @@ test(
           }
         },
       );
-      await t.test('confirmed local reads observe edits in the same request', async () => {
+      await inPart('confirmed local reads observe edits in the same request', async () => {
         await request('PATCH', '/api/preferences', { localFilesEnabled: true });
         const folder = await mkdtemp(join(localHome, 'reread-'));
         for (const replacement of ['b'.repeat(859), 'a'.repeat(280)]) {
@@ -6606,7 +6671,7 @@ test(
           assert.deepEqual(await approvalsFor(resumed), []);
         }
       });
-      await t.test(
+      await inPart(
         'local Markdown approvals preserve the reviewed path through execution',
         async () => {
           const folder = await mkdtemp(join(localHome, 'markdown-'));
@@ -6655,7 +6720,7 @@ test(
           }
         },
       );
-      await t.test(
+      await inPart(
         'local files export imported workspace files and refuse changed approved bytes',
         async () => {
           const folder = await mkdtemp(join(localHome, 'exports-'));
@@ -6691,7 +6756,7 @@ test(
           assert.equal(await readFile(source, 'utf8'), 'Synthetic local report');
         },
       );
-      await t.test(
+      await inPart(
         'computer use opens a named app and runs an approved step only after the owner answers',
         async () => {
           const send = async (body: Record<string, unknown>) => {
@@ -6706,20 +6771,15 @@ test(
           assert.equal(enabled.json().enabled, true);
           const text = `Open TextEdit and clear the notes ${randomUUID()}`;
           asked.add(text);
-          batches.set(text, {
-            subagents: false,
-            sequential: true,
-            calls: [
+          const { turnId: turn } = await taskTurn(
+            text,
+            [
               { tool: 'computer', action: 'open', args: { bundle: 'com.apple.TextEdit' } },
               { tool: 'computer', action: 'snapshot', args: { pid: 41 } },
               { tool: 'computer', action: 'press', args: { ref: '@snotes01:e7' } },
             ],
-          });
-          const response = await send({ text });
-          assert.equal(response.statusCode, 200, response.body);
-          const turn = response.json().turnId as string;
-          ids.push(response.json().threadId as string);
-          await waitFor(turn, 'waiting');
+            { wait: 'waiting' },
+          );
           assert.deepEqual(desktopSteps, []);
           const [held] = await approvalsFor(turn);
           assert.equal(held.action, 'COMPUTER_PRESS');
@@ -6743,7 +6803,8 @@ test(
           assert.equal(disabled.json().enabled, false);
         },
       );
-      await t.test('calendar approvals identify the exact occurrence before consent', async (t) => {
+      section = 3;
+      await inPart('calendar approvals identify the exact occurrence before consent', async (t) => {
         await pool.query(
           'INSERT INTO preferences(owner_id) VALUES($1) ON CONFLICT (owner_id) DO NOTHING',
           [ownerId],
@@ -8200,8 +8261,9 @@ test(
         }
       });
 
+      section = 2;
       await calendarRetry();
-      await t.test(
+      await inPart(
         'shutdown cancels private entry before cleanup and saves final usage',
         async () => {
           await pool.query(`
@@ -8262,8 +8324,7 @@ test(
                 message: 'Use the synthetic login.',
               },
             });
-            const started = await request('POST', '/api/messages', { text });
-            assert.equal(started.statusCode, 200);
+            await taskTurn(text, undefined, { wait: false });
             for (let attempt = 0; !entryStarted && attempt < 300; attempt++) await delay(20);
             assert.equal(entryStarted, true);
             assert.ok(entrySignal);

@@ -167,6 +167,10 @@ export interface RuntimeContext {
     shortened?: boolean;
     createdAt?: string | Date;
   }>;
+  conversationLanguage?: {
+    owner?: { at: string; text: string };
+    nod?: { at: string; text: string };
+  };
   memory?: string;
   memoryBrief?: MemoryBrief;
   learnedSkills?: Array<{ name: string; description: string }>;
@@ -309,8 +313,8 @@ export interface AgentToolMetadata {
   description: string;
   parameters: Record<string, unknown>;
   eager?: boolean;
-  companions?: readonly string[];
-  deferred?: { namespace: string; description: string };
+  companions?: readonly string[] | ((args: Record<string, unknown>) => readonly string[]);
+  deferred?: { namespace: string; description: string; guide?: string };
 }
 export interface AgentTool extends AgentToolMetadata {
   parallel?: boolean;
@@ -320,6 +324,7 @@ export interface SkillLibrary {
   catalog: Array<{ name: string; description: string }>;
   core?: readonly string[];
   read(name: string, file?: string): { name: string; file: string; content: string };
+  tools?(name: string): readonly string[];
 }
 export interface DocumentationSection {
   id: string;

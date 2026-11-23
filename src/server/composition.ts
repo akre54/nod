@@ -123,6 +123,8 @@ import { createFeedbackRedactor } from './feedback-redaction.ts';
 import { withFailureLog, type FailureLogSink } from './failure-log.ts';
 import { createPiMemoryCurator } from '../providers/pi/memory-curator.ts';
 import { createPublicLinkPreviewProvider } from '../providers/public-web/link-preview.ts';
+import { createGoogleFlights } from '../providers/google-flights.ts';
+import type { FlightSearch } from '../ports/flights.ts';
 import { createAgentRuntime } from '../runtime/index.ts';
 import { coreSkills } from '../runtime/prompt.ts';
 import { createApp } from './app.ts';
@@ -186,7 +188,7 @@ import {
 } from './redaction.ts';
 import { createLedger, limitsInput } from './ledger.ts';
 import { createActivityLog } from './activity-log.ts';
-import { actionTarget } from './action-presentation.ts';
+import { actionTarget, objectIds, recordedTitle } from './action-presentation.ts';
 import { usageFileName, usagePdf } from './usage-report.ts';
 import { buildFeedbackReport, type FeedbackReportOptions } from './bug-report.ts';
 import { registerFeedback } from './feedback.ts';
@@ -222,7 +224,7 @@ import {
 import type { VaultActivityReason } from '../shared/contracts.ts';
 import { createTriage, getPreferences } from './triage.ts';
 import { createTasks } from './tasks.ts';
-import { createActivity } from './activity.ts';
+import { createActivity, createActivityLine } from './activity.ts';
 import {
   checkedKeyStore,
   createVault,
@@ -266,6 +268,7 @@ export interface ApplicationAdapters {
   trustCurator?: MemoryCurator;
   messaging?: MessagingTransport;
   linkPreviews?: LinkPreviewProvider;
+  flights?: FlightSearch;
   feedback?: FeedbackDelivery;
   traces?: ModelTraceGate;
   telemetry?: UsageTelemetry;
@@ -669,6 +672,7 @@ export function createDefaultAdapters(
       },
     },
     linkPreviews: createPublicLinkPreviewProvider(),
+    flights: createGoogleFlights(),
     onboardingEmail: createN8nOnboardingEmail({
       url:
         env.NOD_ONBOARDING_EMAIL_URL ??
@@ -708,7 +712,9 @@ export async function createApplication(
     workers?: boolean;
     channels?: boolean;
     heartbeat?: boolean;
+    rateLimit?: boolean;
     runtimeReady?: Promise<void>;
+    starting?: (step: string) => void;
   } = {},
 ) {
   const diagnostics: {
@@ -742,7 +748,9 @@ async function initializeApplication(
     workers?: boolean;
     channels?: boolean;
     heartbeat?: boolean;
+    rateLimit?: boolean;
     runtimeReady?: Promise<void>;
+    starting?: (step: string) => void;
   },
   diagnostics: {
     log?: Awaited<ReturnType<typeof createFeedbackLog>>;
@@ -840,8 +848,10 @@ async function initializeApplication(
   }
   const privacyNotice = await loadPrivacyNoticeFile(process.env.NOD_PRIVACY_NOTICE_FILE);
   await mkdir(dataRoot, { recursive: true, mode: 0o700 });
+  options.starting?.('database');
   await initializeDatabase();
   await adapters.initialize?.();
+  options.starting?.('threads');
   await initializeThreads();
   const artifacts = localArtifacts;
   async function sweepArtifacts() {
@@ -950,6 +960,7 @@ async function initializeApplication(
     documentation: createDocumentation(
       fileURLToPath(new URL('../../docs/src/content/docs/', import.meta.url)),
     ),
+    flights: adapters.flights,
     computer,
     workspace,
     redactError: createErrorRedactor(secrets),
@@ -1006,6 +1017,7 @@ async function initializeApplication(
     },
   });
   const memoryStore = createPostgresObjectStore({ database: pool, ownerId });
+  options.starting?.('memory');
   await memoryStore.initialize();
   await importMemoryFile(memoryStore, join(dataRoot, 'objects', 'memory'));
   const memory = createMemoryService({
@@ -1162,7 +1174,7 @@ async function initializeApplication(
             adapters.models!.paused({ kind: 'schedule', schedule: model }),
         }
       : {}),
-    watchable: async (connectionIds) => integrations.watchable(connectionIds),
+    watchable: (connectionIds, client) => integrations.watchable(connectionIds, client),
     watchState: async (connectionIds) => integrations.watchState(connectionIds),
   });
   await personal.initialize({ workers: options.workers });
@@ -1250,6 +1262,7 @@ async function initializeApplication(
     },
     due: () => proactivity.due(),
   });
+  options.starting?.('apps');
   const grantVault = await createAppGrantVault(pool, {
     ownerId,
     keyStore: adapters.keyStore,
@@ -1896,6 +1909,7 @@ async function initializeApplication(
                           action,
                           provenance.basis ?? { kind: 'approved' },
                           actionTarget(action, args, provenance.details),
+                          objectIds(result),
                         );
                         return privateEmailResult(
                           (
@@ -2424,6 +2438,21 @@ async function initializeApplication(
       },
       desktopRuntime: desktopMode,
       taskClassification: true,
+      ...(adapters.classificationCurator
+        ? {
+            activityLine: (() => {
+              const line = createActivityLine(
+                ledger.curator(adapters.classificationCurator),
+                createTextRedactor(secrets),
+              );
+              return (
+                turnId: string,
+                input: { text: string; question?: string },
+                signal: AbortSignal,
+              ) => ledger.withTurn(turnId, () => line(input, signal));
+            })(),
+          }
+        : {}),
       observeTurn: (turnId, operation, sessionId) => {
         const observe = (ids?: { thread_id: string; turn_id: string }) =>
           analytics
@@ -2873,7 +2902,12 @@ async function initializeApplication(
               Object.keys(args).length ? await activityLog.read(args, 200) : await ledger.read(),
             ),
           );
-        return personal.manage(action, args, { ...provenance, turnId: turn.turnId });
+        const source = { ...provenance, turnId: turn.turnId };
+        if (action === 'schedule_record_observation')
+          return withTurnLock({ turnId: turn.turnId, signal }, (client) =>
+            personal.manage(action, args, source, { client }),
+          );
+        return personal.manage(action, args, source);
       },
       requestPayment: async (turn, input, show) => {
         const { image, ...result } = await payments.request(turn, input);
@@ -3180,7 +3214,19 @@ async function initializeApplication(
             verifiedCalendarRevision = current.revision;
             verifiedInstructionRevision = verdict.instructionRevision;
           }
+          const earlierActions = await ledger.earlierActions(
+            turn.threadId,
+            objectIds(prepared, ''),
+          );
           return {
+            ...(earlierActions.length
+              ? {
+                  earlierActions: earlierActions.map((earlier) => ({
+                    action: recordedTitle(earlier.action),
+                    target: earlier.target,
+                  })),
+                }
+              : {}),
             ...(verdict.confirm ? { reason: verdict.reason } : {}),
             ...(account
               ? {
@@ -3233,6 +3279,7 @@ async function initializeApplication(
               action,
               verdict.confirm ? { kind: 'approved' } : verdict.basis,
               actionTarget(action, prepared),
+              objectIds(result),
             );
             return result;
           },
@@ -3251,6 +3298,7 @@ async function initializeApplication(
   };
   const app = await createApp({
     failureLog: diagnostics.failure,
+    rateLimit: options.rateLimit,
     analytics: captureAnalytics,
     admission,
     artifacts,
@@ -3515,8 +3563,8 @@ async function initializeApplication(
       answer: (text, channel, replyToMessageId) =>
         userMessages.answer(text, { channel, replyToMessageId }),
       acceptApproval: async (client, input) => {
-        const { threadId, messageId, approvalId, approved, channel, stopSignal } = input;
-        await userMessages.submit(approved ? 'Approve' : 'Cancel', [], {
+        const { threadId, messageId, approvalId, approved, channel, label, stopSignal } = input;
+        await userMessages.submit(label ?? (approved ? 'Approve' : 'Cancel'), [], {
           client,
           threadId,
           channel,
@@ -3559,7 +3607,10 @@ async function initializeApplication(
       clearTimeout(timer);
     }
   }
-  app.addHook('onReady', async () => activity.start());
+  app.addHook('onReady', async () => {
+    void discovered.servers().catch((error) => logFailure('mcp_tool_list_preload', error));
+    return activity.start();
+  });
   app.addHook('onClose', async () => {
     stopConnectionInventory();
     const failures: unknown[] = [];

@@ -79,6 +79,7 @@ import type { ExecutionEvent } from '../shared/execution.ts';
 import { modelProviderNames, type ModelSelection, type WorkKind } from '../shared/models.ts';
 import { lockKey } from './locks.ts';
 import { redactSecretText } from './redaction.ts';
+import { loadConversationLanguage } from './communication.ts';
 import { resemblesTaskAcknowledgement } from '../shared/task-ack.ts';
 
 const queue = 'thread-drain';
@@ -160,6 +161,7 @@ type ConfirmAction = {
     input: ChatConfirmationInput,
     onInserted?: () => void,
   ): Promise<ChatConfirmationResult>;
+  close(client: PoolClient, sessionId: string, turnId: string): Promise<void>;
 };
 
 export interface ThreadDependencies {
@@ -174,7 +176,8 @@ export interface ThreadDependencies {
   present?: (
     threadId: string,
     input:
-      { kind: 'interrupted'; work?: string } | { kind: 'failed'; error: string; work?: string },
+      | { kind: 'interrupted'; work?: string; outsideAction: boolean }
+      | { kind: 'failed'; error: string; work?: string },
   ) => Promise<string>;
   observeTurn?: (
     turnId: string,
@@ -183,6 +186,11 @@ export interface ThreadDependencies {
   ) => Promise<void>;
   taskChecks?: (threadId: string) => Promise<void>;
   taskClassification?: boolean;
+  activityLine?: (
+    turnId: string,
+    input: { text: string; question?: string },
+    signal: AbortSignal,
+  ) => Promise<string>;
   consumers?: WorkConsumers;
   artifacts?: ArtifactService;
   writeArtifact?: (
@@ -363,7 +371,7 @@ async function insertEvent(
   event?: ExecutionEvent,
 ) {
   await client.query(
-    'INSERT INTO turn_events(id,turn_id,type,summary,run_id,parent_run_id,session_id,browser_id,call_id,site,command) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)',
+    'INSERT INTO turn_events(id,turn_id,type,summary,run_id,parent_run_id,session_id,browser_id,call_id,site,command,detail) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)',
     [
       randomUUID(),
       turnId,
@@ -376,8 +384,54 @@ async function insertEvent(
       event?.callId ?? null,
       event?.site ?? null,
       event?.command ?? null,
+      event?.detail ?? null,
     ],
   );
+}
+
+export async function recordIntent(client: PoolClient, turnId: string, line: string, steers = 0) {
+  await client.query(
+    `WITH s AS (SELECT COALESCE(max(created_at),'-infinity') AS at,count(*)::int AS n FROM turn_events
+       WHERE turn_id=$2 AND type='steered')
+     INSERT INTO turn_events(id,turn_id,type,summary) SELECT $1,$2,'intent',$3 FROM s
+     WHERE s.n=$4
+       AND NOT EXISTS (SELECT 1 FROM turn_events e WHERE e.turn_id=$2
+         AND e.type IN ('intent','step','thought','retry','final') AND e.created_at>=s.at)
+       AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.turn_id=$2 AND m.role='assistant'
+         AND m.created_at>=s.at)`,
+    [randomUUID(), turnId, line, steers],
+  );
+}
+
+async function showIntent(
+  turn: { id: string; owner_id: string; parent_turn_id: string | null },
+  text: string,
+  steers: number,
+  write: NonNullable<ThreadDependencies['activityLine']>,
+  signal: AbortSignal,
+  current: <T>(operation: (client: PoolClient) => Promise<T>) => Promise<T>,
+) {
+  let question: string | undefined;
+  if (turn.parent_turn_id && !steers) {
+    const asked = (
+      await pool.query<{ text: string }>(
+        `SELECT m.text FROM turns p JOIN messages m ON m.turn_id=p.id AND m.owner_id=p.owner_id
+         WHERE p.id=$1 AND p.owner_id=$2 AND p.waiting_reason='question' AND m.role='assistant'
+         ORDER BY m.created_at DESC,m.id DESC LIMIT 1`,
+        [turn.parent_turn_id, turn.owner_id],
+      )
+    ).rows[0];
+    if (!asked) return;
+    question = asked.text;
+  }
+  const line = await write(
+    turn.id,
+    { text, ...(question ? { question } : {}) },
+    AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
+  );
+  if (!line) return;
+  await current((client) => recordIntent(client, turn.id, line, steers));
+  working();
 }
 
 async function assertReplyTarget(
@@ -892,6 +946,7 @@ export async function submitUserMessage(
       ],
     );
     if (taskTarget) await taskTarget.record(turnId);
+    if (live) await confirmAction?.close(client, question?.session_id ?? thread.id, turnId);
     const prepared = (await options.prepareAttachments?.(client, thread.id)) ?? [];
     await client.query(
       "INSERT INTO messages(id,owner_id,role,text,display_text,thread_id,turn_id,attachments,reply_to_message_id,reply_quote,audio_caption,question_answer) VALUES($1,$2,'user',$3,$4,$5,$6,$7,$8,$9,$10,$11)",
@@ -1535,6 +1590,8 @@ async function failTurn(
         task_id: string | null;
         work: string | null;
         latest_user_message_id: string | null;
+        outside_action: boolean;
+        handed_off: boolean;
       }>(
         `${turnChainSql()}, origin AS (
           SELECT u.created_at,u.id FROM turns u JOIN chain c ON c.id=u.id
@@ -1548,6 +1605,14 @@ async function failTurn(
               OR (author.created_at,author.id)<(SELECT created_at,id FROM origin)
               OR (author.id IS NULL AND m.created_at<(SELECT created_at FROM origin)))
           ORDER BY m.created_at DESC,m.id DESC LIMIT 1) AS latest_user_message_id
+         ,(EXISTS (SELECT 1 FROM turns x JOIN chain c ON c.id=x.id WHERE x.outside_action_at IS NOT NULL)
+           OR EXISTS (SELECT 1 FROM approvals a JOIN chain c ON c.id IN (a.turn_id,a.execution_turn_id)
+             WHERE a.owner_id=u.owner_id AND a.status IN ('executing','uncertain','completed'))) AS outside_action
+         ,(to_jsonb(u)->>'task_id' IS NULL
+           AND EXISTS (SELECT 1 FROM messages m JOIN chain c ON c.id=m.turn_id WHERE m.owner_id=$2 AND m.role='user')
+           AND NOT EXISTS (SELECT 1 FROM messages m JOIN chain c ON c.id=m.turn_id
+             WHERE m.owner_id=$2 AND m.role='user'
+               AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.owner_id=$2 AND t.source_message_id=m.id AND t.state='open'))) AS handed_off
          FROM turns u WHERE u.id=$1 AND u.owner_id=$2 AND u.status='running' FOR UPDATE`,
         [turnId, ownerId, thread.id],
       )
@@ -1567,20 +1632,21 @@ async function failTurn(
   }, pool);
   if (!turn) return false;
   if (!turn.owner_started && !turn.work) return true;
-  const work = turn.owner_started ? undefined : turn.work!;
+  if (error === interrupted && turn.handed_off) return true;
+  const work = turn.owner_started && !turn.task_id ? undefined : (turn.work ?? undefined);
   const presented = modelFailure
     ? undefined
     : await present?.(
         turn.thread_id,
         error === interrupted
-          ? { kind: 'interrupted', ...(work ? { work } : {}) }
+          ? { kind: 'interrupted', outsideAction: turn.outside_action, ...(work ? { work } : {}) }
           : { kind: 'failed', error, ...(work ? { work } : {}) },
       ).catch(() => undefined);
   const body =
     typeof presented === 'string' && presented.trim()
       ? presented
       : error === interrupted
-        ? `I was interrupted before I finished${work ? ` “${work}”` : ''}. Check anything I may have started before you ask me to continue.`
+        ? `I was interrupted before I finished${work ? ` “${work}”` : ''}. ${turn.outside_action ? 'Something I started outside Nod may not have finished, so check it before you ask me to continue.' : 'Nothing was sent, submitted or deleted since your last message. Reply to continue.'}`
         : `I couldn't finish ${work ? `“${work}”` : 'this'}. ${error}${next && (work || failure !== 'offline') ? ` ${next}` : ''}`;
   const message =
     failure === 'model'
@@ -1832,6 +1898,7 @@ async function loadTurnContext(turn: any, dependencies: ThreadDependencies) {
     mcpServers,
     confirmedActions,
     restarted,
+    language,
   ] = await Promise.all([
     loadMessage(sourceMessageId),
     pool.query(
@@ -1876,6 +1943,7 @@ async function loadTurnContext(turn: any, dependencies: ThreadDependencies) {
           [threadId, ownerId],
         )
       : undefined,
+    loadConversationLanguage(pool, ownerId, threadId),
   ]);
   const preference = preferences.rows[0];
   const historyTurnIds = [
@@ -1927,6 +1995,7 @@ async function loadTurnContext(turn: any, dependencies: ThreadDependencies) {
       ...(confirmedActions?.length ? { confirmedActions } : {}),
       ...(credentialRequests.length ? { credentialRequests } : {}),
       ...(related.length ? { relatedConversation: related } : {}),
+      conversationLanguage: language,
       ...(learnedSkills?.length ? { learnedSkills } : {}),
       ...(connectedApps ? { connectedApps } : {}),
       ...(dependencies.localFiles ? { localFiles: true } : {}),
@@ -2022,6 +2091,23 @@ async function executeTurn(turn: any, dependencies: ThreadDependencies) {
     return withTurnLock({ turnId, signal }, operation);
   };
   const ensureCurrent = () => current(async () => {});
+  const intentLine =
+    dependencies.activityLine &&
+    !turn.background &&
+    turn.session_id === threadId &&
+    providerChannel === 'web'
+      ? dependencies.activityLine
+      : undefined;
+  const intentFailed = (error: unknown) => {
+    if (!signal.aborted) logFailure('activity_line_failed', error, { threadId, turnId });
+  };
+  if (
+    intentLine &&
+    turn.source === 'user' &&
+    !String(turn.source_id ?? '').startsWith('reaction-reply:') &&
+    String(turn.prompt ?? '').trim()
+  )
+    void showIntent(turn, turn.prompt, 0, intentLine, signal, current).catch(intentFailed);
   const fenced =
     <A extends unknown[], R>(call: (...args: A) => Promise<R>) =>
     async (...args: A) => {
@@ -2033,6 +2119,21 @@ async function executeTurn(turn: any, dependencies: ThreadDependencies) {
   let explicitAudio = false;
   const published = new Map<string, Artifact>();
   let sourceMessageId: string | null = null;
+  const ownerMessageIds: string[] = [];
+  const ownerRequest = (request: unknown) => {
+    if (request !== undefined) {
+      if (typeof request !== 'string' || !ownerMessageIds.includes(request))
+        throw new Error(
+          'request must be currentMessageId or the messageId of an owner message sent while you worked.',
+        );
+      return request;
+    }
+    if (ownerMessageIds.length > 1)
+      throw new Error(
+        'The owner sent several messages during this turn. Set request to the messageId of the one this work serves.',
+      );
+    return sourceMessageId;
+  };
   const plainReplies: Array<{
     id: string;
     text: string;
@@ -2179,6 +2280,7 @@ async function executeTurn(turn: any, dependencies: ThreadDependencies) {
     const loaded = await loadTurnContext(turn, dependencies);
     const proactivity = await dependencies.proactivity?.(ref, signal);
     sourceMessageId = loaded.sourceMessageId;
+    if (sourceMessageId) ownerMessageIds.push(sourceMessageId);
     let voice = loaded.voice;
     let ownerMessage = turn.source === 'user';
     const stagedFiles = new Map<string, string>();
@@ -2448,20 +2550,25 @@ async function executeTurn(turn: any, dependencies: ThreadDependencies) {
       ),
       task:
         dependencies.task &&
-        fenced((input) => {
+        fenced((raw) => {
+          const { request, ...input } = (raw ?? {}) as {
+            request?: unknown;
+            action?: unknown;
+            message?: string;
+          };
+          const bound =
+            input.action === 'start' || input.action === 'reply'
+              ? ownerRequest(request)
+              : sourceMessageId;
           const prior =
-            (input as { action?: unknown })?.action === 'start' && sourceMessageId
+            input.action === 'start' && bound
               ? plainReplies.findLast(
                   (reply) =>
-                    reply.sourceMessageId === sourceMessageId &&
-                    resemblesTaskAcknowledgement(
-                      reply.text,
-                      (input as { message?: string }).message ?? '',
-                      reply.handoff,
-                    ),
+                    reply.sourceMessageId === bound &&
+                    resemblesTaskAcknowledgement(reply.text, input.message ?? '', reply.handoff),
                 )
               : undefined;
-          return dependencies.task!(ref, input, sourceMessageId, prior?.id, prior?.handoff);
+          return dependencies.task!(ref, input, bound, prior?.id, prior?.handoff);
         }),
       takeMessages:
         turn.background && !taskContext
@@ -2477,7 +2584,24 @@ async function executeTurn(turn: any, dependencies: ThreadDependencies) {
               const taken = await takeQueuedMessages(turnId, turn.session_id, turn.channel);
               if (taken.length) {
                 sourceMessageId = taken.at(-1)!.id;
+                ownerMessageIds.push(...taken.map((message) => message.id));
                 refresh();
+                if (intentLine && taken.at(-1)!.text.trim()) {
+                  const steers = (
+                    await pool.query<{ n: number }>(
+                      "SELECT count(*)::int AS n FROM turn_events WHERE turn_id=$1 AND type='steered'",
+                      [turnId],
+                    )
+                  ).rows[0]!.n;
+                  void showIntent(
+                    turn,
+                    taken.at(-1)!.text,
+                    steers + 1,
+                    intentLine,
+                    signal,
+                    current,
+                  ).catch(intentFailed);
+                }
               }
               const messages = [];
               for (const message of taken) {

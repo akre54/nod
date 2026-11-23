@@ -108,7 +108,7 @@ export interface MessagingTransport {
     accountId: string;
     threadId: string;
     text: string;
-    approval?: true;
+    approval?: { approve: string; decline: string };
     attachments?: MessagingAttachment[];
     replyToMessageId?: string;
     replyToText?: string;

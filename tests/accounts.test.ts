@@ -49,6 +49,7 @@ import {
   createRedactor,
   createTextRedactor,
   redactSecretText,
+  withoutSecretKeys,
 } from '../src/server/redaction.ts';
 
 test('decision failures retain bounded HTTP and response details', async (t) => {
@@ -1938,6 +1939,7 @@ describe('account routes', () => {
     key?: string,
     onboardingMissing?: () => Promise<'brain' | 'email' | null>,
     model?: Parameters<typeof createAccountSession>[0]['model'],
+    extra: Partial<Parameters<typeof createAccountSession>[0]> = {},
   ) {
     let record: AccountSettings = {
       theme: 'system',
@@ -1997,6 +1999,7 @@ describe('account routes', () => {
       onTraces,
       onboardingMissing,
       model,
+      ...extra,
     }).register(app);
     await app.ready();
     return { app, calls, activity, record: () => record };
@@ -2044,6 +2047,43 @@ describe('account routes', () => {
     });
     assert.ok(reopened.statusCode >= 400);
     assert.equal(f.record().onboardingCompleted, true);
+  });
+
+  test('setup failures keep their reason without secrets and are logged', async (t) => {
+    const reason = 'The local computer could not start: Docker daemon is not running';
+    const failure = new Error(`${reason} (Bearer synthetic-secret-token-0123456789)`);
+    const preparing = await fixture(undefined, undefined, undefined, async () => null, undefined, {
+      async prepare() {
+        throw failure;
+      },
+    });
+    const verifying = await fixture(undefined, undefined, undefined, async () => {
+      throw failure;
+    });
+    t.after(() => Promise.all([preparing.app.close(), verifying.app.close()]));
+    const logged = t.mock.method(console, 'error', () => {});
+    const send = (f: typeof preparing, method: 'PATCH' | 'POST', url: string, payload: object) =>
+      f.app.inject({ method, url, headers: { origin }, payload });
+    const responses = [
+      await send(preparing, 'PATCH', '/api/account', { onboardingCompleted: true }),
+      await send(preparing, 'POST', '/api/account/prepare', {}),
+      await send(verifying, 'PATCH', '/api/account', { onboardingCompleted: true }),
+    ];
+    assert.deepEqual(
+      responses.map((response) => [response.statusCode, response.json().error]),
+      [
+        [503, `Setup could not be completed. ${reason} ([redacted])`],
+        [503, `Setup could not be completed. ${reason} ([redacted])`],
+        [503, `Could not verify setup. ${reason} ([redacted])`],
+      ],
+    );
+    assert.deepEqual(
+      logged.mock.calls.map((call) => JSON.parse(String(call.arguments[0])).event),
+      ['setup_failed', 'setup_failed', 'setup_failed'],
+    );
+    const written = JSON.stringify(logged.mock.calls.map((call) => call.arguments));
+    assert.doesNotMatch(written, /synthetic-secret-token|Docker daemon/);
+    assert.equal(verifying.record().onboardingCompleted, false);
   });
 
   test('usage data stays off until the owner opts in and the environment switch always wins', async (t) => {
@@ -3222,6 +3262,113 @@ test('secret redaction hides every bearer token character', () => {
   assert.equal(redactSecretText(`Rejected Basic ${basic}~tail`), 'Rejected [redacted]~tail');
 });
 
+test('secret field values stay private in every supported representation', () => {
+  const redact = createRedactor([]);
+  const canary = 'SyntheticPrefixedCredentialValue';
+  const tail = 'SyntheticPrivateTupleTail';
+  const names = [
+    'GITHUB_TOKEN',
+    'password',
+    'db_password',
+    'STRIPE_API_KEY',
+    'authToken',
+    'DBPwd',
+    'db_pwd',
+    'AUTH_OTP',
+    'authTOTP',
+    'card_cvv',
+    'card_cvc',
+    'CARD_PAN',
+    'database.password',
+    'service__api__key',
+  ];
+  for (const name of names) {
+    for (const clean of [redact, withoutSecretKeys]) {
+      assert.deepEqual(
+        JSON.parse(JSON.stringify(clean({ [name]: canary }))),
+        { [name]: '[redacted]' },
+        name,
+      );
+      assert.deepEqual(
+        JSON.parse(JSON.stringify(clean({ name, value: canary }))),
+        { name, value: '[redacted]' },
+        name,
+      );
+      assert.deepEqual(clean([name, canary, tail]), [name, '[redacted]'], name);
+      assert.deepEqual(clean([name]), [name], name);
+    }
+    for (const input of [
+      `${name}=${canary}`,
+      `"${name}":"${canary}"`,
+      `note="${name}=${canary}"`,
+      `https://example.test/?${name}=${canary}&status=ok`,
+    ]) {
+      assert.ok(!redactSecretText(input).includes(canary), input);
+      assert.ok(!createTextRedactor([])(input).includes(canary), input);
+    }
+  }
+  for (const name of [
+    'span',
+    'japan',
+    'Japan',
+    'tokenCount',
+    'passwordLength',
+    'Enter your password',
+  ]) {
+    for (const clean of [redact, withoutSecretKeys]) {
+      assert.deepEqual(
+        JSON.parse(JSON.stringify(clean({ [name]: 'Public value' }))),
+        { [name]: 'Public value' },
+        name,
+      );
+      assert.deepEqual(
+        clean([name, 'Public scalar detail', 'Another detail']),
+        [name, 'Public scalar detail', 'Another detail'],
+        name,
+      );
+    }
+  }
+  assert.equal(redactSecretText('span=safe japan=safe'), 'span=safe japan=safe');
+  const maskedLabel = createTextRedactor(['GITHUB_TOKEN']);
+  assert.ok(!maskedLabel(`GITHUB_TOKEN=${canary}`).includes(canary));
+  const overlapping = createTextRedactor(['AlphaBridge', 'BridgeOmega']);
+  assert.equal(overlapping('AlphaBridgeOmega'), '[redacted]');
+  const encoded = Buffer.from(canary).toString('base64');
+  assert.ok(
+    !redactSecretText(`api_key=data:application/octet-stream;base64,${encoded}`).includes(encoded),
+  );
+  const keyBlock = `Synthetic failure: api_key=-----BEGIN PRIVATE KEY-----\n${canary}\n-----END PRIVATE KEY-----`;
+  const keyError = createTextRedactor(['PRIVATE KEY'])(keyBlock);
+  assert.ok(keyError.startsWith('Synthetic failure:'));
+  assert.ok(!keyError.includes(canary));
+  for (const label of ['PRIVATE KEY', 'RSA PRIVATE KEY', 'EC PRIVATE KEY', 'OPENSSH PRIVATE KEY']) {
+    const start = `-----BEGIN ${label}-----`;
+    const end = `-----END ${label}-----`;
+    const suffix = 'Public status: denied';
+    const closed = `${start}\n${canary}\n${end}\n${suffix}`;
+    for (const clean of [redactSecretText, createTextRedactor([])]) {
+      for (const input of [closed, `${closed}\n${closed}`]) {
+        const output = clean(input);
+        assert.ok(!output.includes(canary), label);
+        assert.ok(output.endsWith(suffix), label);
+      }
+      for (const broken of [
+        `${start}\n${canary}\n${tail}`,
+        `${start}\n${canary}\n-----END CERTIFICATE-----\n${tail}`,
+        `${start}\n${canary}\n${start}\n${end}\n${tail}`,
+      ]) {
+        const hidden = clean(broken);
+        assert.ok(!hidden.includes(canary), label);
+        assert.ok(!hidden.includes(tail), label);
+      }
+    }
+  }
+  const manyPublicFields = `${'publicField=ok\n'.repeat(9000)}GITHUB_TOKEN=${canary}\nFinal public reason`;
+  const largeOutput = createTextRedactor([])(manyPublicFields);
+  assert.ok(!largeOutput.includes(canary));
+  assert.ok(largeOutput.endsWith('Final public reason'));
+});
+
 test('secret redaction keeps valid tokens when another token is missing', () => {
   const secrets = [' fixture-access-token ', undefined, null, 42] as unknown as string[];
   const text = createTextRedactor(secrets);
@@ -3595,6 +3742,91 @@ test('compatible model discovery retains HTTP failures and private values throug
     });
 });
 
+test('Hostinger AI Router applies model output limits and prices, filters chat models, and rejects a refused key', async () => {
+  const { createPiModelBackend, createPiModelRuntime } =
+    await import('../src/providers/pi/models.ts');
+  const { ModelAuthError } = await import('../src/ports/models.ts');
+  const model = (id: string, endpoints: string[], output = ['text']) => ({
+    id,
+    name: id,
+    context_length: 200000,
+    max_output_tokens: 4096,
+    supported_parameters: ['tools', 'reasoning_effort'],
+    supported_endpoints: endpoints,
+    architecture: { input_modalities: ['text', 'image'], output_modalities: output },
+    pricing: {
+      prompt: '0.000132',
+      completion: '0.00066',
+      input_cache_read: '0.0000132',
+      input_cache_write: '0.000165',
+    },
+  });
+  const backend = createPiModelBackend({
+    fetch: async (input, init) => {
+      assert.equal(String(input), 'https://router.hostinger.com/v1/models');
+      const key = new Headers(init?.headers).get('authorization');
+      if (key !== 'Bearer fixture-hostinger-key')
+        return Response.json({ error: 'invalid key' }, { status: 401 });
+      return Response.json({
+        data: [
+          model('fixture-chat', ['/v1/chat/completions', '/v1/messages']),
+          model('fixture-messages-only', ['/v1/messages']),
+          model('fixture-image', ['/v1/images/generations'], ['image']),
+          model('fixture-embedding', ['/v1/embeddings']),
+        ],
+      });
+    },
+  });
+  const models = await backend.catalog('hostinger', 'api_key', {
+    type: 'api_key',
+    key: 'fixture-hostinger-key',
+  });
+  assert.deepEqual(
+    models.map(({ choice }) => choice.id),
+    ['fixture-chat'],
+  );
+  const spec = models[0].spec as { baseUrl: string; api: string; cost: Record<string, number> };
+  assert.equal(spec.baseUrl, 'https://router.hostinger.com/v1');
+  assert.equal(spec.api, 'openai-completions');
+  for (const [rate, expected] of Object.entries({
+    input: 1.32,
+    output: 6.6,
+    cacheRead: 0.132,
+    cacheWrite: 1.65,
+  }))
+    assert.ok(Math.abs(spec.cost[rate]! - expected) < 1e-9, rate);
+  const { runtime, model: selected } = await createPiModelRuntime({
+    provider: 'hostinger',
+    method: 'api_key',
+    effort: 'off',
+    definition: models[0],
+    read: async () => ({ type: 'api_key', key: 'fixture-hostinger-key' }),
+  });
+  let requestedOutput: unknown;
+  const result = await runtime.completeSimple(
+    selected,
+    { messages: [{ role: 'user', content: 'Complete the synthetic task.', timestamp: 1 }] },
+    {
+      maxTokens: 32_768,
+      fetch: async (_input, init) => {
+        requestedOutput = JSON.parse(String(init?.body)).max_completion_tokens;
+        return new Response(
+          'data: {"choices":[{"index":0,"delta":{"content":"Synthetic result."},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+          {
+            headers: { 'content-type': 'text/event-stream' },
+          },
+        );
+      },
+    },
+  );
+  assert.equal(result.stopReason, 'stop', result.errorMessage);
+  assert.equal(requestedOutput, 4096);
+  await assert.rejects(
+    backend.catalog('hostinger', 'api_key', { type: 'api_key', key: 'fixture-refused-key' }),
+    (error) => error instanceof ModelAuthError && /Hostinger AI Router/.test(error.message),
+  );
+});
+
 describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
   async function fixture(t: import('node:test').TestContext) {
     const { createModelService } = await import('../src/server/models.ts');
@@ -3606,6 +3838,7 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
       connectionString: process.env.TEST_DATABASE_URL,
       options: `-c search_path=${schema}`,
       max: 2,
+      idleTimeoutMillis: 0,
     });
     const key = randomBytes(32);
     const keyStore = { id: 'fixture', configured: true, getKey: async () => key };
@@ -3764,6 +3997,29 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
       const completeCurrent = await current.prepareRequest!(selection.modelId, false);
       await completeCurrent();
       assert.equal(owner.current.issue, undefined);
+
+      const started = checks.length;
+      await owner.addEndpoint('http://localhost:11434/v1', 'fixture-busy-endpoint-key');
+      assert.equal(checks.length, started + 1);
+      checks.at(-1)!.reject(
+        Object.assign(new Error('HTTP 429: Synthetic model is at capacity.'), {
+          providerStatus: 429,
+          providerRetryable: true,
+        }),
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(owner.current.checking, false);
+      assert.equal(owner.current.issue, undefined);
+
+      await owner.addEndpoint('http://localhost:11434/v1', 'fixture-quota-endpoint-key');
+      checks.at(-1)!.reject(
+        Object.assign(new Error('HTTP 429: Synthetic insufficient_quota.'), {
+          providerStatus: 429,
+          providerRetryable: false,
+        }),
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.match(owner.current.issue!.reason, /Synthetic insufficient_quota/);
     },
   );
 
@@ -4135,10 +4391,14 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
       CLOUDFLARE_ACCOUNT_ID: 'ABCDEF0123456789ABCDEF0123456789',
       CLOUDFLARE_GATEWAY_ID: 'fixture-gateway',
     };
+    const definition = (await f.backend.catalog('openai', 'api_key')).find(
+      (model) => model.choice.id === 'gpt-6.1-sol',
+    )!;
     const backend = {
       ...f.backend,
-      catalog: (provider: import('../src/shared/models.ts').ModelProvider) =>
-        f.backend.catalog(provider, 'api_key'),
+      catalog: async (provider: import('../src/shared/models.ts').ModelProvider) => [
+        { ...definition, spec: { ...definition.spec, provider } },
+      ],
     };
     const owner = await f.create(
       'fixture-environment-owner',
@@ -4402,14 +4662,25 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     assert.equal(service.view().connections[0]!.issue, undefined);
     assert.equal(service.current.issue, undefined);
 
+    reply = () =>
+      Response.json(
+        { error: { message: 'Synthetic model is at capacity; please retry later.' } },
+        { status: 429 },
+      );
+    await assert.rejects(
+      curator.curate({ task: 'check', instructions: 'Return only {"ok":true}.', input: {} }),
+      { providerStatus: 429, providerRetryable: true },
+    );
+    assert.equal(calls, 10);
+
     reply = () => Response.json({ error: { message: 'API key expired.' } }, { status: 401 });
     assert.equal((await ask()).stopReason, 'error');
-    assert.equal(calls, 10);
+    assert.equal(calls, 11);
     assert.equal(service.view().connections[0]!.status, 'reconnect');
     assert.match(service.current.issue!.reason, /API key expired/);
     assert.equal(service.configured, false);
     await assert.rejects(ask(), /add it again/);
-    assert.equal(calls, 10);
+    assert.equal(calls, 11);
   });
 
   test('model setup chooses capable defaults, preserves explicit choices and requires valid cloud accounts', async (t) => {
@@ -6269,6 +6540,28 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
       'reconnect',
     );
     assert.equal(duplicated.configured, false);
+  });
+});
+
+test('API errors keep the server reason or else the status, never a response body', async (t) => {
+  const { responseError } = await import('../src/web/lib/api.ts');
+  const { downloadExport } = await import('../src/web/lib/download.ts');
+  const failure = (body: string, status: number, type: string) =>
+    responseError(new Response(body, { status, headers: { 'Content-Type': type } }));
+  const json = await failure('{"message":"Disk is full"}', 500, 'application/json');
+  assert.equal(json.message, 'Disk is full');
+  assert.equal(json.status, 500);
+  const preferred = await failure('{"error":"Too large","message":"x"}', 413, 'application/json');
+  assert.equal(preferred.message, 'Too large');
+  const proxy = await failure('<html>PRIVATE_BODY_CANARY</html>', 502, 'text/html');
+  assert.equal(proxy.message, 'The request could not be completed (HTTP 502).');
+  assert.equal(proxy.status, 502);
+  t.mock.method(globalThis, 'fetch', async () =>
+    Response.json({ error: 'The export is too large.' }, { status: 413 }),
+  );
+  await assert.rejects(downloadExport('/api/memory/export', 'memory.md'), {
+    message: 'The export is too large.',
+    status: 413,
   });
 });
 
@@ -9340,12 +9633,33 @@ test('startup facts keep only structured bounded codes and do not call getters o
     exitCode: 4294967295,
     signal: 'SIGTERM',
   });
+  assert.deepEqual(
+    startupErrorFacts({
+      code: 'NOD_WSL_REQUIRED',
+      step: 'import',
+      exitCode: 4294967295,
+    }),
+    {
+      detailsOmitted: true,
+      exitCode: 4294967295,
+      code: 'NOD_WSL_REQUIRED',
+      step: 'import',
+    },
+  );
+  assert.deepEqual(
+    startupErrorFacts({
+      code: 'NOD_SYNTHETIC_PRIVATE_CODE',
+      step: 'C:\\Users\\Synthetic Owner',
+    }),
+    { detailsOmitted: true },
+  );
   const poisoned = Object.defineProperties(
     {},
     Object.fromEntries(
       [
         'name',
         'code',
+        'step',
         'syscall',
         'status',
         'phase',

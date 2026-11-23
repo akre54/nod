@@ -21,8 +21,16 @@ const ref = /^@[a-z0-9]{6,32}:e\d{1,7}$/;
 const windowId = /^[A-Za-z0-9:._-]{1,200}$/;
 const appName = /^[^\0\r\n]{1,200}$/;
 const keys = /^[a-z0-9+.,\-=/ ]{1,40}$/i;
-const needsFocus =
+const focusRefusal =
   /focus fallback is denied|no verified focused element|focus could not be confirmed|physical input is disabled|requires --headed|requires focus permission/i;
+const unready = (error) =>
+  error.kind === 'deadline' ||
+  /has not published its accessibility tree|tree is still thin/i.test(error.message);
+const needsFocus = (error) =>
+  focusRefusal.test(error.message) ||
+  (error.delivery === 'not_delivered' &&
+    (error.kind === 'actionability_timeout' || unready(error)));
+const activation = ['focused', 'hovered', 'disabled'];
 const pasteRoles = new Set(['scrollarea', 'webarea', 'group', 'document']);
 const appSteps = new Set([
   'open',
@@ -68,6 +76,21 @@ const desktopId = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/;
 const programName = /^[A-Za-z0-9][A-Za-z0-9 _.-]{0,99}$/;
 const refusedCategories = /(^|;)(Settings|System|FileManager|Security)(;|$)/;
 
+const isFocused = (node) =>
+  node.states?.includes('focused') && !['window', 'dialog'].includes(node.role);
+
+function focusClaims(tree) {
+  const claims = new Map();
+  const visit = (node, list) => {
+    const own = listRoles.has(node.role) ? node : list;
+    const claim = own ?? node;
+    if (isFocused(node)) claims.set(claim, claims.has(claim) ? claim : node);
+    node.children?.forEach((child) => visit(child, own));
+  };
+  visit(tree);
+  return claims;
+}
+
 function secure(node) {
   return node.states?.includes('secure') || /secure|password/i.test(node.role ?? '');
 }
@@ -90,6 +113,8 @@ const listRoles = new Set([
   'menu',
 ]);
 const listLimit = 20;
+const contextChars = 12_000;
+const deadline = ['--timeout-ms', '25000'];
 
 const emptyGroup = (node) =>
   node.role === 'group' &&
@@ -114,49 +139,54 @@ function inspectResult(data, menu = false, target) {
       relevance.set(
         node,
         Boolean(
-          node.states?.includes('selected') || isTarget(node) || node.children?.some(relevant),
+          node.states?.includes('selected') ||
+          isTarget(node) ||
+          holders.has(node) ||
+          node.children?.some(relevant),
         ),
       );
     return relevance.get(node);
   };
   let trimmed = false;
-  let found = false;
+  let found = 0;
+  let targetNode;
+  let focusNode;
+  const selected = [];
   const focused = [];
   const focus = (node, path = []) => {
-    if (node.states?.includes('focused') && !['window', 'dialog'].includes(node.role))
+    if (holders.has(node))
       focused.push({ path, role: node.role ?? '', name: secure(node) ? '' : (node.name ?? '') });
     if (secure(node)) return;
     node.children?.forEach((child, index) => focus(child, [...path, index]));
   };
-  const walk = (node) => {
+  const walk = (node, inFocus = false) => {
     if (node.subtree_truncated || (node.children_count ?? 0) > (node.children?.length ?? 0))
       throw new Error('POLICY_DENIED: Part of the window is missing, so this step did not run.');
     if (secure(node)) return { role: node.role ?? '', secure: true };
-    if (isTarget(node)) found = true;
+    if (isTarget(node)) found++;
     const all = node.children ?? [];
     const kept = listRoles.has(node.role) && all.length > listLimit ? all.filter(relevant) : all;
-    if (kept.length < all.length) trimmed = true;
-    return {
+    const more = kept.length < all.length;
+    if (more) trimmed = true;
+    const read = {
       role: node.role ?? '',
       name: node.name ?? '',
       value: node.value ?? null,
       ...Object.fromEntries(
-        [
-          'description',
-          'hint',
-          'subrole',
-          'role_description',
-          'placeholder',
-          'native_id',
-          'available_actions',
-        ]
+        [...described, 'native_id']
           .filter((key) => node[key] != null)
           .map((key) => [key, node[key]]),
       ),
-      states: (node.states ?? []).filter((state) => !['focused', 'hovered'].includes(state)).sort(),
-      ...(kept.length < all.length ? { more: true } : {}),
-      children: kept.map(walk).filter((child) => !emptyGroup(child)),
+      states: (node.states ?? []).filter((state) => !activation.includes(state)).sort(),
+      ...(more ? { more: true } : {}),
+      children: kept
+        .map((child) => walk(child, inFocus || claims.has(node)))
+        .filter((child) => !emptyGroup(child)),
     };
+    if (isTarget(node)) targetNode ??= read;
+    if (holders.has(node)) focusNode ??= read;
+    if (inFocus && node.states?.includes('selected')) selected.push(read);
+    return read;
   };
   const source = menu
     ? {
@@ -166,6 +196,8 @@ function inspectResult(data, menu = false, target) {
           data.tree.children_count == null ? undefined : Math.max(0, data.tree.children_count - 2),
       }
     : data.tree;
+  const claims = focusClaims(source);
+  const holders = new Set(claims.values());
   const tree = walk(source);
   focus(source);
   if (target && !found)
@@ -173,17 +205,131 @@ function inspectResult(data, menu = false, target) {
       'STALE_REF: That control is no longer in the window, so this step did not run.',
     );
   const hash = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+  const placed = around(
+    tree,
+    targetNode ?? selected[0] ?? focusNode ?? tree,
+    targetNode ? [] : selected,
+  );
+  const checked = placed ?? around(tree, tree);
+  if (target && checked !== tree && (found > 1 || !placed))
+    throw new Error(
+      'POLICY_DENIED: This window is too large to check whole, and Nod could not tell which part holds that control, so this step did not run.',
+    );
   return {
-    tree: JSON.parse(
-      JSON.stringify(tree, (key, value) =>
-        ['native_id', 'available_actions'].includes(key) ? undefined : value,
-      ),
-    ),
-    state: hash(tree),
+    context: render(checked).join('\n'),
+    state: hash(checked),
     focus: hash(focused),
     focused,
-    incomplete: trimmed,
+    incomplete: trimmed || checked !== tree,
   };
+}
+
+const quote = (text) => JSON.stringify(String(text));
+const described = ['description', 'hint', 'placeholder', 'subrole', 'role_description'];
+
+function line(node, depth) {
+  let text = `${'  '.repeat(depth)}- ${node.role || 'element'}`;
+  if (node.secure) return `${text} [password, hidden]`;
+  if (node.name) text += ` ${quote(node.name)}`;
+  if (node.value != null) text += ` = ${quote(node.value)}`;
+  for (const key of described) if (node[key] != null) text += ` ${key}: ${quote(node[key])}`;
+  if (node.states?.length) text += ` (${node.states.join(', ')})`;
+  if (node.more) text += ' [more not shown]';
+  return text;
+}
+
+function render(node, depth = 0) {
+  const inner = depth + (wrapper(node) ? 0 : 1);
+  const children = (node.children ?? []).flatMap((child) => render(child, inner));
+  return wrapper(node) ? children : [line(node, depth), ...children];
+}
+
+function wrapper(node) {
+  return (
+    ['group', ''].includes(node.role) &&
+    !node.name &&
+    node.value == null &&
+    !node.states?.length &&
+    !node.more &&
+    !described.some((key) => node[key] != null)
+  );
+}
+
+function around(tree, anchor, required = []) {
+  const sizes = new WeakMap();
+  const whole = (node, depth) => {
+    const known = sizes.get(node) ?? new Map();
+    sizes.set(node, known);
+    if (!known.has(depth)) known.set(depth, render(node, depth).join('\n').length + 1);
+    return known.get(depth);
+  };
+  if (whole(tree, 0) - 1 <= contextChars) return tree;
+  const pathTo = (wanted) => {
+    const path = [];
+    const find = (node) => {
+      path.push(node);
+      if (node === wanted || node.children?.some(find)) return true;
+      path.pop();
+      return false;
+    };
+    return find(tree) ? path : undefined;
+  };
+  const path = pathTo(anchor);
+  if (!path) return undefined;
+  const open = new Set(path);
+  const kept = new Set();
+  for (const node of required) {
+    const route = pathTo(node);
+    if (!route) return undefined;
+    route.forEach((step) => open.add(step));
+    kept.add(node);
+  }
+  const part = (node) => {
+    const shown = node.children.filter((child) => kept.has(child) || open.has(child));
+    return {
+      node: { ...node, ...(shown.length < node.children.length ? { more: true } : {}) },
+      shown,
+    };
+  };
+  const size = (node, depth) => {
+    if (kept.has(node)) return whole(node, depth);
+    const { node: self, shown } = part(node);
+    const own = wrapper(self) ? 0 : line(self, depth).length + 1;
+    const inner = depth + (wrapper(self) ? 0 : 1);
+    return own + shown.reduce((sum, child) => sum + size(child, inner), 0);
+  };
+  const fits = () => size(tree, 0) - 1 <= contextChars;
+  const fit = (node, backwards = false) => {
+    if (kept.has(node)) return;
+    kept.add(node);
+    if (fits()) return;
+    kept.delete(node);
+    if (!node.children?.length) return;
+    const opened = !open.has(node);
+    open.add(node);
+    if (!fits()) {
+      if (opened) open.delete(node);
+      return;
+    }
+    for (const child of backwards ? [...node.children].reverse() : node.children)
+      fit(child, backwards);
+  };
+  fit(anchor);
+  for (let depth = path.length - 1; depth > 0; depth--) {
+    const siblings = path[depth - 1].children;
+    const at = siblings.indexOf(path[depth]);
+    const order = siblings
+      .map((_, index) => index)
+      .filter((index) => index !== at)
+      .sort((a, b) => Math.abs(a - at) - Math.abs(b - at) || a - b);
+    for (const index of order) fit(siblings[index], index < at);
+  }
+  const build = (node) => {
+    if (kept.has(node)) return node;
+    const { node: self, shown } = part(node);
+    return { ...self, children: shown.map(build) };
+  };
+  return build(tree);
 }
 
 async function windowsProgram(path) {
@@ -309,7 +455,12 @@ export function createComputerHelper({
           if (envelope.ok) return resolve(envelope.data ?? {});
           const failure = envelope.error ?? {};
           reject(
-            new Error(`${failure.code ?? 'ERROR'}: ${failure.message ?? 'agent-desktop failed.'}`),
+            Object.assign(
+              new Error(
+                `${failure.code ?? 'ERROR'}: ${failure.message ?? 'agent-desktop failed.'}`,
+              ),
+              { kind: failure.details?.kind, delivery: failure.disposition?.delivery },
+            ),
           );
         },
       );
@@ -335,6 +486,7 @@ export function createComputerHelper({
     ...(request.menu ? ['--surface', 'menubar'] : []),
     '--max-depth',
     '50',
+    ...deadline,
   ];
 
   function guarded(request, args, input) {
@@ -345,14 +497,37 @@ export function createComputerHelper({
         alive(started, current);
         return spawnCommand(args, undefined, current);
       };
-      if (request.expected || request.noSecureFocus) {
+      if (request.noSecureFocus && !request.expected) {
+        const data = await read([
+          'find',
+          ...scope(request),
+          '--state',
+          'focused',
+          '--limit',
+          '0',
+          ...deadline,
+        ]);
+        if (
+          !Array.isArray(data.matches) ||
+          data.truncated ||
+          data.matches.some(
+            (node) =>
+              secure(node) ||
+              node.path?.some(
+                (step) => typeof step !== 'string' || secure({ role: step.split(':')[0] }),
+              ),
+          )
+        )
+          throw new Error('POLICY_DENIED: A password field has focus, so this step did not run.');
+      }
+      if (request.expected) {
         const data = await read(inspectArgs(request));
         const inspected = inspectResult(
           data,
           platform === 'darwin' && Boolean(request.menu),
           request.control,
         );
-        if (request.expected && inspected.state !== request.expected)
+        if (inspected.state !== request.expected)
           throw new Error('STALE_REF: That window changed since this step was checked.');
         if (request.expectedFocus && inspected.focus !== request.expectedFocus)
           throw new Error('STALE_REF: The keyboard target changed since this step was checked.');
@@ -366,6 +541,7 @@ export function createComputerHelper({
           check(request.ref, ref, 'ref'),
           '--max-depth',
           '50',
+          ...deadline,
         ]);
         inspectResult(data);
         const node = data.tree;
@@ -594,7 +770,7 @@ export function createComputerHelper({
       try {
         return await guarded(request, args, input);
       } catch (error) {
-        if (!window || !needsFocus.test(error.message)) throw error;
+        if (!window || !needsFocus(error)) throw error;
       }
     if (inFront) stale.add(target.window);
     return focused(target, window, async () => {
@@ -602,7 +778,7 @@ export function createComputerHelper({
       try {
         return await guarded(request, args, input);
       } catch (error) {
-        if (!needsFocus.test(error.message)) throw error;
+        if (!needsFocus(error)) throw error;
         return guarded(request, [...args, '--headed'], input);
       }
     });
@@ -648,7 +824,12 @@ export function createComputerHelper({
 
   async function observe(request, work) {
     const target = { app: request.app, window: request.window };
-    if (!stale.has(target.window)) return work();
+    if (!stale.has(target.window))
+      try {
+        return await work();
+      } catch (error) {
+        if (!target.window || !needsFocus(error)) throw error;
+      }
     const window = await windowOf(target);
     if (!window) return work();
     const result = await focused(target, window, work);
@@ -664,30 +845,33 @@ export function createComputerHelper({
       else await run(['permissions', request.which === 'screen' ? '--guide' : '--request']);
       return permissions();
     },
-    apps: async () => {
-      const [{ apps }, windows] = await Promise.all([run(['list-apps']), run(['list-windows'])]);
-      return {
-        apps: await Promise.all(
-          apps.map(async (app) => ({
-            pid: app.pid,
-            bundle: app.bundle_id ?? (platform === 'linux' ? '' : app.name),
-            ...(platform === 'linux'
-              ? {
-                  program: sandboxed
-                    ? ''
-                    : await readlink(`/proc/${app.pid}/exe`).then(basename, () => ''),
-                }
-              : platform === 'win32'
-                ? { program: app.name }
-                : {}),
-            name: app.name,
-            windows: windows
-              .filter((window) => window.pid === app.pid && window.visible !== false)
-              .map((window) => ({ id: window.id, title: window.title ?? '' })),
-          })),
-        ),
-      };
-    },
+    apps: async () => ({
+      apps: await Promise.all(
+        (await run(['list-apps'])).apps.map(async (app) => ({
+          pid: app.pid,
+          bundle: app.bundle_id ?? (platform === 'linux' ? '' : app.name),
+          ...(platform === 'linux'
+            ? {
+                program: sandboxed
+                  ? ''
+                  : await readlink(`/proc/${app.pid}/exe`).then(basename, () => ''),
+              }
+            : platform === 'win32'
+              ? { program: app.name }
+              : {}),
+          name: app.name,
+        })),
+      ),
+    }),
+    windows: async (request) => ({
+      windows: (await run(['list-windows', '--app', check(request.app, appName, 'app')]))
+        .filter((window) => window.pid === request.pid && window.accessible !== false)
+        .map((window) => ({
+          id: window.id,
+          title: window.title ?? '',
+          ...(window.visible === false ? { hidden: true } : {}),
+        })),
+    }),
     locate: async (request) => {
       const { bundle, name, program } = await locate(request);
       return { bundle, name, program };
@@ -723,7 +907,7 @@ export function createComputerHelper({
               ...(request.menu ? ['--surface', await menuBar()] : []),
               ...(request.skeleton ? ['--skeleton'] : []),
             ];
-        const data = await run([...args, '-i', '--compact']);
+        const data = await run([...args, '-i', '--compact', ...deadline]);
         return { tree: data.tree };
       }),
     inspect: async (request) => {
@@ -745,6 +929,7 @@ export function createComputerHelper({
           ...scope(request),
           ...(request.text ? ['--text', check(request.text, appName, 'text')] : []),
           ...(request.role ? ['--role', check(request.role, /^[a-z]{1,40}$/, 'role')] : []),
+          ...deadline,
         ]),
       ),
     screenshot: (request) => observe(request, () => screenshot(request)),
