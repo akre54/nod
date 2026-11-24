@@ -52,6 +52,7 @@ export interface IntegrationSession {
   id: string;
   authorize(service: IntegrationService, callbackUrl: string): Promise<IntegrationAuthorization>;
   search(query: string, signal?: AbortSignal): Promise<IntegrationSearch>;
+  offers?(action: string, signal?: AbortSignal): Promise<boolean>;
   execute(
     action: string,
     args: Record<string, unknown>,
@@ -77,6 +78,7 @@ export interface IntegrationEvent {
 export interface IntegrationInboxPoll {
   cursor: string;
   hasMore: boolean;
+  retryAfterMs?: number;
   messages: Array<{
     id: string;
     threadId: string;
@@ -86,24 +88,149 @@ export interface IntegrationInboxPoll {
   }>;
 }
 export class IntegrationInboxCursorExpired extends Error {}
-export class IntegrationPermissionError extends Error {}
-export class IntegrationCatalogAccessDenied extends Error {
-  constructor() {
-    super('The app catalog is unavailable. Try again later.');
-  }
-}
-export class IntegrationConnectionError extends Error {
-  readonly statusCode: number;
+export class IntegrationInboxTransientError extends Error {
+  readonly retryAfterMs: number;
+
   constructor(
-    readonly reason:
-      'authorization' | 'permission' | 'rate_limit' | 'timeout' | 'unavailable' | 'invalid_request',
-    readonly phase: 'session' | 'link',
     readonly status?: number,
     readonly code?:
       | 'installation_busy'
       | 'public_budget_exceeded'
+      | 'rate_limited'
       | 'service_unavailable'
       | 'security_service_unavailable',
+  ) {
+    super(
+      `The inbox check temporarily failed${status ? ` (HTTP ${status})` : ''}${code ? `: ${code}` : ''}.`,
+    );
+    this.retryAfterMs = code === 'public_budget_exceeded' ? 300_000 : 60_000;
+  }
+}
+export class IntegrationPermissionError extends Error {}
+export type IntegrationCatalogAccessCode =
+  'installation_enrollment_required' | 'installation_revoked' | 'browser_pairing_required';
+export class IntegrationCatalogAccessDenied extends Error {
+  constructor(readonly code?: IntegrationCatalogAccessCode) {
+    super(
+      code === 'installation_enrollment_required'
+        ? 'This Nod installation needs enrollment for app access. Contact support if it remains blocked.'
+        : code === 'installation_revoked'
+          ? 'App access for this Nod installation was revoked. Contact support to restore it.'
+          : code === 'browser_pairing_required'
+            ? 'App access needs browser pairing. Complete the app connection in your browser, then try again.'
+            : 'The app catalog could not authorize this request. Contact support if it persists.',
+    );
+    if (code) this.message += ` Proxy code: ${code}. HTTP 403.`;
+  }
+}
+export const integrationCatalogProxyErrorCodes = [
+  'rate_limited',
+  'installation_busy',
+  'public_budget_exceeded',
+  'provider_rate_limited',
+  'service_unavailable',
+  'security_service_unavailable',
+  'public_access_unavailable',
+  'provider_unavailable',
+  'provider_request_failed',
+  'catalog_unavailable',
+  'operation_timeout',
+  'invalid_limit_configuration',
+  'invalid_provider_response',
+  'unsafe_provider_response',
+] as const;
+export type IntegrationCatalogProxyErrorCode = (typeof integrationCatalogProxyErrorCodes)[number];
+export class IntegrationCatalogFailure extends Error {
+  readonly statusCode: number;
+  constructor(
+    readonly reason: IntegrationConnectionError['reason'],
+    readonly status?: number,
+    readonly code?: IntegrationCatalogProxyErrorCode,
+  ) {
+    super(
+      code === 'public_budget_exceeded'
+        ? 'The app request limit has been reached. Wait for it to reset before trying again.'
+        : code === 'provider_rate_limited'
+          ? 'The app provider is limiting requests. Wait for its limit to reset before trying again.'
+          : reason === 'rate_limit'
+            ? 'The app catalog is receiving too many requests. Wait a moment, then try again.'
+            : reason === 'timeout'
+              ? 'The app catalog took too long to respond. Try again shortly.'
+              : reason === 'authorization' || reason === 'permission'
+                ? 'The app catalog could not authorize this request. Try again later.'
+                : reason === 'invalid_request'
+                  ? 'The app catalog request was rejected. Try again later.'
+                  : 'The app catalog is unavailable. Try again later.',
+    );
+    if (code) this.message += ` Proxy code: ${code}.`;
+    if (status !== undefined) this.message += ` HTTP ${status}.`;
+    this.statusCode =
+      status === 502
+        ? 502
+        : reason === 'rate_limit'
+          ? 429
+          : reason === 'timeout'
+            ? 504
+            : reason === 'invalid_request'
+              ? 502
+              : 503;
+  }
+}
+const integrationConnectionCodes = [
+  ...integrationCatalogProxyErrorCodes,
+  'connections_unavailable',
+  'not_found',
+  'installation_enrollment_required',
+  'installation_revoked',
+  'browser_pairing_required',
+  'account_unavailable',
+  'account_revoking',
+  'toolkit_unavailable',
+  'invalid_callback',
+  'invalid_ui_origin',
+  'invalid_authentication',
+  'expired_authentication',
+  'request_already_used',
+  'json_required',
+  'invalid_json',
+  'invalid_request',
+  'request_too_large',
+  'request_timeout',
+  'upload_busy',
+  'file_too_large',
+  'invalid_file_data',
+  'tool_account_mismatch',
+  'invalid_upload_session',
+  'invalid_storage_destination',
+  'file_upload_failed',
+  'file_verification_failed',
+] as const;
+export type IntegrationConnectionCode = (typeof integrationConnectionCodes)[number];
+export type IntegrationConnectionReason =
+  'authorization' | 'permission' | 'rate_limit' | 'timeout' | 'unavailable' | 'invalid_request';
+export function connectionCode(value: unknown): IntegrationConnectionCode | undefined {
+  return integrationConnectionCodes.find((code) => code === value);
+}
+export function connectionReason(
+  status: unknown,
+  timedOut: boolean,
+  unreachable: boolean,
+): IntegrationConnectionReason | undefined {
+  if (status === 401) return 'authorization';
+  if (status === 403) return 'permission';
+  if (status === 429) return 'rate_limit';
+  if (status === 408 || status === 504 || timedOut) return 'timeout';
+  if ((typeof status === 'number' && status >= 500 && status <= 599) || unreachable)
+    return 'unavailable';
+  if (typeof status === 'number' && status >= 400 && status <= 499) return 'invalid_request';
+}
+export class IntegrationConnectionError extends Error {
+  readonly statusCode: number;
+  constructor(
+    readonly reason: IntegrationConnectionReason,
+    readonly phase: 'session' | 'link',
+    readonly status?: number,
+    readonly code?: IntegrationConnectionCode,
   ) {
     super(
       code
@@ -128,6 +255,11 @@ export class IntegrationConnectionError extends Error {
             ? 504
             : 502;
   }
+}
+export interface IntegrationBackoff {
+  until: number;
+  status: number;
+  code?: IntegrationConnectionError['code'];
 }
 export interface VerificationEmailQuery {
   recipient: string;
@@ -177,6 +309,7 @@ export interface IntegrationProvider {
   configured: boolean;
   configurationId?: string;
   ownsConnectionUrl?(url: string): boolean;
+  connectionBackoff?(): IntegrationBackoff | undefined;
   supportedServices?: readonly IntegrationService[];
   listServices?(): Promise<IntegrationServiceInfo[]>;
   webhooksConfigured: boolean;

@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import type { Pool, PoolClient } from 'pg';
 import { z } from 'zod';
 import { openVaultValue, sealVaultValue } from './vault-crypto.ts';
+import { transaction } from './transaction.ts';
 import {
   ChannelSetupFailure,
   telegramSecret,
@@ -222,22 +223,14 @@ async function databaseStore(pool: Pool, owner: string) {
       ).rows;
     },
     async save(row: ChannelSettingsRow, beforeCommit?: () => Promise<void>) {
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
+      return transaction(async (client) => {
         await client.query(
           `INSERT INTO channel_settings(owner_id,provider,enabled,ciphertext,summary) VALUES($1,$2,$3,$4,$5)
            ON CONFLICT(owner_id,provider) DO UPDATE SET enabled=EXCLUDED.enabled,ciphertext=EXCLUDED.ciphertext,summary=EXCLUDED.summary,updated_at=now()`,
           [owner, row.provider, row.enabled, row.ciphertext, JSON.stringify(row.summary)],
         );
         await beforeCommit?.();
-        await client.query('COMMIT');
-      } catch (error) {
-        await client.query('ROLLBACK');
-        throw error;
-      } finally {
-        client.release();
-      }
+      }, pool);
     },
     async activate(provider: ChannelProvider) {
       return (
@@ -252,9 +245,7 @@ async function databaseStore(pool: Pool, owner: string) {
       next: ChannelSettingsRow,
       beforeCommit: (client: PoolClient) => Promise<(() => void) | undefined>,
     ) {
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
+      return transaction(async (client) => {
         const updated = await client.query(
           `UPDATE channel_settings SET ciphertext=$2,summary=$3::jsonb || CASE WHEN summary ? 'webhookStatus' THEN jsonb_build_object('webhookStatus',summary->'webhookStatus') ELSE '{}'::jsonb END,updated_at=now()
            WHERE owner_id=$1 AND provider='telegram' AND enabled=true AND ciphertext=$4`,
@@ -262,14 +253,8 @@ async function databaseStore(pool: Pool, owner: string) {
         );
         if (updated.rowCount !== 1) throw new ChannelSetupFailure('pairing_unavailable');
         const notify = await beforeCommit(client);
-        await client.query('COMMIT');
         return notify;
-      } catch (error) {
-        await client.query('ROLLBACK');
-        throw error;
-      } finally {
-        client.release();
-      }
+      }, pool);
     },
   };
 }
@@ -504,8 +489,11 @@ export async function createChannelSettings(
         await store.save({ provider, enabled: true, ciphertext, summary });
         try {
           summary = await activate(provider, { environment: configured, summary });
-        } catch {
-          throw new ChannelSetupFailure('activation_pending');
+        } catch (error) {
+          throw new ChannelSetupFailure(
+            'activation_pending',
+            error instanceof ChannelSetupFailure ? error.details : undefined,
+          );
         }
         return { ok: true, channel: summary, ...(pairingUrl ? { pairingUrl } : {}) };
       }
@@ -739,7 +727,7 @@ export async function createChannelSettings(
           webhook_failed:
             'Telegram did not confirm the webhook registration. Check the public URL and try again.',
           activation_pending:
-            'The setup was saved and the bot token is valid, but Nod could not start receiving messages. Retry the connection to continue.',
+            'The setup was saved, but message delivery could not be confirmed. Retry the connection to continue.',
           server_managed:
             'This channel is managed by the server environment. Update it there and restart Nod.',
           pairing_unavailable:
@@ -758,7 +746,11 @@ export async function createChannelSettings(
           .send({
             error:
               error instanceof ChannelSetupFailure
-                ? messages[error.reason]
+                ? error.details
+                  ? error.reason === 'activation_pending'
+                    ? `${messages.activation_pending} ${error.details}`
+                    : error.details
+                  : messages[error.reason]
                 : 'Channel settings could not be saved securely. Check the setup before retrying.',
           });
       });

@@ -3,6 +3,7 @@ import { DataSharing } from '../../../components/data-sharing';
 import { LockKeyhole, MousePointerClick, ShieldCheck, Sparkles } from '../../../components/icons';
 import { NodGlyph } from '../../../components/motion';
 import { Button } from '../../../components/ui';
+import { appPages } from '../../../../shared/app-links';
 import { desktopRuntimeAvailable } from '../../../lib/desktop';
 import { legalLinks } from '../../../../shared/onboarding';
 import type { StepProps } from '..';
@@ -17,7 +18,7 @@ function differentiators(local: boolean) {
     {
       icon: Sparkles,
       title: 'Works proactively',
-      text: 'Turn on automatic preparation in Settings → Notifications to get useful work from app changes, within a monthly allowance.',
+      text: `Turn on automatic preparation in ${appPages['/settings/notifications']} to get useful work from app changes, within a monthly allowance.`,
     },
     {
       icon: LockKeyhole,
@@ -39,7 +40,8 @@ export function Welcome({
   actionLabel = 'Get started',
   local = desktopRuntimeAvailable() ||
     ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname),
-}: StepProps & { actionLabel?: string; local?: boolean }) {
+  note = true,
+}: StepProps & { actionLabel?: string; local?: boolean; note?: boolean }) {
   useEffect(() => {
     const press = (event: KeyboardEvent) => {
       const surface =
@@ -85,17 +87,23 @@ export function Welcome({
         )}
         <Button onClick={onNext}>{actionLabel}</Button>
       </div>
-      <p className="ob-welcome-note">
-        This is a preview version of Nod, developed by n8n
-        <br />
-        <a className="ob-link" href={legalLinks.terms} target="_blank" rel="noreferrer">
-          Terms of Use
-        </a>
-        {' · '}
-        <a className="ob-link" href={legalLinks.privacy} target="_blank" rel="noreferrer">
-          Privacy policy
-        </a>
-      </p>
+      {note && <WelcomeNote />}
     </section>
+  );
+}
+
+export function WelcomeNote() {
+  return (
+    <p className="ob-welcome-note">
+      This is a preview version of Nod, developed by n8n
+      <br />
+      <a className="ob-link" href={legalLinks.terms} target="_blank" rel="noreferrer">
+        Terms of Use
+      </a>
+      {' · '}
+      <a className="ob-link" href={legalLinks.privacy} target="_blank" rel="noreferrer">
+        Privacy policy
+      </a>
+    </p>
   );
 }

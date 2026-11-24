@@ -3,6 +3,7 @@ export const apiKeyModelProviders = [
   'anthropic',
   'google',
   'openrouter',
+  'hostinger',
   'amazon-bedrock',
   'google-vertex',
   'azure',
@@ -74,13 +75,163 @@ export interface ModelChoice {
   audio?: boolean;
   textModelName?: string;
   contextWindow: number;
-  pricing?: { input: number; output: number } | 'variable';
+  pricing?: ModelPricing | 'variable';
+}
+
+export interface ModelPricing {
+  input: number;
+  output: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  longCacheWrites?: boolean;
+  tiers?: Array<Omit<ModelPricing, 'tiers'> & { inputTokensAbove: number }>;
 }
 
 export interface ModelSelection {
   connectionId: string;
   modelId: string;
   effort: ModelEffort;
+}
+
+export type ModelLane = 'schedule' | 'background';
+export type ModelRoute = ModelSelection | 'light';
+export type ModelRoutes = Partial<Record<ModelLane, ModelRoute | null>>;
+export type WorkKind = 'chat' | ModelLane;
+
+export interface WorkModel {
+  selection: ModelSelection;
+  follows: 'task' | 'schedule' | 'lane' | 'light' | 'chat';
+}
+
+export interface WorkUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cacheWrite1h?: number;
+  agentUsd: number;
+  otherUsd: number;
+  models: string[];
+  pricingSignatures?: Array<string | null>;
+  tokensAbove?: Array<
+    [
+      threshold: number,
+      input: number,
+      output: number,
+      cacheRead: number,
+      cacheWrite: number,
+      cacheWrite1h: number,
+    ]
+  >;
+}
+
+export interface WorkUsageResponse {
+  lanes: Record<WorkKind, WorkUsage>;
+  schedules: Record<string, WorkUsage>;
+  tasks: Record<string, WorkUsage>;
+  own: Array<
+    WorkUsage & { kind: WorkKind; task: ModelSelection | null; schedule: ModelSelection | null }
+  >;
+}
+
+export function routeModel(
+  models: {
+    connections: Array<{ id: string }>;
+    selection: ModelSelection | null;
+    routes?: ModelRoutes;
+    light?: ModelSelection | null;
+  },
+  kind: WorkKind,
+  own: { task?: ModelSelection | null; schedule?: ModelSelection | null } = {},
+): WorkModel | null {
+  const present = (choice: ModelSelection | null | undefined) =>
+    choice && models.connections.some((row) => row.id === choice.connectionId) ? choice : undefined;
+  const task = present(own.task);
+  if (task) return { selection: task, follows: 'task' };
+  const schedule = kind === 'schedule' ? present(own.schedule) : undefined;
+  if (schedule) return { selection: schedule, follows: 'schedule' };
+  const route = kind === 'chat' ? undefined : models.routes?.[kind];
+  if (route === 'light' && models.light) return { selection: models.light, follows: 'light' };
+  const lane = route === 'light' ? undefined : present(route);
+  if (lane) return { selection: lane, follows: 'lane' };
+  return models.selection ? { selection: models.selection, follows: 'chat' } : null;
+}
+
+export function boundedPrice(cost: ModelChoice['pricing']) {
+  if (!cost || cost === 'variable') return false;
+  const prices = [cost.input, cost.output, cost.cacheRead ?? 0, cost.cacheWrite ?? 0];
+  return prices.every((price) => Number.isFinite(price) && price >= 0) && Math.max(...prices) > 0;
+}
+
+export function supportsLongCacheWrites(api: unknown) {
+  return api === 'anthropic-messages' || api === 'bedrock-converse-stream';
+}
+
+export function modelPricingSignature(
+  pricing: ModelChoice['pricing'],
+  api?: unknown,
+): string | undefined {
+  if (!pricing || pricing === 'variable' || !boundedPrice(pricing)) return undefined;
+  const rates = (value: Omit<ModelPricing, 'tiers'>) => [
+    value.input,
+    value.output,
+    value.cacheRead ?? value.input,
+    value.cacheWrite ?? value.input,
+  ];
+  const tiers = (pricing.tiers ?? []).map((tier) => [tier.inputTokensAbove, ...rates(tier)]);
+  if (tiers.some((tier) => tier.some((value) => !Number.isFinite(value) || value < 0)))
+    return undefined;
+  const longCacheWrites = pricing.longCacheWrites ?? supportsLongCacheWrites(api);
+  return JSON.stringify([...rates(pricing), ...tiers, ...(longCacheWrites ? ['1h'] : [])]);
+}
+
+export function canReuseWorkCost(
+  usage: WorkUsage,
+  modelId: string,
+  pricing: ModelChoice['pricing'],
+) {
+  const signature = modelPricingSignature(pricing);
+  return (
+    signature !== undefined &&
+    usage.models.length === 1 &&
+    usage.models[0] === modelId &&
+    usage.pricingSignatures?.length === 1 &&
+    usage.pricingSignatures[0] === signature
+  );
+}
+
+export function repriceUsd(usage: WorkUsage, pricing: ModelChoice['pricing'], audio = false) {
+  if (audio || !pricing || pricing === 'variable') return null;
+  const charge = (
+    [input, output, cacheRead, cacheWrite, cacheWrite1h]: [number, number, number, number, number],
+    rates: ModelPricing,
+  ) => {
+    const longWrites = pricing.longCacheWrites ? cacheWrite1h : 0;
+    return (
+      input * rates.input +
+      output * rates.output +
+      cacheRead * (rates.cacheRead ?? rates.input) +
+      (cacheWrite - longWrites) * (rates.cacheWrite ?? rates.input) +
+      longWrites * rates.input * 2
+    );
+  };
+  let total = charge(
+    [usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.cacheWrite1h ?? 0],
+    pricing,
+  );
+  let rates: ModelPricing = pricing;
+  let previousThreshold: number | undefined;
+  for (const tier of pricing.tiers?.toSorted((a, b) => a.inputTokensAbove - b.inputTokensAbove) ??
+    []) {
+    if (tier.inputTokensAbove === previousThreshold) continue;
+    const above = usage.tokensAbove?.find(([threshold]) => threshold === tier.inputTokensAbove);
+    if (!above) return null;
+    const [, ...tokens] = above;
+    total += charge(tokens, tier) - charge(tokens, rates);
+    rates = tier;
+    previousThreshold = tier.inputTokensAbove;
+  }
+  return usage.otherUsd + total / 1e6;
 }
 
 export interface ModelConnection {
@@ -92,11 +243,21 @@ export interface ModelConnection {
   models: ModelChoice[];
   managed: boolean;
   keyEnding?: string;
+  issue?: ModelIssue;
+}
+
+export interface ModelIssue {
+  reason: string;
 }
 
 export interface ModelsResponse {
   connections: ModelConnection[];
   selection: ModelSelection | null;
+  selectionIssue?: ModelIssue;
+  routes: ModelRoutes;
+  backups: ModelSelection[];
+  light: ModelSelection | null;
+  unpricedPreparationModel?: string;
 }
 
 export interface ModelWorkspace {
@@ -109,6 +270,7 @@ export const modelProviderNames = {
   anthropic: 'Anthropic',
   google: 'Google Gemini',
   openrouter: 'OpenRouter',
+  hostinger: 'Hostinger AI Router',
   elevenlabs: 'ElevenLabs',
   'amazon-bedrock': 'Amazon Bedrock',
   'google-vertex': 'Google Vertex AI',
@@ -179,6 +341,12 @@ export const modelProviderInfo: Record<
   openrouter: {
     keyUrl: 'openrouter.ai/settings/keys',
     env: 'OPENROUTER_API_KEY',
+    catalog: 'account',
+    common: true,
+  },
+  hostinger: {
+    keyUrl: 'hpanel.hostinger.com/ai-router',
+    env: 'HOSTINGER_AI_ROUTER_API_KEY',
     catalog: 'account',
     common: true,
   },

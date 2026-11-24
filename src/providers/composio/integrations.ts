@@ -1,3 +1,5 @@
+import { setTimeout as delay } from 'node:timers/promises';
+import { APIError } from '@composio/client';
 import type { Composio, ToolRouterSession } from '@composio/core';
 import { z } from 'zod';
 import { composioActivity } from './activity.ts';
@@ -7,10 +9,15 @@ import type { createComposioProxy } from './proxy.ts';
 import { readInboxSnippets, readInboxThreads, readSentEmails } from './sent-email.ts';
 import { readVerificationEmails } from './verification-email.ts';
 import {
+  connectionCode,
+  connectionReason,
   IntegrationCatalogAccessDenied,
+  IntegrationCatalogFailure,
   IntegrationConnectionError,
   IntegrationInboxCursorExpired,
+  IntegrationInboxTransientError,
   IntegrationPermissionError,
+  integrationCatalogProxyErrorCodes,
   type IntegrationProvider,
   type IntegrationSession,
 } from '../../ports/integrations.ts';
@@ -190,46 +197,51 @@ function identityFields(
   };
 }
 
+function proxyRequestFailure(
+  error: unknown,
+  signal?: AbortSignal,
+):
+  | {
+      reason: IntegrationConnectionError['reason'];
+      status?: number;
+      code?: unknown;
+    }
+  | undefined {
+  const refused =
+    error instanceof IntegrationConnectionError
+      ? error
+      : error instanceof Error && error.cause instanceof IntegrationConnectionError
+        ? error.cause
+        : undefined;
+  if (refused) return { reason: refused.reason, status: refused.status, code: refused.code };
+  const status = error && typeof error === 'object' && 'status' in error ? error.status : undefined;
+  const kind = error instanceof Error ? error.constructor.name : '';
+  const reason = connectionReason(
+    status,
+    kind === 'APIConnectionTimeoutError' ||
+      (signal?.aborted === true && signal.reason?.name === 'TimeoutError'),
+    kind === 'APIConnectionError',
+  );
+  if (!reason) return;
+  const body = error && typeof error === 'object' && 'error' in error ? error.error : undefined;
+  const code = body && typeof body === 'object' && 'error' in body ? body.error : undefined;
+  return {
+    reason,
+    status: typeof status === 'number' ? status : undefined,
+    code,
+  };
+}
+
 function connectionFailure(phase: IntegrationConnectionError['phase'], signal?: AbortSignal) {
   return (error: unknown): never => {
-    const status =
-      error && typeof error === 'object' && 'status' in error ? error.status : undefined;
-    const kind = error instanceof Error ? error.constructor.name : '';
-    const reason =
-      status === 401
-        ? 'authorization'
-        : status === 403
-          ? 'permission'
-          : status === 429
-            ? 'rate_limit'
-            : status === 408 ||
-                status === 504 ||
-                kind === 'APIConnectionTimeoutError' ||
-                (signal?.aborted && signal.reason?.name === 'TimeoutError')
-              ? 'timeout'
-              : (typeof status === 'number' && status >= 500 && status <= 599) ||
-                  kind === 'APIConnectionError'
-                ? 'unavailable'
-                : typeof status === 'number' && status >= 400 && status <= 499
-                  ? 'invalid_request'
-                  : undefined;
-    if (reason) {
-      const body = (error as { error?: { error?: unknown } }).error;
-      const code = z
-        .enum([
-          'installation_busy',
-          'public_budget_exceeded',
-          'service_unavailable',
-          'security_service_unavailable',
-        ])
-        .safeParse(body?.error);
+    const failure = proxyRequestFailure(error, signal);
+    if (failure)
       throw new IntegrationConnectionError(
-        reason,
+        failure.reason,
         phase,
-        typeof status === 'number' ? status : undefined,
-        code.success ? code.data : undefined,
+        failure.status,
+        connectionCode(failure.code),
       );
-    }
     throw error;
   };
 }
@@ -237,6 +249,7 @@ function connectionFailure(phase: IntegrationConnectionError['phase'], signal?: 
 export function createComposioProvider(options: {
   proxy: ReturnType<typeof createComposioProxy>;
   fileDownload?: Parameters<typeof createComposioFiles>[0];
+  inboxRetryDelay?: (attempt: number) => number;
 }): IntegrationProvider {
   const files = createComposioFiles(options.fileDownload);
   const identities = new Map<string, AccountIdentity>();
@@ -269,8 +282,8 @@ export function createComposioProvider(options: {
   async function listServices(): Promise<IntegrationServiceInfo[]> {
     if (catalog && catalog.expiresAt > Date.now()) return catalog.services;
     if (catalogRequest) return catalogRequest;
+    const operation = AbortSignal.timeout(10_000);
     const pending = (async () => {
-      const operation = AbortSignal.timeout(10_000);
       const services = new Map(builtInServices().map((service) => [service.slug, service]));
       const cursors = new Set<string>();
       let cursor: string | undefined;
@@ -339,10 +352,27 @@ export function createComposioProvider(options: {
       return result;
     })().catch((error: unknown) => {
       catalogRetryAfter = Date.now() + 30_000;
-      if (error instanceof IntegrationConnectionError) throw error;
-      const status =
-        error && typeof error === 'object' && 'status' in error ? error.status : undefined;
-      if (status === 403) throw new IntegrationCatalogAccessDenied();
+      if (error instanceof IntegrationConnectionError || error instanceof IntegrationCatalogFailure)
+        throw error;
+      const failure = proxyRequestFailure(error, operation);
+      if (failure?.reason === 'permission') {
+        const code = z
+          .enum([
+            'installation_enrollment_required',
+            'installation_revoked',
+            'browser_pairing_required',
+          ])
+          .safeParse(failure.code);
+        throw new IntegrationCatalogAccessDenied(code.success ? code.data : undefined);
+      }
+      if (failure) {
+        const code = z.enum(integrationCatalogProxyErrorCodes).safeParse(failure.code);
+        throw new IntegrationCatalogFailure(
+          failure.reason,
+          failure.status,
+          code.success ? code.data : undefined,
+        );
+      }
       throw new Error('The app catalog could not be loaded. Try again later.');
     });
     catalogRequest = pending;
@@ -588,6 +618,41 @@ export function createComposioProvider(options: {
           );
         }
       },
+      async offers(action, signal) {
+        actionToolkit(action);
+        const response = await client
+          .getClient()
+          .toolRouter.session.executeMeta(
+            value.sessionId,
+            {
+              slug: 'COMPOSIO_GET_TOOL_SCHEMAS',
+              arguments: { tool_slugs: [action], include: ['input_schema'] },
+            },
+            { signal, maxRetries: 0 },
+          )
+          .catch((error: unknown) => {
+            if (
+              error instanceof APIError &&
+              error.status === 404 &&
+              (error.error as { error?: unknown } | undefined)?.error === 'not_found'
+            )
+              return undefined;
+            throw error;
+          });
+        signal?.throwIfAborted();
+        if (!response) return false;
+        const missing = z.object({ not_found: z.array(z.string()).optional() });
+        const answer = z
+          .object({ data: missing.extend({ data: missing.optional() }) })
+          .safeParse(response);
+        return !(
+          answer.success &&
+          [
+            ...(answer.data.data.not_found ?? []),
+            ...(answer.data.data.data?.not_found ?? []),
+          ].includes(action)
+        );
+      },
       async execute(action, args, accountId, signal) {
         signal?.throwIfAborted();
         const toolkit = actionToolkit(action);
@@ -596,7 +661,33 @@ export function createComposioProvider(options: {
             signal,
             maxRetries: 0,
           } as Parameters<typeof value.execute>[3])
-          .catch((error: unknown) => {
+          .catch((wrapped: unknown) => {
+            const error =
+              !signal?.aborted && wrapped instanceof Error && wrapped.cause instanceof APIError
+                ? wrapped.cause
+                : wrapped;
+            if (
+              error instanceof APIError &&
+              error.status === 403 &&
+              error.headers?.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase() ===
+                'text/html'
+            ) {
+              const ray = error.headers?.get('cf-ray');
+              const rayId = ray && /^[0-9a-f]{16}-[A-Z]{3}$/i.test(ray) ? ray : undefined;
+              throw Object.assign(
+                new Error(
+                  `The app request received HTTP 403 at ${new Date().toISOString()}${rayId ? ` (Cloudflare Ray ID 0x${rayId})` : ''}.`,
+                ),
+                { status: 403 },
+              );
+            }
+            if (error instanceof APIError && error.status === 404)
+              throw Object.assign(
+                new Error(
+                  `The connection service answered ${action} with HTTP ${error.message}. If this action name did not come from SEARCH_TOOLS, find the exact name there before calling it again.`,
+                ),
+                { status: 404 },
+              );
             const kind = error instanceof Error ? error.constructor.name : '';
             const reason =
               kind === 'APIConnectionTimeoutError'
@@ -634,6 +725,7 @@ export function createComposioProvider(options: {
   return {
     id: 'composio',
     ownsConnectionUrl: (url) => options.proxy.ownsConnectionUrl(url),
+    connectionBackoff: () => options.proxy.backoff(),
     configured: true,
     get configurationId() {
       return options.proxy.configurationId;
@@ -673,34 +765,103 @@ export function createComposioProvider(options: {
         pending: z.array(id).max(1000).default([]),
         finalHistoryId: historyId.optional(),
       });
-      async function get(path: string, parameters: Array<[string, string | number]>) {
-        operation.throwIfAborted();
-        phase = path === 'profile' ? 'baseline' : path === 'history' ? 'history' : 'message';
-        category = 'request';
-        status = undefined;
-        const response = await client.tools.proxyExecute(
-          {
-            connectedAccountId: accountId,
-            endpoint: `https://gmail.googleapis.com/gmail/v1/users/me/${path}`,
-            method: 'GET',
-            parameters: parameters.map(([name, value]) => ({ in: 'query', name, value })),
-          },
-          { signal: operation },
-        );
-        operation.throwIfAborted();
-        status = response.status;
-        if (response.status === 404 && path.startsWith('messages/')) return null;
-        if (response.status === 404 && path === 'history')
-          throw new IntegrationInboxCursorExpired();
-        category = 'http';
-        if (response.status !== 200) throw new Error();
-        category = 'response_size';
-        if (JSON.stringify(response.data).length > 1_000_000) {
-          if (path === 'history') throw new IntegrationInboxCursorExpired();
-          throw new Error();
+      let retriesRemaining = 2;
+      const retryableStatus = (value: unknown): value is number =>
+        typeof value === 'number' &&
+        Number.isInteger(value) &&
+        (value === 408 || value === 429 || (value >= 500 && value <= 599));
+      function proxyCode(value: unknown) {
+        if (!value || typeof value !== 'object') return undefined;
+        const detail = (value as Record<string, unknown>).error;
+        const candidate =
+          typeof detail === 'string'
+            ? detail
+            : detail && typeof detail === 'object'
+              ? ((detail as Record<string, unknown>).code ??
+                (detail as Record<string, unknown>).error)
+              : undefined;
+        const code = z
+          .enum([
+            'installation_busy',
+            'public_budget_exceeded',
+            'rate_limited',
+            'service_unavailable',
+            'security_service_unavailable',
+          ])
+          .safeParse(candidate);
+        return code.success ? code.data : undefined;
+      }
+      function transientFailure(error: unknown) {
+        let current = error;
+        for (let depth = 0; depth < 3 && current && typeof current === 'object'; depth++) {
+          const detail = current as Record<string, unknown>;
+          const code = proxyCode(detail.error);
+          if (retryableStatus(detail.status))
+            return new IntegrationInboxTransientError(detail.status, code);
+          if (current instanceof Error) {
+            const kind = current.constructor.name;
+            if (kind === 'APIConnectionError' || kind === 'APIConnectionTimeoutError')
+              return new IntegrationInboxTransientError(undefined, code);
+          }
+          current = detail.cause;
         }
-        category = 'response';
-        return response.data;
+      }
+      async function get(path: string, parameters: Array<[string, string | number]>) {
+        for (;;) {
+          operation.throwIfAborted();
+          phase = path === 'profile' ? 'baseline' : path === 'history' ? 'history' : 'message';
+          category = 'request';
+          status = undefined;
+          try {
+            const response = await client.tools.proxyExecute(
+              {
+                connectedAccountId: accountId,
+                endpoint: `https://gmail.googleapis.com/gmail/v1/users/me/${path}`,
+                method: 'GET',
+                parameters: parameters.map(([name, value]) => ({ in: 'query', name, value })),
+              },
+              { signal: operation },
+            );
+            operation.throwIfAborted();
+            status = response.status;
+            if (response.status === 404 && path.startsWith('messages/')) return null;
+            if (response.status === 404 && path === 'history')
+              throw new IntegrationInboxCursorExpired();
+            category = 'http';
+            if (response.status !== 200) {
+              if (retryableStatus(response.status))
+                throw new IntegrationInboxTransientError(response.status, proxyCode(response.data));
+              throw new Error();
+            }
+            category = 'response_size';
+            if (JSON.stringify(response.data).length > 1_000_000) {
+              if (path === 'history') throw new IntegrationInboxCursorExpired();
+              throw new Error();
+            }
+            category = 'response';
+            return response.data;
+          } catch (error) {
+            if (operation.aborted) throw error;
+            const transient =
+              error instanceof IntegrationInboxTransientError ? error : transientFailure(error);
+            if (!transient) throw error;
+            if (
+              !retriesRemaining ||
+              (transient.code &&
+                (transient.code === 'public_budget_exceeded' ||
+                  !(error instanceof IntegrationInboxTransientError)))
+            )
+              throw transient;
+            const attempt = 2 - retriesRemaining;
+            retriesRemaining--;
+            await delay(
+              options.inboxRetryDelay?.(attempt) ??
+                350 * 2 ** attempt + Math.floor(Math.random() * 150),
+              undefined,
+              { signal: operation },
+            );
+          }
+        }
       }
       try {
         if (cursor === null) {
@@ -754,6 +915,7 @@ export function createComposioProvider(options: {
         }
         const messages = [];
         let consumed = 0;
+        let retryAfterMs: number | undefined;
         for (const pendingId of state.pending.slice(0, 20)) {
           let response;
           try {
@@ -762,7 +924,27 @@ export function createComposioProvider(options: {
               ['fields', 'id,threadId,internalDate,labelIds,payload/headers'],
             ]);
           } catch (error) {
-            if (!signal.aborted && deadline.aborted && consumed) break;
+            if (!signal.aborted && consumed) {
+              if (deadline.aborted) {
+                retryAfterMs = 60_000;
+                break;
+              }
+              if (error instanceof IntegrationInboxTransientError) {
+                retryAfterMs = error.retryAfterMs;
+                console.warn(
+                  JSON.stringify({
+                    event: 'gmail_inbox_poll_deferred',
+                    timestamp: new Date().toISOString(),
+                    phase,
+                    category,
+                    ...(error.status === undefined ? {} : { status: error.status }),
+                    ...(error.code ? { code: error.code } : {}),
+                    consumed,
+                  }),
+                );
+                break;
+              }
+            }
             throw error;
           }
           if (response === null) {
@@ -808,6 +990,7 @@ export function createComposioProvider(options: {
         return {
           cursor: JSON.stringify(state),
           hasMore: Boolean(state.pending.length || state.pageToken),
+          ...(retryAfterMs ? { retryAfterMs } : {}),
           messages,
         };
       } catch (error) {
@@ -891,6 +1074,9 @@ export function createComposioProvider(options: {
                     ? 'timeout'
                     : category,
             ...(httpStatus === undefined ? {} : { status: httpStatus }),
+            ...(error instanceof IntegrationInboxTransientError && error.code
+              ? { code: error.code }
+              : {}),
             ...(errorKind ? { errorKind } : {}),
             ...(causeCode ? { causeCode } : {}),
             ...(issue
@@ -911,6 +1097,8 @@ export function createComposioProvider(options: {
           }),
         );
         if (error instanceof IntegrationInboxCursorExpired) throw error;
+        if (error instanceof IntegrationInboxTransientError) throw error;
+        if (deadline.aborted) throw new IntegrationInboxTransientError(httpStatus);
         throw new Error('The Gmail inbox could not be checked.');
       }
     },
@@ -991,7 +1179,7 @@ export function createComposioProvider(options: {
     },
     async deleteAccount(id, ownerId) {
       if (ownerId) userId(ownerId);
-      if (options.proxy.isPendingAccount(id)) return;
+      if (options.proxy.isPendingAccount(id)) return options.proxy.finishPendingAccount(id);
       if (ownerId) await ownedAccount(id, ownerId, AbortSignal.timeout(10_000));
       await client.connectedAccounts.delete(id);
       for (const key of identities.keys()) if (JSON.parse(key)[1] === id) identities.delete(key);

@@ -1,10 +1,11 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { constants, createReadStream } from 'node:fs';
+import { constants, createReadStream, createWriteStream } from 'node:fs';
 import {
   access,
   chmod,
   copyFile,
+  lstat,
   mkdir,
   readdir,
   readFile,
@@ -38,6 +39,54 @@ async function fileHash(path) {
   return hash.digest('hex');
 }
 
+export async function stageGuestImage(source, target, sha256, signal) {
+  signal?.throwIfAborted();
+  const temporary = `${target}.${randomBytes(6).toString('hex')}.tmp`;
+  try {
+    const hash = createHash('sha256');
+    const input = createReadStream(source);
+    input.on('data', (chunk) => hash.update(chunk));
+    await pipeline(input, createWriteStream(temporary, { flags: 'wx', mode: 0o600, flush: true }), {
+      signal,
+    });
+    if (hash.digest('hex') !== sha256)
+      throw new Error('The Nod guest image does not match its manifest.');
+    signal?.throwIfAborted();
+    await rename(temporary, target);
+  } catch (error) {
+    await rm(temporary, { force: true }).catch((cleanupError) => {
+      error.details = [error.details, cleanupError.stack || cleanupError.message]
+        .filter(Boolean)
+        .join('\n');
+    });
+    throw error;
+  }
+}
+
+export async function guestDiskIsEmpty(path, signal) {
+  const before = await lstat(path).catch((error) => {
+    if (error.code !== 'ENOENT') throw error;
+  });
+  if (!before?.isFile()) return false;
+  const zero = Buffer.alloc(1024 * 1024);
+  let bytes = 0;
+  for await (const chunk of createReadStream(path, { signal, highWaterMark: zero.length })) {
+    bytes += chunk.length;
+    if (!chunk.equals(zero.subarray(0, chunk.length))) return false;
+  }
+  signal?.throwIfAborted();
+  const after = await lstat(path);
+  return (
+    after.isFile() &&
+    before.dev === after.dev &&
+    before.ino === after.ino &&
+    before.mtimeMs === after.mtimeMs &&
+    before.ctimeMs === after.ctimeMs &&
+    before.size === after.size &&
+    bytes === after.size
+  );
+}
+
 export async function retainStopExecutable(lima, controlRoot) {
   const hash = await fileHash(lima);
   const target = join(controlRoot, 'limactl-stop');
@@ -54,11 +103,12 @@ export async function retainStopExecutable(lima, controlRoot) {
   }
 }
 
-export function execute(
-  command,
-  args,
-  { env, signal, timeout = 120_000, input, encoding = 'utf8' } = {},
-) {
+function commandText(chunks) {
+  const bytes = Buffer.concat(chunks);
+  return bytes.toString(bytes.includes(0) ? 'utf16le' : 'utf8').replaceAll('\uFEFF', '');
+}
+
+export function execute(command, args, { env, signal, timeout = 120_000, input } = {}) {
   signal?.throwIfAborted();
   return new Promise((resolveRun, reject) => {
     const child = spawn(command, args, {
@@ -67,7 +117,9 @@ export function execute(
       shell: false,
       windowsHide: true,
     });
-    let output = '';
+    const stdout = [];
+    const tails = { stdout: { chunks: [], bytes: 0 }, stderr: { chunks: [], bytes: 0 } };
+    let stdoutBytes = 0;
     let timedOut = false;
     let spawnError;
     let killTimer;
@@ -84,13 +136,24 @@ export function execute(
       timedOut = true;
       stop();
     }, timeout);
-    const collect = (chunk) => {
-      output = (output + chunk).slice(-128 * 1024);
+    const keep = (tail, chunk) => {
+      tail.chunks.push(chunk);
+      tail.bytes += chunk.length;
+      while (tail.bytes - tail.chunks[0].length > 128 * 1024) {
+        const dropped = tail.chunks.shift().length;
+        tail.bytes -= dropped;
+        if (dropped % 2) {
+          tail.chunks[0] = tail.chunks[0].subarray(1);
+          tail.bytes -= 1;
+        }
+      }
     };
-    child.stdout.setEncoding(encoding);
-    child.stderr.setEncoding(encoding);
-    child.stdout.on('data', collect);
-    child.stderr.on('data', collect);
+    child.stdout.on('data', (chunk) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes <= 8 * 1024 * 1024) stdout.push(chunk);
+      keep(tails.stdout, chunk);
+    });
+    child.stderr.on('data', (chunk) => keep(tails.stderr, chunk));
     child.on('error', (error) => {
       spawnError = error;
     });
@@ -107,28 +170,38 @@ export function execute(
       clearTimeout(killTimer);
       signal?.removeEventListener('abort', stop);
       if (signal?.aborted) return reject(new Error('Nod setup was cancelled.'));
-      const failure = (message) =>
-        Object.assign(new Error(message), {
-          details: [spawnError?.stack, output.replaceAll('\0', '').trim()]
-            .filter(Boolean)
-            .join('\n'),
+      const output = [commandText(tails.stdout.chunks), commandText(tails.stderr.chunks)]
+        .map((text) => text.trim())
+        .filter(Boolean)
+        .join('\n');
+      const failure = (message, facts) =>
+        Object.assign(new Error(message), facts, {
+          details: [spawnError?.stack, output].filter(Boolean).join('\n'),
         });
+      if (timedOut)
+        return reject(
+          failure('Nod runtime setup took too long. Please retry.', { name: 'TimeoutError' }),
+        );
       if (spawnError)
         return reject(
-          failure(`Nod could not launch its bundled runtime (${spawnError.code || 'unknown'}).`),
+          failure(`Nod could not launch its bundled runtime (${spawnError.code || 'unknown'}).`, {
+            errno: spawnError.code,
+          }),
         );
-      if (timedOut) return reject(failure('Nod runtime setup took too long. Please retry.'));
       if (code !== 0) {
-        const detail = output.replaceAll('\0', '').replace(/\s+/g, ' ').trim();
+        const detail = output.replace(/\s+/g, ' ');
         return reject(
           failure(
             `Nod runtime command failed (${code})${
               detail ? `: ${detail.length > 300 ? '…' : ''}${detail.slice(-300)}` : '.'
             }`,
+            { exitCode: code },
           ),
         );
       }
-      resolveRun(output.trim());
+      if (stdoutBytes > 8 * 1024 * 1024)
+        return reject(failure('Nod runtime command produced too much output.'));
+      resolveRun(commandText(stdout).trim());
     });
   });
 }
@@ -159,13 +232,14 @@ export async function waitFor(operation, { signal, attempts = 240, interval = 25
   throw failure;
 }
 
-async function prepare(options, onComputerStart) {
+async function prepare(options, onComputerStart, progress = {}) {
   if (process.platform === 'win32' && process.arch === 'x64') {
     const { prepareWindowsRuntime } = await import('./windows.mjs');
     return prepareWindowsRuntime(options, onComputerStart);
   }
   if (!['darwin', 'linux'].includes(process.platform) || !['arm64', 'x64'].includes(process.arch))
     throw new Error('This Nod build requires a Mac or a 64-bit Linux computer.');
+  progress.step = 'check';
   if (process.platform === 'linux')
     await access('/dev/kvm', constants.R_OK | constants.W_OK).catch(() => {
       throw Object.assign(
@@ -179,6 +253,7 @@ async function prepare(options, onComputerStart) {
   const resourcesPath = resolve(options.resourcesPath || options.resources);
   const onStatus = options.onStatus || options.onProgress || (() => {});
   const signal = options.signal;
+  progress.step = 'assets';
   await mkdir(dataRoot, { recursive: true, mode: 0o700 });
   const controlRoot = join(dataRoot, 'desktop-runtime');
   await mkdir(controlRoot, { recursive: true, mode: 0o700 });
@@ -191,6 +266,7 @@ async function prepare(options, onComputerStart) {
   let downloading = runtimeAssets.paths.length > 0;
   let waiting;
   const status = (phase, message, stage = 'computer') => {
+    if (stage !== 'computer') progress.step = stage;
     const value = { phase, message, stage };
     if (downloading) waiting = value;
     else onStatus(value);
@@ -256,11 +332,9 @@ async function prepare(options, onComputerStart) {
       () => false,
     );
     if (orphaned)
-      await execute(lima, ['delete', '--force', 'nod'], {
-        env: hostEnvironment,
-        signal,
-        timeout: 120_000,
-      });
+      throw new Error(
+        'The Nod local computer configuration is missing for an existing private computer.',
+      );
   }
   if (
     saved &&
@@ -269,6 +343,7 @@ async function prepare(options, onComputerStart) {
       !Number.isInteger(saved.port) ||
       saved.port < 1 ||
       saved.port > 65535 ||
+      (saved.initializing !== undefined && typeof saved.initializing !== 'boolean') ||
       !/^[a-f0-9]{64}$/.test(saved.password))
   )
     throw new Error('The Nod local computer configuration needs recovery.');
@@ -279,9 +354,16 @@ async function prepare(options, onComputerStart) {
     password: randomBytes(32).toString('hex'),
   };
   saved.stopExecutableSha256 = await retainStopExecutable(lima, controlRoot);
-  const temporaryState = `${configPath}.${randomBytes(6).toString('hex')}.tmp`;
-  await writeFile(temporaryState, JSON.stringify(saved), { mode: 0o600, flag: 'wx' });
-  await rename(temporaryState, configPath);
+  const saveState = async () => {
+    const temporaryState = `${configPath}.${randomBytes(6).toString('hex')}.tmp`;
+    await writeFile(temporaryState, JSON.stringify(saved), {
+      mode: 0o600,
+      flag: 'wx',
+      flush: true,
+    });
+    await rename(temporaryState, configPath);
+  };
+  await saveState();
   const vm = 'nod';
   const dockerSocket = join(limaHome, vm, 'sock/docker.sock');
   const dockerConfig = join(controlRoot, 'docker-config');
@@ -295,13 +377,54 @@ async function prepare(options, onComputerStart) {
     execute(docker, args, { env: dockerEnvironment, signal, ...extra });
   const runLima = (args, extra = {}) =>
     execute(lima, args, { env: hostEnvironment, signal, ...extra });
+  progress.step = 'check';
   let exists = false;
   try {
     await access(join(limaHome, vm, 'lima.yaml'));
     exists = true;
-  } catch {}
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  if (
+    exists &&
+    process.platform === 'linux' &&
+    saved.initializing === undefined &&
+    (await guestDiskIsEmpty(join(limaHome, vm, 'disk'), signal))
+  ) {
+    status('preparing', 'Checking your private computer…');
+    if ((await runLima(['list', '--format', '{{.Status}}', vm])).trim() !== 'Stopped') {
+      await runLima(['stop', '--tty=false', vm], { timeout: 90_000 });
+      if ((await runLima(['list', '--format', '{{.Status}}', vm])).trim() !== 'Stopped')
+        throw new Error('Nod could not confirm that its empty private computer stopped.');
+    }
+    if (await guestDiskIsEmpty(join(limaHome, vm, 'disk'), signal)) {
+      saved.initializing = true;
+      await saveState();
+    }
+  }
+  if (saved.initializing) {
+    progress.step = 'create';
+    status('preparing', 'Replacing your unfinished private computer…');
+    if (exists) await runLima(['delete', '--force', vm], { timeout: 120_000 });
+    else await rm(join(limaHome, vm), { recursive: true, force: true });
+    exists = false;
+  }
   if (!exists) {
+    if (!saved.initializing) {
+      const entries = await readdir(join(limaHome, vm)).catch((error) => {
+        if (error.code !== 'ENOENT') throw error;
+        return [];
+      });
+      if (entries.length)
+        throw new Error('The Nod private computer has files but no Lima configuration.');
+      await rmdir(join(limaHome, vm)).catch((error) => {
+        if (error.code !== 'ENOENT') throw error;
+      });
+    }
+    progress.step = 'create';
     status('preparing', 'Preparing your private computer…');
+    saved.initializing = true;
+    await saveState();
     const config = guestConfiguration({
       assets,
       imageDigest: manifest.guest.sha256,
@@ -329,6 +452,7 @@ async function prepare(options, onComputerStart) {
     if (config.mounts[0].location !== assets) {
       const currentStatus = await runLima(['list', '--format', '{{.Status}}', vm]);
       if (currentStatus.trim() !== 'Stopped') {
+        progress.step = 'update';
         status('preparing', 'Stopping your local computer for the update…');
         await runLima(['stop', '--tty=false', vm], { timeout: 90_000 });
         signal?.throwIfAborted();
@@ -357,6 +481,30 @@ async function prepare(options, onComputerStart) {
       await rename(temporary, vmConfigPath);
     }
   }
+  if (process.platform === 'linux') {
+    let hasDisk = false;
+    for (const name of ['disk', 'diffdisk']) {
+      try {
+        await lstat(join(limaHome, vm, name));
+        hasDisk = true;
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+    }
+    if (!hasDisk) {
+      if (!saved.initializing) {
+        saved.initializing = true;
+        await saveState();
+      }
+      await stageGuestImage(
+        join(assets, manifest.guest.file),
+        join(limaHome, vm, 'image'),
+        manifest.guest.sha256,
+        signal,
+      );
+    }
+  }
+  progress.step = 'start';
   status('starting', 'Starting your private computer…');
   onComputerStart();
   await runLima(['start', '--tty=false', vm], { timeout: 600_000 });
@@ -368,6 +516,11 @@ async function prepare(options, onComputerStart) {
       new Error('Nod could not apply its container protection. Keep your app data and retry.'),
       { code: 'NOD_COMPUTER_PROTECTION_FAILED', details: error.details || error.stack },
     );
+  }
+  if (saved.initializing !== false) {
+    signal?.throwIfAborted();
+    saved.initializing = false;
+    await saveState();
   }
   if (!options.preserveRuntimeCache) await removeUnmountedRuntimes(assets).catch(() => {});
   await waitFor(() => runDocker(['info', '--format', '{{.ServerVersion}}']), { signal });
@@ -904,6 +1057,7 @@ export function prepareRuntime(options) {
   const key = resolve(options.dataRoot || options.root);
   if (!preparing.has(key)) {
     let computerMayBeRunning = false;
+    const progress = {};
     preparing.set(
       key,
       prepare(
@@ -921,8 +1075,10 @@ export function prepareRuntime(options) {
         () => {
           computerMayBeRunning = true;
         },
+        progress,
       )
         .catch(async (error) => {
+          if (error && typeof error === 'object') error.step ??= progress.step;
           if (computerMayBeRunning && !storageReady.has(key)) {
             try {
               await stopRuntime(options);
@@ -933,6 +1089,7 @@ export function prepareRuntime(options) {
                 }),
                 {
                   code: cleanupError.code,
+                  step: error.step,
                   details: [
                     error.stack || error.message,
                     error.details,

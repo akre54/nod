@@ -42,11 +42,14 @@ export const analyticsTool = z.enum([
   'ask_user',
   'browser',
   'browser_session',
+  'computer',
   'create_audio',
   'delegate',
   'files',
+  'flights',
   'manage_apps',
-  'manage_personal_context',
+  'memory',
+  'nod',
   'pay',
   'react_to_message',
   'send_message',
@@ -59,6 +62,14 @@ export const analyticsTool = z.enum([
   'other',
 ]);
 export const analyticsModelProvider = z.enum([...modelProviders, 'typesafe', 'other']);
+export const analyticsMemoryOperation = z.enum([
+  'reflect',
+  'remember',
+  'recall',
+  'style',
+  'skill',
+  'brief',
+]);
 const analyticsModel = z.string().regex(/^[a-z0-9][a-z0-9._:/-]{0,119}$/);
 const modelConnectionProperties = z.object({
   provider: z.enum(modelProviders),
@@ -263,6 +274,7 @@ export const analyticsEvent = z.discriminatedUnion('event', [
             'quiet_start',
             'quiet_end',
             'proactivity_paused',
+            'local_files_access',
             'memory_enabled',
             'memory_sensitive',
             'monthly_spending_limit',
@@ -270,6 +282,10 @@ export const analyticsEvent = z.discriminatedUnion('event', [
             'preparation_spending_limit',
             'model_selection',
             'model_effort',
+            'model_route_schedule',
+            'model_route_background',
+            'schedule_model',
+            'task_model',
           ]),
           actor: z.enum(['owner', 'agent', 'system']),
           state: z
@@ -381,6 +397,12 @@ export const analyticsEvent = z.discriminatedUnion('event', [
     .strict(),
   z
     .object({
+      event: z.literal('runtime_active'),
+      properties: z.object({ started_today: z.boolean() }).strict(),
+    })
+    .strict(),
+  z
+    .object({
       event: z.literal('vault_imported'),
       properties: z
         .object({
@@ -446,6 +468,7 @@ export const analyticsEvent = z.discriminatedUnion('event', [
           provider: analyticsModelProvider,
           model: analyticsModel.optional(),
           purpose: z.enum(['agent', 'memory', 'review', 'tasks', 'task_classification']),
+          memory_operation: analyticsMemoryOperation.optional(),
           request_kind: z
             .enum([
               'chat',
@@ -471,7 +494,14 @@ export const analyticsEvent = z.discriminatedUnion('event', [
           pricing: z.enum(['api', 'plan_estimate', 'unavailable']),
           duration_ms: duration.optional(),
         })
-        .strict(),
+        .strict()
+        .refine(
+          ({ purpose, memory_operation }) => memory_operation === undefined || purpose === 'memory',
+          {
+            message: 'Memory operations require a memory request.',
+            path: ['memory_operation'],
+          },
+        ),
     })
     .strict(),
   z

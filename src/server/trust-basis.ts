@@ -1,16 +1,27 @@
 import type { TrustBecause } from '../shared/trust.ts';
 import type { DecisionQuestion } from '../ports/decisions.ts';
+import type { OwnerInput } from './owner-instructions.ts';
 
 export type TrustBasis =
   | { kind: 'read' }
   | { kind: 'message'; messageId: string; quote: string }
-  | { kind: 'schedule' | 'standing' | 'rule'; quote: string }
+  | { kind: 'schedule' | 'standing' | 'rule'; quote: string; messageId?: string }
+  | { kind: 'scheduleApproval'; approvalId: string }
   | { kind: 'approved' };
 
 export interface TrustWords {
-  userMessages?: Array<{ at: string; text: string; canAuthorize?: boolean }>;
+  userMessages?: Array<{
+    id?: string;
+    at: string;
+    text: string;
+    canAuthorize?: boolean;
+    replyTo?: string;
+  }>;
   assistantMessageBeforeLatestUserMessage?: string;
-  scheduledTaskInstruction?: string;
+  scheduledInstructions?: ReadonlyArray<
+    Omit<OwnerInput, 'id' | 'replyTo'> & { id?: string | null; replyTo?: { text: string } }
+  >;
+  scheduledApproval?: { id?: string; at?: string; definition: Record<string, unknown> };
   scheduledFor?: string;
   timeZone?: string;
   standingInstruction?: string;
@@ -22,7 +33,10 @@ export function trustDecision(words: TrustWords) {
   words.userMessages?.forEach(({ text, canAuthorize }, index) => {
     if (canAuthorize !== false) sources.set(`message:${index}`, text);
   });
-  if (words.scheduledTaskInstruction) sources.set('schedule', words.scheduledTaskInstruction);
+  words.scheduledInstructions?.forEach(({ text, canAuthorize }, index) => {
+    if (canAuthorize !== false && text) sources.set(`schedule:${index}`, text);
+  });
+  if (words.scheduledApproval) sources.set('scheduleApproval', 'schedule approval');
   if (words.standingInstruction) sources.set('standing', words.standingInstruction);
   if (words.userRules) sources.set('rules', words.userRules);
   const question: DecisionQuestion = {
@@ -52,7 +66,7 @@ export function trustDecision(words: TrustWords) {
         value,
         description: value.startsWith('message:')
           ? `The applicable owner words are in userMessages[${value.slice(8)}].text.`
-          : `The applicable owner words are in ${value === 'schedule' ? 'scheduledTaskInstruction' : value === 'standing' ? 'standingInstruction' : 'userRules'}.`,
+          : `The applicable owner words are in ${value.startsWith('schedule:') ? `scheduledInstructions[${value.slice(9)}].text` : value === 'scheduleApproval' ? 'scheduledApproval' : value === 'standing' ? 'standingInstruction' : 'userRules'}.`,
       })),
     ],
   };
@@ -66,106 +80,114 @@ export function trustDecision(words: TrustWords) {
       if (value === 'read') return { run: true, because: 'read', ...details };
       if (value === 'rule' && words.userRules) return { run: false, rule: true, ...details };
       const quote = typeof value === 'string' ? sources.get(value) : undefined;
-      return quote ? { run: true, because: quote, source: value, ...details } : undefined;
+      return quote
+        ? { run: true, because: quote, source: value, terms: [], ...details }
+        : undefined;
     },
   };
 }
 
-const plain = (text: string) =>
-  text
-    .normalize('NFKC')
-    .toLowerCase()
-    .replace(/[“”«»„]/g, '"')
-    .replace(/[‘’‚]/g, "'")
-    .replace(/\s+/g, ' ')
-    .trim();
+const ownSettings = new Set([
+  'NOD_schedule_create',
+  'NOD_schedule_update',
+  'NOD_schedule_pause',
+  'NOD_schedule_cancel',
+  'NOD_limits_update',
+  'NOD_bug_report_send',
+  'NOD_notification_preferences_update',
+  'NOD_memory_forget',
+  'NOD_memory_control',
+  'NOD_model_select',
+]);
 
 export function trustBasis(
   answer: unknown,
   words: TrustWords & { action?: { name: string; arguments?: Record<string, unknown> } },
-  messageIds: readonly string[],
 ): TrustBasis | undefined {
   if (!answer || typeof answer !== 'object') return undefined;
-  const { run, because, terms, source } = answer as {
+  const { run, because, source, terms } = answer as {
     run?: unknown;
     because?: unknown;
-    terms?: unknown;
     source?: unknown;
+    terms?: unknown;
   };
   if (
     terms !== undefined &&
     (!Array.isArray(terms) ||
-      terms.some((term) => !term || typeof term !== 'object' || term.same !== true))
+      terms.some(
+        (term) =>
+          !term ||
+          typeof term !== 'object' ||
+          term.same !== true ||
+          typeof term.user !== 'string' ||
+          !term.user.trim() ||
+          typeof term.action !== 'string' ||
+          !term.action.trim(),
+      ))
   )
     return undefined;
-  if (run !== true || typeof because !== 'string') return undefined;
-  const action = words.action;
-  const settings = [
-    'NOD_schedule_create',
-    'NOD_schedule_update',
-    'NOD_schedule_pause',
-    'NOD_schedule_cancel',
-    'NOD_limits_update',
-    'NOD_notification_preferences_update',
-    'NOD_memory_forget',
-    'NOD_memory_control',
-    'NOD_model_select',
-  ].includes(action?.name ?? '');
-  const command = action?.arguments?.command;
-  const requiresQuote =
-    settings ||
-    [
-      'NOD_sign_in',
-      'NOD_browser_session',
-      'NOD_vault_allow',
-      'LOCAL_FILES_READ',
-      'LOCAL_FILES_IMPORT',
-    ].includes(action?.name ?? '') ||
-    (action?.name === 'NOD_browser' &&
-      (action.arguments?.step === 'upload' ||
+  const cited =
+    typeof source === 'string'
+      ? source
+      : because === 'read'
+        ? 'read'
+        : because === 'schedule approval'
+          ? 'scheduleApproval'
+          : undefined;
+  if (
+    run !== true ||
+    !cited ||
+    (cited !== 'read' && cited !== 'scheduleApproval' && !Array.isArray(terms))
+  )
+    return undefined;
+  const name = words.action?.name ?? '';
+  const args = words.action?.arguments ?? {};
+  const command = args.command;
+  const opens =
+    opensContent(name) ||
+    ['NOD_sign_in', 'NOD_browser_session', 'NOD_vault_allow'].includes(name) ||
+    (name === 'NOD_browser' &&
+      (args.step === 'upload' ||
         (command &&
           typeof command === 'object' &&
           'action' in command &&
           command.action === 'upload')));
-  if (because === 'read') return requiresQuote ? undefined : { kind: 'read' };
-  const quote = because
-    .trim()
-    .replace(/^["'“”«»„‘’‚]+|["'“”«»„‘’‚.!?…]+$/gu, '')
-    .trim();
-  const needle = plain(quote);
-  if (!needle) return undefined;
-  const said = (text: string | undefined) => text !== undefined && plain(text).includes(needle);
-  const kept = quote.slice(0, 300);
-  if (source !== undefined) {
-    const match = typeof source === 'string' && /^message:(0|[1-9]\d*)$/.exec(source);
-    if (match) {
-      const index = Number(match[1]);
-      return messageIds[index] &&
-        words.userMessages?.[index]?.canAuthorize !== false &&
-        said(words.userMessages?.[index]?.text)
-        ? { kind: 'message', messageId: messageIds[index], quote: kept }
-        : undefined;
-    }
-    if (source === 'schedule' && said(words.scheduledTaskInstruction))
-      return { kind: 'schedule', quote: kept };
-    if (!settings && source === 'standing' && said(words.standingInstruction))
-      return { kind: 'standing', quote: kept };
-    if (!settings && source === 'rules' && said(words.userRules))
-      return { kind: 'rule', quote: kept };
-    return undefined;
-  }
-  const index =
-    words.userMessages?.findIndex(
-      (message) => message.canAuthorize !== false && said(message.text),
-    ) ?? -1;
-  if (index >= 0)
-    return messageIds[index]
-      ? { kind: 'message', messageId: messageIds[index], quote: kept }
+  const settings = ownSettings.has(name);
+  const quote = (text: string) => text.slice(0, 300);
+  if (cited === 'read') return opens || settings ? undefined : { kind: 'read' };
+  if (cited === 'scheduleApproval')
+    return !settings && words.scheduledApproval?.id
+      ? { kind: 'scheduleApproval', approvalId: words.scheduledApproval.id }
       : undefined;
-  if (said(words.scheduledTaskInstruction)) return { kind: 'schedule', quote: kept };
-  if (said(words.standingInstruction))
-    return settings ? undefined : { kind: 'standing', quote: kept };
-  if (said(words.userRules)) return settings ? undefined : { kind: 'rule', quote: kept };
+  const message = /^message:(0|[1-9]\d*)$/.exec(cited);
+  if (message) {
+    const entry = words.userMessages?.[Number(message[1])];
+    return entry?.id && entry.canAuthorize !== false && entry.text.trim()
+      ? { kind: 'message', messageId: entry.id, quote: quote(entry.text) }
+      : undefined;
+  }
+  const scheduled = /^schedule:(0|[1-9]\d*)$/.exec(cited);
+  if (scheduled) {
+    const entry = words.scheduledInstructions?.[Number(scheduled[1])];
+    return entry && entry.canAuthorize !== false && entry.text.trim()
+      ? { kind: 'schedule', quote: quote(entry.text), ...(entry.id ? { messageId: entry.id } : {}) }
+      : undefined;
+  }
+  if (cited === 'standing')
+    return !settings && words.standingInstruction
+      ? { kind: 'standing', quote: quote(words.standingInstruction) }
+      : undefined;
+  if (cited === 'rules')
+    return words.userRules &&
+      name !== 'NOD_bug_report_send' &&
+      !(
+        name === 'NOD_notification_preferences_update' &&
+        ['rules', 'currentRules', 'notificationRule', 'currentNotificationRule'].some(
+          (key) => key in args,
+        )
+      )
+      ? { kind: 'rule', quote: quote(words.userRules) }
+      : undefined;
   return undefined;
 }
 
@@ -175,6 +197,12 @@ export function becauseOf(
 ): TrustBecause | undefined {
   if (!basis || basis.kind === 'read') return undefined;
   if (basis.kind === 'approved') return { kind: 'approved' };
-  if (basis.kind === 'message' && !said) return undefined;
+  if (basis.kind === 'scheduleApproval') return { kind: 'scheduleApproval' };
+  if ((basis.kind === 'message' || (basis.kind === 'schedule' && basis.messageId)) && !said)
+    return undefined;
   return { kind: basis.kind, text: basis.quote };
+}
+
+export function opensContent(action: string | undefined) {
+  return ['LOCAL_FILES_READ', 'LOCAL_FILES_IMPORT', 'COMPUTER_OPEN'].includes(action ?? '');
 }

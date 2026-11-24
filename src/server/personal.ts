@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { InstructionChange } from './owner-instructions.ts';
 import type { PoolClient } from 'pg';
 import type { FastifyInstance } from 'fastify';
 import { afterCommit } from './transaction.ts';
@@ -12,12 +13,38 @@ import { withdrawnSql } from './turn-chain.ts';
 import { createSchedules, type ScheduleDependencies } from './schedules.ts';
 import type { MemoryChange } from './analytics.ts';
 import { modelSelectionInput, type createModelService } from './models.ts';
+import { defaultEffort } from '../shared/model-defaults.ts';
+import type { ModelRoute, ModelSelection } from '../shared/models.ts';
+
+type ModelScope = 'chat' | 'schedules' | 'background' | 'schedule' | 'task';
 
 type PersonalDependencies = ScheduleDependencies & {
   memory?: MemoryService;
   learnedSkills?: LearnedSkills;
   models?: ReturnType<typeof createModelService>;
+  localFilesAvailable?: boolean;
+  taskModels?: {
+    list(): Promise<Array<{ id: string; title: string; model: ModelSelection }>>;
+    title(id: string): Promise<string>;
+    set(client: PoolClient | undefined, id: string, model: ModelSelection | null): Promise<boolean>;
+  };
+  modelProjection?(
+    scope: ModelScope,
+    id: string | undefined,
+    model: ModelRoute | null,
+  ): Promise<{ last30Usd: number; withChoiceUsd: number | null } | null>;
 };
+
+const modelScopeInput = z
+  .object({
+    scope: z.enum(['chat', 'schedules', 'background', 'schedule', 'task']).default('chat'),
+    id: z.uuid().optional(),
+    connectionId: z.uuid().optional(),
+    modelId: z.string().min(1).max(200).optional(),
+    effort: modelSelectionInput.shape.effort.optional(),
+    use: z.enum(['light', 'same']).optional(),
+  })
+  .strict();
 
 export function createPersonalService(dependencies: PersonalDependencies) {
   const { pool, ownerId, refresh } = dependencies;
@@ -40,6 +67,39 @@ export function createPersonalService(dependencies: PersonalDependencies) {
     await schedules.initialize(options);
   }
 
+  async function validateModelChoice(args: Record<string, unknown>) {
+    const models = dependencies.models;
+    if (!models) throw new Error('Model settings are unavailable.');
+    const input = modelScopeInput.parse(args);
+    const item = input.scope === 'schedule' || input.scope === 'task';
+    if (item !== Boolean(input.id))
+      throw new Error(
+        item ? 'Name the schedule or task with id.' : 'Only a schedule or task takes an id.',
+      );
+    const named = Boolean(input.connectionId || input.modelId || input.effort);
+    if (named === Boolean(input.use))
+      throw new Error('Choose a model with connectionId and modelId, or use light or same.');
+    if (input.use === 'light' && input.scope !== 'schedules' && input.scope !== 'background')
+      throw new Error('The light model is a choice for schedules or background work.');
+    if (input.use === 'same' && input.scope === 'chat')
+      throw new Error('Choose a model for chat with connectionId and modelId.');
+    if (input.scope === 'schedule') await schedules.get(input.id!);
+    if (input.scope === 'task') await dependencies.taskModels?.title(input.id!);
+    if (input.use)
+      return { scope: input.scope, ...(input.id ? { id: input.id } : {}), use: input.use };
+    const connection = models
+      .view()
+      .connections.find((row) => row.id === input.connectionId && row.status === 'connected');
+    const choice = connection?.models.find((model) => model.id === input.modelId);
+    const effort =
+      input.effort ?? (connection && choice && defaultEffort(connection.provider, choice));
+    if (!connection || !choice || !effort || !choice.efforts.includes(effort))
+      throw new Error('Choose an available model and effort from models_get.');
+    const selection = { connectionId: connection.id, modelId: choice.id, effort };
+    if (input.scope !== 'chat') models.validateChoice(selection);
+    return { scope: input.scope, ...(input.id ? { id: input.id } : {}), ...selection };
+  }
+
   async function validateReview(
     action: string,
     args: Record<string, unknown>,
@@ -51,17 +111,13 @@ export function createPersonalService(dependencies: PersonalDependencies) {
         throw Object.assign(new Error('Choose a detail to update.'), { statusCode: 400 });
       return input;
     }
-    if (action === 'notification_preferences_update') return changed(preferences.validate(args));
-    if (action === 'model_select') {
-      const input = modelSelectionInput.parse(args);
-      const connection = dependencies.models
-        ?.view()
-        .connections.find((item) => item.id === input.connectionId && item.status === 'connected');
-      const model = connection?.models.find((item) => item.id === input.modelId);
-      if (!model?.efforts.includes(input.effort))
-        throw new Error('Choose an available model and effort from models_get.');
+    if (action === 'notification_preferences_update') {
+      const input = changed(preferences.validate(args));
+      if (input.localFilesEnabled !== undefined && !dependencies.localFilesAvailable)
+        throw new Error('Local file access works only in the Nod desktop app.');
       return input;
     }
+    if (action === 'model_select') return validateModelChoice(args);
     if (action === 'schedule_create') return schedules.validateCreate(args);
     if (action === 'schedule_update') {
       const { id: rawId, ...raw } = args;
@@ -116,14 +172,25 @@ export function createPersonalService(dependencies: PersonalDependencies) {
       sourceMessageId: string | null;
       turnId?: string;
       expectedRevision?: number;
+      instructionChange?: InstructionChange;
     },
-    options?: { expectedRules?: string; client?: PoolClient },
+    options?: { expectedRules?: string; expectedNotificationRule?: string; client?: PoolClient },
   ) {
     if (action === 'notification_preferences_get') return preferences.get();
     if (action === 'models_get') {
       if (!dependencies.models) throw new Error('Model settings are unavailable.');
-      const { connections, selection } = dependencies.models.view();
+      const { connections, selection, routes, light } = dependencies.models.view();
       return {
+        routes,
+        light,
+        ownModels: {
+          schedules: (await schedules.list()).flatMap((schedule) =>
+            schedule.model
+              ? [{ id: schedule.id, title: schedule.title, model: schedule.model }]
+              : [],
+          ),
+          tasks: (await dependencies.taskModels?.list()) ?? [],
+        },
         connections: connections.map(
           ({ id, provider, method, label, status, managed, models }) => ({
             id,
@@ -139,28 +206,57 @@ export function createPersonalService(dependencies: PersonalDependencies) {
       };
     }
     if (action === 'model_select') {
-      const input = modelSelectionInput.parse(await validateReview(action, args));
-      await dependencies.models!.select(input, 'agent');
+      const input = (await validateModelChoice(args)) as {
+        scope: ModelScope;
+        id?: string;
+        use?: 'light' | 'same';
+      } & Partial<ModelSelection>;
+      const models = dependencies.models!;
+      const client = options?.client;
+      const model: ModelRoute | null =
+        input.use === 'light'
+          ? 'light'
+          : input.use === 'same'
+            ? null
+            : { connectionId: input.connectionId!, modelId: input.modelId!, effort: input.effort! };
+      if (input.scope === 'chat') await models.select(model as ModelSelection, 'agent', client);
+      if (input.scope === 'schedules' || input.scope === 'background')
+        await models.setRoute(
+          input.scope === 'schedules' ? 'schedule' : 'background',
+          model,
+          'agent',
+          client,
+        );
+      const schedule =
+        input.scope === 'schedule'
+          ? await schedules.setModel(input.id!, model as ModelSelection | null, 'agent', client)
+          : undefined;
+      if (input.scope === 'task')
+        await dependencies.taskModels!.set(client, input.id!, model as ModelSelection | null);
       dependencies.analytics?.({
         event: 'settings_updated',
         properties: { section: 'models', operation: 'update' },
       });
-      afterCommit(options?.client ?? pool, refresh);
-      return { selection: dependencies.models!.view().selection };
+      afterCommit(client ?? pool, refresh);
+      const projection = await dependencies
+        .modelProjection?.(input.scope, input.id, model)
+        .catch(() => null);
+      return {
+        scope: input.scope,
+        ...(input.id ? { id: input.id } : {}),
+        model: model ?? 'same',
+        ...(projection ? { last30Days: projection } : {}),
+        ...(schedule ? { monthlyUsd: schedule.monthlyUsd } : {}),
+      };
     }
     if (action === 'notification_preferences_update') {
-      const result = await preferences.update(
-        args,
-        'agent',
-        options?.expectedRules,
-        options?.client,
-      );
+      const result = await preferences.update(args, 'agent', options);
       afterCommit(options?.client ?? pool, refresh);
       return result;
     }
     if (action === 'schedule_list') return schedules.list();
     if (action === 'schedule_record_observation')
-      return schedules.recordObservation(provenance?.turnId ?? '', args);
+      return schedules.recordObservation(provenance?.turnId ?? '', args, options?.client);
     if (action === 'schedule_create') return schedules.create(args, provenance, options?.client);
     if (action === 'schedule_update') {
       const { id, ...input } = args;
@@ -206,9 +302,11 @@ export function createPersonalService(dependencies: PersonalDependencies) {
        docs AS (
          SELECT m.id,m.role,m.text,m.created_at,to_tsvector('english',m.text) AS v FROM messages m CROSS JOIN terms
          WHERE m.owner_id=$1 AND m.role='user' AND m.approval_answer IS NULL AND ${activeThreadSql('m')} AND m.id IS DISTINCT FROM $4::uuid AND NOT ${withdrawnSql('m')}
+           AND m.created_at>COALESCE((SELECT chat_cleared_at FROM threads WHERE id=m.thread_id AND owner_id=$1),'-infinity')
            AND ($3::timestamptz IS NULL OR m.created_at<$3) AND to_tsvector('english',m.text) @@ terms.q),
        weights AS (
-         SELECT w,ln(1+((SELECT count(*) FROM messages m WHERE m.owner_id=$1 AND ${activeThreadSql('m')})-count(*)+0.5)/(count(*)+0.5)) AS idf
+         SELECT w,ln(1+((SELECT count(*) FROM messages m WHERE m.owner_id=$1 AND ${activeThreadSql('m')}
+           AND m.created_at>COALESCE((SELECT chat_cleared_at FROM threads WHERE id=m.thread_id AND owner_id=$1),'-infinity'))-count(*)+0.5)/(count(*)+0.5)) AS idf
          FROM (SELECT DISTINCT lexeme AS w FROM unnest(tsvector_to_array(to_tsvector('english',$2))) lexeme) words
          JOIN docs ON docs.v @@ quote_literal(w)::tsquery GROUP BY w),
        best AS (
@@ -300,6 +398,7 @@ export function createPersonalService(dependencies: PersonalDependencies) {
     manage,
     recall,
     validateReview,
+    prepareScheduleChange: schedules.prepareChange,
     reviewMemory,
     memoryView,
     registerRoutes,

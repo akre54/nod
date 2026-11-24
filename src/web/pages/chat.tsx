@@ -1,5 +1,13 @@
 import { Tooltip } from '../components/tooltip';
-import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import {
+  Fragment,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type SetStateAction,
+} from 'react';
 import { createPortal, flushSync } from 'react-dom';
 import { ArrowDown, Check, CornerUpLeft, LoaderCircle, Repeat } from '../components/icons';
 import type {
@@ -13,6 +21,7 @@ import type {
 } from '../../shared/contracts';
 import type { SuggestedTask, TaskSuggestions } from '../../shared/onboarding';
 import type { TrustView } from '../../shared/trust';
+import { appPages } from '../../shared/app-links';
 import type { QuestionAnswer } from '../../shared/answer-choices';
 import { integrationMetadata, integrationServices } from '../../shared/integrations';
 import { moreIdeasLine } from '../../shared/sender-apps';
@@ -21,8 +30,7 @@ import { classifyVerificationReply, securityCodeIn } from '../../shared/verifica
 import { ChatTools } from '../components/chat-tools';
 import { ServiceLogo } from '../components/service-logo';
 import { Composer, type ComposerHandle, type ComposerSendResult } from '../components/composer';
-import { TaskCard } from './tasks';
-import { MessageBubble } from '../components/message';
+import { MessageBubble, WorkLabel, type MessageWork } from '../components/message';
 import { conversationFiles } from '../components/attachment-card';
 import { ArtifactWorkspace } from '../components/artifact-drawer';
 import { PrivateEntryWorkspace } from '../components/private-entry';
@@ -30,6 +38,7 @@ import { ChatNotifications } from '../components/chat-notifications';
 import { BrandMark } from '../components/brand';
 import { FeedbackLauncher } from '../components/feedback-discovery';
 import { Button, Notice } from '../components/ui';
+import type { ModelSelection } from '../../shared/models';
 import { desktopSettingsAvailable } from '../lib/desktop';
 import { usePageData } from '../hooks/use-page-data';
 import { api, apiResponse, ApiError, errorMessage, post } from '../lib/api';
@@ -43,7 +52,7 @@ import {
 import { formatDayLabel, isSameDay, useDateFormat } from '../lib/date-format';
 import { NodGlyph, Rise, prefersReducedMotion } from '../components/motion';
 import { LiveLine } from '../components/live-line';
-import { TaskDots } from '../components/task-dots';
+import { TaskChip, TaskLine, TaskStackCard } from '../components/task-stack';
 import { recordingSource } from '../lib/recording';
 import { money } from '../lib/money';
 import type { ImagePreview } from '../components/attachment-images';
@@ -123,28 +132,50 @@ function Working({
   sending = false,
   writing = false,
   quiet = true,
+  routed,
 }: {
   items?: Activity[];
   label?: string;
   sending?: boolean;
   writing?: boolean;
   quiet?: boolean;
+  routed?: MessageWork;
 }) {
-  const found = writing ? undefined : items.find((item) => !item.background && !item.taskId);
+  const found = items.find((item) => !item.background && !item.taskId);
   const chat = found?.doing === 'queued' ? undefined : found;
-  const thinking = Boolean(found) || (sending && !writing);
+  const thinking = !writing && (Boolean(found) || sending);
   const receipt = items.some((item) => !item.background && item.received)
     ? 'Got your message. I’ll read it after this step.'
     : null;
-  if (!thinking && !label && !receipt) return null;
+  if (!thinking && !label && !receipt && routed)
+    return (
+      <div className="thinking">
+        <NodGlyph size={28} mode="thinking" />
+        <div className="working-details">
+          <WorkLabel work={routed} />
+        </div>
+      </div>
+    );
+  if (!thinking && !label && !receipt && !found) return null;
   return (
-    <div className="thinking" role="status">
+    <div className="thinking" hidden={!thinking && !label && !receipt}>
       <NodGlyph size={28} mode="thinking" />
       <div className="working-details">
-        <span className="working-text">
-          {thinking ? <LiveLine item={chat} quiet={quiet} /> : (label ?? receipt)}
-        </span>
-        {thinking && receipt && <span className="working-receipt">{receipt}</span>}
+        <div className="working-text">
+          <div hidden={!thinking}>
+            <LiveLine item={chat} quiet={quiet && thinking} clipped />
+          </div>
+          {!thinking && (
+            <span className="live-line-current" role="status">
+              {label ?? receipt}
+            </span>
+          )}
+        </div>
+        {thinking && receipt && (
+          <span className="working-receipt" role="status">
+            {receipt}
+          </span>
+        )}
       </div>
     </div>
   );
@@ -333,7 +364,7 @@ export function Chat({
           : 'Choose a model to start chatting'}
       </h2>
       <Button variant="outline" asChild>
-        <a href="/settings/models">Open Settings &gt; Models</a>
+        <a href="/settings/models">Open {appPages['/settings/models']}</a>
       </Button>
     </div>
   );
@@ -354,9 +385,15 @@ export function Chat({
       ),
     [connections],
   );
-  const [text, setText] = useState('');
+  const [text, setDraftText] = useState('');
+  function setText(value: SetStateAction<string>) {
+    setDraftText(value);
+    setReplyNotice('');
+  }
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
+  const [recovering, setRecovering] = useState(false);
+  const [recovered, setRecovered] = useState<string>();
   const [connectionNotice, setConnectionNotice] = useState<{
     text: string;
     kind: 'success' | 'error';
@@ -364,7 +401,6 @@ export function Chat({
   const [replyTo, setReplyTo] = useState<ComposerReply | null | undefined>(null);
   const [replyNotice, setReplyNotice] = useState('');
   const [unavailableQuestions, setUnavailableQuestions] = useState<ReadonlySet<string>>(new Set());
-  useEffect(() => setReplyNotice(''), [text, replyTo?.id]);
   const taskReply = useRef<string | null>(null);
   const [focusTarget, setFocusTarget] = useState<{
     id: string;
@@ -557,6 +593,30 @@ export function Chat({
     epoch: number;
     oldest: Pick<Message, 'id' | 'createdAt'> | null;
   }>({ threadId, count: hiddenCount, epoch: 0, oldest: null });
+  const clearedHistory = useRef({ threadId, at: state.chatClearedAt });
+  if (clearedHistory.current.threadId !== threadId)
+    clearedHistory.current = { threadId, at: state.chatClearedAt };
+  else if (clearedHistory.current.at !== state.chatClearedAt) {
+    clearedHistory.current = { threadId, at: state.chatClearedAt };
+    hiddenHistory.current = {
+      threadId,
+      count: hiddenCount,
+      epoch: hiddenHistory.current.epoch + 1,
+      oldest: null,
+    };
+    known.current = { threadId, messages: [] };
+  }
+  useEffect(() => {
+    if (!state.chatClearedAt) return;
+    cancelFocusedMessage();
+    setReplyTo(null);
+    setOptimistic((current) => current.filter((item) => item.threadId !== threadId));
+    const previous = retry.current;
+    if (previous && !previous.replyId) {
+      if (previous.recording) recordingIds.current.delete(recordingSource(previous.recording));
+      retry.current = null;
+    } else if (previous) retry.current = { ...previous, warned: true };
+  }, [threadId, state.chatClearedAt]);
   if (hiddenHistory.current.threadId !== threadId)
     hiddenHistory.current = { threadId, count: hiddenCount, epoch: 0, oldest: null };
   else if (hiddenHistory.current.count !== hiddenCount) {
@@ -695,7 +755,112 @@ export function Chat({
   ];
   const live = state.activity ?? [];
   const working = live.some((item) => !item.background);
-  const chatWork = connected ? live.find((item) => !item.background && !item.taskId) : undefined;
+  const lastMessage = allMessages.at(-1);
+  const beforeLast = allMessages.at(-2);
+  const failureKind = lastMessage?.streamId?.split(':')[0];
+  const modelAdvice = failureKind !== 'offline-failure' || Boolean(state.configuration.modelIssue);
+  const modelFailed =
+    lastMessage?.role === 'assistant' &&
+    lastMessage.id !== recovered &&
+    (failureKind === 'model-failure' || failureKind === 'offline-failure') &&
+    beforeLast?.role === 'user' &&
+    beforeLast.turnId === lastMessage.turnId;
+  const failedRequest =
+    modelFailed &&
+    beforeLast &&
+    !beforeLast.attachments.length &&
+    !beforeLast.replyToMessageId &&
+    !beforeLast.choiceAnswer &&
+    !beforeLast.cardAnswer
+      ? beforeLast.text
+      : undefined;
+  const chatWork = connected
+    ? live.find((item) => !item.background && !item.taskId && !item.runId)
+    : undefined;
+  const lastOwner = allMessages.findLast((message) => message.role === 'user');
+  const routedWork = !chatWork && lastOwner?.work?.kind === 'task' ? lastOwner.work : undefined;
+  const routedItem = routedWork
+    ? live.find(
+        (entry) =>
+          entry.taskId === routedWork.id &&
+          (entry.turnId === routedWork.turnId || entry.turnId === lastOwner!.turnId) &&
+          !allMessages.some(
+            (message) =>
+              message.role === 'assistant' &&
+              message.turnId === entry.turnId &&
+              message.createdAt > lastOwner!.createdAt,
+          ),
+      )
+    : undefined;
+  const workOf = (message: Message): MessageWork | undefined => {
+    const work = message.role === 'assistant' ? message.work : undefined;
+    if (!work) return undefined;
+    const item = live.find((entry) =>
+      work.kind === 'task' ? entry.taskId === work.id : entry.runId === work.id,
+    );
+    const moved = work.kind === 'task' && routedItem?.taskId === work.id;
+    return labelOf(
+      work,
+      message.approval?.state === 'pending' || message.answerChoicesPending
+        ? 'needs_you'
+        : item && !moved
+          ? 'working'
+          : 'idle',
+      moved ? undefined : item,
+    );
+  };
+  const startedTask = (message: Message) =>
+    message.role === 'assistant'
+      ? state.tasks?.find((task) => task.messageId === message.id)
+      : undefined;
+  const approvalTask = (message: Message) =>
+    message.approval && message.work?.kind === 'task'
+      ? state.tasks?.find((task) => task.id === message.work!.id)
+      : undefined;
+  const chipOf = (message: Message) => {
+    const task = startedTask(message);
+    if (!task) return undefined;
+    const answer = allMessages.findLast(
+      (item) => item.role === 'assistant' && item.replyToMessageId === message.id,
+    );
+    return (
+      <TaskChip
+        task={task}
+        running={live.some((item) => item.taskId === task.id)}
+        answerId={answer?.id}
+      />
+    );
+  };
+  const labelOf = (
+    work: NonNullable<Message['work']>,
+    status: MessageWork['status'],
+    item: Activity | undefined,
+  ): MessageWork => {
+    const task =
+      work.kind === 'task' ? state.tasks?.find((entry) => entry.id === work.id) : undefined;
+    return {
+      title: work.title,
+      status,
+      ...(task?.status === 'done' ? { done: true } : {}),
+      live: item,
+      ...(task?.messageId
+        ? {
+            onOpen: () => {
+              const opened = !window.dispatchEvent(
+                new CustomEvent('nod:open-task', { detail: { taskId: task.id }, cancelable: true }),
+              );
+              if (!opened)
+                window.dispatchEvent(
+                  new CustomEvent('nod:focus-message', {
+                    detail: { messageId: task.messageId, taskId: task.id },
+                  }),
+                );
+            },
+          }
+        : {}),
+    };
+  };
+  const routed = routedWork && routedItem ? labelOf(routedWork, 'working', routedItem) : undefined;
   const lastChatWork = useRef<{ threadId: string; item: Activity } | null>(null);
   if (chatWork) lastChatWork.current = { threadId, item: chatWork };
   const finishing = lastChatWork.current?.threadId === threadId ? lastChatWork.current.item : null;
@@ -1051,26 +1216,6 @@ export function Chat({
     return () => window.removeEventListener('nod:focus-message', focusMessage);
   }, []);
   useEffect(() => {
-    const openTask = (event: Event) => {
-      const id = (event as CustomEvent<{ taskId?: unknown }>).detail?.taskId;
-      const element = scroll.current;
-      const card = Array.from(element?.querySelectorAll<HTMLElement>('[data-task-id]') ?? []).find(
-        (item) => item.dataset.taskId === id,
-      );
-      if (!element || !card?.getClientRects().length) return;
-      const view = element.getBoundingClientRect();
-      const box = card.getBoundingClientRect();
-      if (box.top >= view.top && box.bottom <= view.bottom) return;
-      stickToBottom.current = false;
-      card.scrollIntoView({
-        block: 'center',
-        behavior: prefersReducedMotion() ? 'auto' : 'smooth',
-      });
-    };
-    window.addEventListener('nod:open-task', openTask);
-    return () => window.removeEventListener('nod:open-task', openTask);
-  }, []);
-  useEffect(() => {
     if (!visible || !focusTarget || loadingHistory) return;
     if (hiddenIds.has(focusTarget.id)) {
       setFocusTarget(null);
@@ -1112,6 +1257,27 @@ export function Chat({
     setFocusTarget(null);
     setError('Could not find that message in this chat.');
   }, [focusTarget, loadingHistory, historyPage, hasEarlier, historyError, visible]);
+  async function recover(selection?: ModelSelection) {
+    setRecovering(true);
+    try {
+      if (selection)
+        await api('/api/models/selection', {
+          method: 'PUT',
+          body: JSON.stringify({
+            connectionId: selection.connectionId,
+            modelId: selection.modelId,
+            effort: selection.effort,
+          }),
+        });
+      if (failedRequest) await send(failedRequest, [], null);
+      else setRecovered(lastMessage?.id);
+    } catch (error) {
+      setError(errorMessage(error));
+    } finally {
+      setRecovering(false);
+    }
+  }
+
   async function send(
     value: string,
     attachments: Artifact[],
@@ -1129,6 +1295,10 @@ export function Chat({
     approvalAnswer?: { approvalId: string; approved: boolean },
   ): Promise<ComposerSendResult & { error?: string; questionUnavailable?: true }> {
     if (welcoming) return { sent: false, restoreText: true };
+    if (value.trim().toLowerCase() === '/clear' && (attachments.length || recording)) {
+      setError('Send /clear as a text message without attachments or a recording.');
+      return { sent: false, restoreText: true, restoreRecording: true };
+    }
     unreadPositioned.current = currentUnreadVisit.current;
     const replyId = reply?.id;
     questionAnswer ??=
@@ -1143,6 +1313,7 @@ export function Chat({
     const directAnswer = source === 'answer_choice' || source === 'approval_card';
     const captureAnalytics = analyticsForCurrentSession();
     const sentThread = threadId;
+    const sentChatClearedAt = state.chatClearedAt ?? null;
     const activeReply = { retired: false };
     const replyRetired = () => activeReply.retired;
     const verificationRequests = (
@@ -1291,6 +1462,14 @@ export function Chat({
           restoreRecording: !privateVerification,
         };
       }
+      if (!replyId && (clearedHistory.current.at ?? null) !== sentChatClearedAt) {
+        failed = true;
+        retry.current = null;
+        if (recordingKey) recordingIds.current.delete(recordingKey);
+        setOptimistic((current) => current.filter((item) => item.message.id !== id));
+        setError('This message was cancelled when the chat was cleared.');
+        return { sent: false, restoreText: true, restoreRecording: true };
+      }
       if (replyId && (hiddenMessageIds.current.has(replyId) || replyRetired())) {
         failed = true;
         retry.current = previousAttempt
@@ -1344,6 +1523,7 @@ export function Chat({
         submittedBody ??
         JSON.stringify({
           threadId: sentThread,
+          chatClearedAt: sentChatClearedAt,
           clientMessageId: id,
           text: value,
           ...(displayText ? { displayText } : {}),
@@ -2183,32 +2363,26 @@ export function Chat({
                           ...(task.kind
                             ? { kind: task.kind === 'ongoing' ? 'ongoing' : 'immediate' }
                             : {}),
+                          origin: task.origin ?? 'learned',
                           position,
                         });
                         void send(task.title, [], null, 'task_card');
                       }}
                     />
-                  ) : state.tasks?.some((task) => task.messageId === message.id) ? (
-                    state.tasks
-                      ?.filter((task) => task.messageId === message.id)
-                      .map((task) => (
-                        <TaskCard
-                          key={task.id}
-                          task={task}
-                          live={live.find((item) => item.taskId === task.id)}
-                          onReply={() => {
-                            const target =
-                              allMessages.find((item) => item.id === task.questionMessageId) ??
-                              message;
-                            taskReply.current = target.id;
-                            setReplyTo(target);
-                            composer.current?.focus();
-                          }}
-                        />
-                      ))
                   ) : (
                     <MessageBubble
                       message={message}
+                      work={startedTask(message) ? undefined : workOf(message)}
+                      task={chipOf(message)}
+                      onStopTask={
+                        approvalTask(message)
+                          ? async () => {
+                              captureAnalytics('task_action', { action: 'stop' });
+                              await post(`/api/tasks/${approvalTask(message)!.id}/stop`);
+                            }
+                          : undefined
+                      }
+                      taskStopped={approvalTask(message)?.status === 'cancelled'}
                       answersDisabled={sending || !state.configuration.llmReady || welcoming}
                       onAnswer={async (value, answer) => {
                         if (replyTo?.id === message.id && composer.current?.hasDraft()) {
@@ -2316,6 +2490,36 @@ export function Chat({
                   sending={sending}
                   writing={Boolean(streamEntries.length) && finishing?.doing !== 'tool'}
                   quiet={!streamEntries.length}
+                  routed={connected ? routed : undefined}
+                />
+              )}
+              {connected && (
+                <TaskLine
+                  tasks={state.tasks ?? []}
+                  live={live}
+                  card={(task, close, back) => {
+                    const target =
+                      allMessages.find((item) => item.id === task.questionMessageId) ??
+                      allMessages.find((item) => item.id === task.messageId);
+                    return (
+                      <TaskStackCard
+                        key={task.id}
+                        task={task}
+                        live={live.find((item) => item.taskId === task.id)}
+                        onClose={close}
+                        onBack={back}
+                        onReply={
+                          target &&
+                          (() => {
+                            taskReply.current = target.id;
+                            setReplyTo(target);
+                            close();
+                            composer.current?.focus();
+                          })
+                        }
+                      />
+                    );
+                  }}
                 />
               )}
             </div>
@@ -2323,7 +2527,6 @@ export function Chat({
           </div>
         </div>
         <div className="chat-bottom conversation-column">
-          {connected && <TaskDots tasks={state.tasks ?? []} />}
           {(canReturn || away || onReturnToMemory) && (
             <div className="chat-jump-actions">
               {onReturnToMemory && (
@@ -2393,12 +2596,91 @@ export function Chat({
               {replyNotice}
             </Notice>
           )}
+          {state.chatRecovery && (
+            <Notice kind="info">
+              <div className="chat-recovery">
+                <span>This chat needs a restart. Your messages, files and tasks stay.</span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={!connected || sending || Boolean(chatWork) || recovering}
+                  onClick={async () => {
+                    const expectedThread = threadId;
+                    setRecovering(true);
+                    setError('');
+                    try {
+                      await post('/api/conversation/restart-context', {
+                        threadId,
+                        turnId: state.chatRecovery!.turnId,
+                      });
+                      await refresh();
+                      if (threadRef.current === expectedThread) {
+                        setReplyTo(null);
+                        setReplyNotice('Chat restarted. Send your request again.');
+                        composer.current?.focus();
+                      }
+                    } catch (cause) {
+                      if (threadRef.current === expectedThread) setError(errorMessage(cause));
+                    } finally {
+                      setRecovering(false);
+                    }
+                  }}
+                >
+                  {recovering ? 'Restarting…' : 'Restart chat'}
+                </Button>
+              </div>
+            </Notice>
+          )}
           {error && <Notice>{error}</Notice>}
           {connectionNotice && (
             <Notice kind={connectionNotice.kind} onDismiss={() => setConnectionNotice(null)}>
               {connectionNotice.text}
             </Notice>
           )}
+          {state.configuration.llmReady &&
+            state.configuration.modelChecking &&
+            !state.configuration.modelIssue && (
+              <div className="chat-model-check" role="status">
+                <LoaderCircle size={14} className="spin" aria-hidden="true" />
+                Checking your model connection…
+              </div>
+            )}
+          {state.configuration.llmReady &&
+            !state.chatRecovery &&
+            (state.configuration.modelIssue ||
+              (modelFailed &&
+                (failedRequest || (modelAdvice && state.configuration.modelAlternative)))) && (
+              <Notice kind="info">
+                {state.configuration.modelIssue
+                  ? `Your model connection needs attention: ${state.configuration.modelIssue.reason.replace(/(?<![.!?])$/, '.')}`
+                  : 'Your model’s last request failed.'}
+                <span className="notice-actions">
+                  {modelAdvice && state.configuration.modelAlternative && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="secondary"
+                      disabled={recovering || working || sending}
+                      onClick={() => void recover(state.configuration.modelAlternative)}
+                    >
+                      Use {state.configuration.modelAlternative.label}
+                    </Button>
+                  )}
+                  {failedRequest && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      disabled={recovering || working || sending}
+                      onClick={() => void recover()}
+                    >
+                      Try again
+                    </Button>
+                  )}
+                  {modelAdvice && <a href="/settings/models">{appPages['/settings/models']}</a>}
+                </span>
+              </Notice>
+            )}
           {spendingPaused && trust?.limit && (
             <Notice kind="info">
               You reached your {money(trust.limit.monthlyUsd)} monthly spending limit. Raise or
@@ -2406,7 +2688,6 @@ export function Chat({
             </Notice>
           )}
           <div
-            hidden={!state.configuration.llmReady && !working && !sending}
             onInputCapture={() => {
               unreadPositioned.current = currentUnreadVisit.current;
             }}
@@ -2420,7 +2701,11 @@ export function Chat({
               restoreReply={(saved) => {
                 if (!saved || !hiddenMessageIds.current.has(saved.id)) setReplyTo(saved);
               }}
-              ready={state.configuration.llmReady && !welcoming}
+              ready={
+                (state.configuration.llmReady || text.trim().toLowerCase() === '/clear') &&
+                !welcoming &&
+                !recovering
+              }
               busy={connected && working}
               text={text}
               setText={setText}

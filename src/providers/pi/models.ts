@@ -1,10 +1,13 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import {
   getSupportedThinkingLevels,
   getSystemMessageText,
   hasApi,
   createAssistantMessageEventStream,
+  isContextOverflow,
+  isRetryableAssistantError,
   type Api,
   type AssistantMessage,
   type Context,
@@ -15,7 +18,14 @@ import { ModelRuntime, type ProviderModelConfig } from '@earendil-works/pi-codin
 import { Agent, Dispatcher1Wrapper } from 'undici';
 import { z } from 'zod';
 import { createRemoteJWKSet, customFetch, jwtVerify } from 'jose';
-import { ModelAuthError, ModelWorkspaceSelectionError } from '../../ports/models.ts';
+import { logFailure } from '../../ports/failure-log.ts';
+import { nodFetch, nodIdentity } from '../attribution.ts';
+import {
+  ModelAuthError,
+  ModelCatalogError,
+  ModelWorkspaceSelectionError,
+} from '../../ports/models.ts';
+import { appPages } from '../../shared/app-links.ts';
 import { ElevenLabsConnectionError, readElevenLabsVoices } from '../elevenlabs/speech.ts';
 import { openAIBaseUrl, openAIRequestError } from '../openai/api.ts';
 import type {
@@ -23,9 +33,12 @@ import type {
   ModelBackend,
   ModelCredential,
   ModelDefinition,
+  ModelCatalogFailure,
 } from '../../ports/models.ts';
 import {
   bedrockRegionPattern,
+  boundedPrice,
+  modelPricingSignature,
   modelProviders,
   modelProviderNames,
   type ModelProvider,
@@ -38,17 +51,23 @@ import type { ProviderUsageEvent } from '../../ports/provider-usage.ts';
 import { piUsageMetrics } from './usage.ts';
 import { audioUsage, nativeAudioRequest, readsNativeAudio } from './audio.ts';
 import { completeAssistantMessage } from './checkpoint.ts';
-import { modelServiceError } from '../model-error.ts';
+import { modelContext } from './context.ts';
+import { ModelServiceError, modelServiceError } from '../model-error.ts';
 import {
   antLingModel,
   nativeAudioModel,
+  openAIModels,
   assistantModelId,
   assistantModels,
   cloudflareCredential,
+  discoveryCause,
   nativeCatalog,
 } from './model-catalog.ts';
 
+const reconnectChatGpt = `Reconnect your ChatGPT account in ${appPages['/settings/models']}.`;
+
 export const localModelSilenceMs = 30 * 60_000;
+export const modelFirstEventMs = 90_000;
 
 function supportedModel(model: Model<Api>): Model<Api> {
   if (model.provider === 'groq' && model.id.startsWith('qwen/'))
@@ -57,72 +76,23 @@ function supportedModel(model: Model<Api>): Model<Api> {
     return { ...model, compat: { ...model.compat, supportsStrictMode: false } };
   if (model.provider === 'openrouter' && model.id === 'openrouter/free')
     return { ...model, thinkingLevelMap: { ...model.thinkingLevelMap, off: null } };
+  if (model.provider === 'compatible' && model.thinkingLevelMap?.high === 'true')
+    return { ...model, thinkingLevelMap: { ...model.thinkingLevelMap, high: 'high' } };
   return model;
 }
 
 const resource = 'https://api.openai.com/v1';
+
+const routers = {
+  openrouter: {
+    baseUrl: 'https://openrouter.ai/api/v1',
+    perMillion: 1_000_000,
+    compat: { thinkingFormat: 'openrouter' },
+  },
+  hostinger: { baseUrl: 'https://router.hostinger.com/v1', perMillion: 10_000, compat: {} },
+} as const;
 const issuer = 'https://auth.openai.com';
 
-export function modelContextBudget(model: {
-  provider: string;
-  id: string;
-  contextWindow: number;
-  maxTokens: number;
-}) {
-  const routed =
-    model.provider === 'openrouter' && ['openrouter/free', 'openrouter/auto'].includes(model.id);
-  const window = routed ? Math.min(8192, model.contextWindow) : model.contextWindow;
-  const compact = window < 65_536;
-  return {
-    window,
-    compact,
-    margin: Math.min(2048, Math.max(128, Math.floor(window / 16))),
-    output: compact ? Math.min(model.maxTokens, Math.floor(window / 4)) : model.maxTokens,
-    reserve: compact ? Math.floor(window / 2) : Math.max(16_384, window - 256_000),
-    recent: compact
-      ? Math.floor(window / 8)
-      : Math.max(0, Math.round(Math.min(256_000, window - 16_384) / 3)),
-  };
-}
-
-export function estimateModelTokens(payload: unknown) {
-  let images = 0;
-  const text = JSON.stringify(payload, (_key, value) => {
-    if (!value || typeof value !== 'object') return value;
-    if (value.type === 'image_url' && typeof value.image_url?.url === 'string') {
-      images++;
-      return { ...value, image_url: { ...value.image_url, url: '[image]' } };
-    }
-    if (value.type === 'input_image' && typeof value.image_url === 'string') {
-      images++;
-      return { ...value, image_url: '[image]' };
-    }
-    if (value.type === 'image' && value.source?.type === 'base64') {
-      images++;
-      return { ...value, source: { ...value.source, data: '[image]' } };
-    }
-    if (
-      value.type === 'image' &&
-      /^image\//.test(value.mimeType ?? '') &&
-      typeof value.data === 'string'
-    ) {
-      images++;
-      return { ...value, data: '[image]' };
-    }
-    for (const key of ['inlineData', 'inline_data'])
-      if (/^image\//.test(value[key]?.mimeType ?? value[key]?.mime_type ?? '')) {
-        images++;
-        return { ...value, [key]: { ...value[key], data: '[image]' } };
-      }
-    if (value.image?.source?.bytes && value.image?.format) {
-      images++;
-      return { ...value, image: { ...value.image, source: { bytes: '[image]' } } };
-    }
-    return value;
-  });
-  return Math.ceil(Buffer.byteLength(text) / 3) + images * 1200;
-}
-const callbackUrl = 'http://127.0.0.1:1455/auth/callback';
 const registration = 'dynamic_agent_client';
 const planScope = 'chatgpt.tokens.use.direct';
 const random = () => randomBytes(32).toString('base64url');
@@ -158,8 +128,7 @@ class AnthropicBadRequest extends ModelAuthError {}
 
 function chatgptCredential(value: unknown) {
   const parsed = chatgptCredentialSchema.safeParse(value);
-  if (!parsed.success)
-    throw new ModelAuthError('Reconnect your ChatGPT account in Settings > Models.', true);
+  if (!parsed.success) throw new ModelAuthError(reconnectChatGpt, true);
   return parsed.data;
 }
 
@@ -182,7 +151,7 @@ const levels = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 let endpointConnections: Dispatcher1Wrapper | undefined;
 const keyless = 'nod-no-key';
 const ollamaShowSchema = z.object({
-  capabilities: z.array(z.string()).catch([]),
+  capabilities: z.array(z.string()).optional().catch(undefined),
   model_info: z.record(z.string(), z.unknown()).catch({}),
   parameters: z.string().catch(''),
   thinking: z
@@ -200,7 +169,7 @@ function ollamaModel(show: z.infer<typeof ollamaShowSchema>) {
   const values = show.thinking?.values;
   const named = levels.filter((level) => values?.includes(level));
   const thinkingLevelMap =
-    !show.capabilities.includes('thinking') || !values
+    show.capabilities?.includes('thinking') === false || !values
       ? undefined
       : named.length
         ? {
@@ -213,13 +182,13 @@ function ollamaModel(show: z.infer<typeof ollamaShowSchema>) {
           ? {
               off: values.includes(false) ? 'none' : null,
               ...Object.fromEntries(
-                levels.map((level) => [level, level === 'high' ? 'true' : null]),
+                levels.map((level) => [level, level === 'high' ? level : null]),
               ),
             }
           : undefined;
   return {
-    usable: show.capabilities.includes('tools'),
-    images: show.capabilities.includes('vision'),
+    usable: show.capabilities?.includes('tools'),
+    images: show.capabilities?.includes('vision'),
     contextWindow: Number.isFinite(contextWindow) ? contextWindow : undefined,
     reasoning: !!thinkingLevelMap,
     thinkingLevelMap,
@@ -253,7 +222,7 @@ function lmStudioModel(model: z.infer<typeof lmStudioModelSchema>) {
 }
 
 export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): ModelBackend {
-  const request = options.fetch ?? fetch;
+  const request = options.fetch ?? nodFetch;
   let catalogRuntime: Promise<ModelRuntime> | undefined;
   const runtime = () =>
     (catalogRuntime ??= ModelRuntime.create({
@@ -316,6 +285,8 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
     const headers: Record<string, string> = credential.key
       ? { Authorization: `Bearer ${credential.key}` }
       : {};
+    const secrets = [credential.url, credential.key ?? ''];
+    const failures: ModelCatalogFailure[] = [];
     let found: { url: string; data: unknown[] } | undefined;
     for (const url of credential.url.endsWith('/v1')
       ? [credential.url]
@@ -325,15 +296,26 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         redirect: 'error',
         signal: AbortSignal.timeout(15000),
       });
+      const path = url === credential.url ? '/models' : '/v1/models';
+      if (!response.ok) {
+        const error = await modelServiceError(response, 'Model discovery', secrets);
+        failures.push({ path, status: error.status, detail: error.details ?? '' });
+        continue;
+      }
       const list = z
         .object({ data: z.array(z.unknown()) })
-        .safeParse(response.ok ? await response.json().catch(() => undefined) : undefined);
+        .safeParse(await response.json().catch(() => undefined));
       if (list.success) {
         found = { url, data: list.data.data };
         break;
       }
+      failures.push({
+        path,
+        status: response.status,
+        detail: 'The server returned an invalid model list.',
+      });
     }
-    if (!found) throw new Error('The server’s model list could not be loaded.');
+    if (!found) throw new ModelCatalogError(failures);
     const size = z.number().int().positive().optional().catch(undefined);
     const listed = entries(
       found.data,
@@ -354,71 +336,94 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
       })
         .then((response) => (response.ok ? response.json() : undefined))
         .catch(() => undefined);
-    const ollama = z
-      .object({ version: z.string() })
-      .safeParse(await serverJson('/api/version')).success;
-    const studio = ollama
-      ? undefined
-      : z.object({ models: z.array(z.unknown()) }).safeParse(await serverJson('/api/v1/models'))
-          .data?.models;
-    const studioModels = studio ? entries(studio, lmStudioModelSchema) : [];
-    const models = await Promise.all(
-      listed.map(async (entry) => {
-        const shown = ollama
-          ? ollamaShowSchema.safeParse(
-              await serverJson('/api/show', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ model: entry.id }),
-              }),
-            )
-          : undefined;
-        const studioModel = studioModels.find((model) => model.key === entry.id);
-        const known = shown?.success
-          ? ollamaModel(shown.data)
-          : studioModel
-            ? lmStudioModel(studioModel)
-            : undefined;
-        if (known && !known.usable) return [];
-        const contextWindow =
-          known?.contextWindow ??
-          entry.context_length ??
-          entry.context_window ??
-          entry.max_model_len ??
-          128_000;
-        return [
-          definition({
-            id: entry.id,
-            name: entry.id,
-            api: 'openai-completions',
-            provider: 'compatible',
-            baseUrl: found.url,
-            compat: {
-              supportsStore: false,
-              supportsDeveloperRole: false,
-              maxTokensField: 'max_tokens',
-            },
-            reasoning: known?.reasoning ?? false,
-            thinkingLevelMap: known?.thinkingLevelMap,
-            input: known?.images ? ['text', 'image'] : ['text'],
-            contextWindow,
-            maxTokens: Math.min(32_768, Math.floor(contextWindow / 2)),
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          } as Model<Api>),
-        ];
+    const [version, studio] = await Promise.all([
+      serverJson('/api/version'),
+      serverJson('/api/v1/models'),
+    ]);
+    const ollama = z.object({ version: z.string() }).safeParse(version).success;
+    const running = ollama ? await serverJson('/api/ps') : undefined;
+    const loadedModels = entries(
+      z.object({ models: z.array(z.unknown()) }).safeParse(running).data?.models ?? [],
+      z.object({
+        name: z.string().min(1).max(200).optional(),
+        model: z.string().min(1).max(200).optional(),
+        context_length: z.number().int().positive(),
       }),
     );
-    return models.flat();
+    const studioModels = entries(
+      z.object({ models: z.array(z.unknown()) }).safeParse(studio).data?.models ?? [],
+      lmStudioModelSchema,
+    );
+    const models: ModelDefinition[] = [];
+    for (let index = 0; index < listed.length; index += 3) {
+      const batch = await Promise.all(
+        listed.slice(index, index + 3).map(async (entry) => {
+          const studioModel = studioModels.find((model) => model.key === entry.id);
+          const shown =
+            ollama && !studioModel
+              ? ollamaShowSchema.safeParse(
+                  await serverJson('/api/show', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model: entry.id }),
+                  }),
+                )
+              : undefined;
+          const known = studioModel
+            ? lmStudioModel(studioModel)
+            : shown?.success
+              ? ollamaModel(shown.data)
+              : undefined;
+          if (known?.usable === false) return [];
+          const reportedContext =
+            known?.contextWindow ??
+            entry.context_length ??
+            entry.context_window ??
+            entry.max_model_len ??
+            128_000;
+          const contextWindow = Math.min(
+            reportedContext,
+            ...(studioModel
+              ? []
+              : loadedModels
+                  .filter((model) => model.name === entry.id || model.model === entry.id)
+                  .map((model) => model.context_length)),
+          );
+          return [
+            definition({
+              id: entry.id,
+              name: entry.id,
+              api: 'openai-completions',
+              provider: 'compatible',
+              baseUrl: found.url,
+              compat: {
+                supportsStore: false,
+                supportsDeveloperRole: false,
+                maxTokensField: 'max_tokens',
+              },
+              reasoning: known?.reasoning ?? false,
+              thinkingLevelMap: known?.thinkingLevelMap,
+              input: known?.images ? ['text', 'image'] : ['text'],
+              contextWindow,
+              maxTokens: Math.min(32_768, Math.floor(contextWindow / 2)),
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            } as Model<Api>),
+          ];
+        }),
+      );
+      models.push(...batch.flat());
+    }
+    return models;
   }
-  async function cloudResponse(url: string, init: RequestInit, rejected: string) {
+  async function cloudResponse(url: string, init: RequestInit, service: string, key: string) {
     const response = await request(url, {
       ...init,
       redirect: 'error',
       signal: AbortSignal.timeout(15000),
     });
     if ([400, 401, 403, 404].includes(response.status)) {
-      await response.body?.cancel();
-      throw new ModelAuthError(rejected);
+      const error = await modelServiceError(response, `${service} model discovery`, [key]);
+      throw new ModelAuthError(error.message);
     }
     return response;
   }
@@ -431,7 +436,8 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         await cloudResponse(
           `${root}${path}`,
           { headers: { Authorization: `Bearer ${credential.key}` } },
-          'Amazon Bedrock didn’t accept this key in that Region. Check both, and that the key can list models.',
+          'Amazon Bedrock',
+          credential.key,
         ),
       );
     const available = new Set(
@@ -471,11 +477,15 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         signal: AbortSignal.timeout(15000),
       },
     );
-    await response.body?.cancel();
-    if ([400, 401, 403].includes(response.status))
-      throw new ModelAuthError('Google Vertex AI didn’t accept this API key.');
+    if ([400, 401, 403].includes(response.status)) {
+      const error = await modelServiceError(response, 'Google Vertex AI model discovery', [
+        credential.key,
+      ]);
+      throw new ModelAuthError(error.message);
+    }
     if (!response.ok && response.status !== 404)
-      throw new Error('The model service is temporarily unavailable. Try again.');
+      throw await modelServiceError(response, 'Google Vertex AI model discovery', [credential.key]);
+    await response.body?.cancel();
     return local.map(definition);
   }
   async function azureCatalog(local: readonly Model<Api>[], credential: ModelCredential) {
@@ -486,7 +496,8 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
       await cloudResponse(
         `${credential.url}/models`,
         { headers: { 'api-key': credential.key } },
-        'This Azure OpenAI endpoint didn’t accept the key. Check the endpoint and the key.',
+        'Azure OpenAI',
+        credential.key,
       ),
     );
     return [definition({ ...model, baseUrl: credential.url })];
@@ -495,28 +506,14 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
     async signIn({ signal: requestedSignal, hostId, previous }) {
       const controller = new AbortController();
       const signal = AbortSignal.any([requestedSignal, controller.signal]);
-      const canceled = () => new ModelAuthError('ChatGPT sign-in was canceled.');
+      const refused = (message: string, reason: string) =>
+        new ModelAuthError(message, false, { cause: { reason } });
+      const canceled = (reason = 'aborted') => refused('ChatGPT sign-in was canceled.', reason);
       if (signal.aborted) throw canceled();
       const saved = chatgptCredentialSchema.safeParse(previous).data;
       const state = random();
       const nonce = random();
       const verifier = random();
-      const url = new URL(`${issuer}/api/accounts/authorize`);
-      url.search = new URLSearchParams({
-        client_id: saved?.clientId ?? registration,
-        ...(saved
-          ? { id_token_hint: saved.idToken, ...(saved.email ? { login_hint: saved.email } : {}) }
-          : { agent_name_hint: 'Nod' }),
-        ext_agent_host_id: `urn:uuid:${hostId}`,
-        response_type: 'code',
-        redirect_uri: callbackUrl,
-        scope: `openid profile email offline_access resource.invoke ${planScope}`,
-        resource,
-        state,
-        nonce,
-        code_challenge: createHash('sha256').update(verifier).digest('base64url'),
-        code_challenge_method: 'S256',
-      }).toString();
       let settled = false;
       let claimed = false;
       let grant!: (value: { code: string; clientId: string }) => void;
@@ -528,10 +525,10 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
       granted.catch(() => {});
       const abort = () => refuse(canceled());
       signal.addEventListener('abort', abort, { once: true });
-      const expected = new URL(callbackUrl);
+      const expected = new URL('http://127.0.0.1:1455/auth/callback');
       const complete = (callback: URL) => {
         if (settled || claimed || signal.aborted)
-          throw new ModelAuthError('This sign-in request has expired. Start a new connection.');
+          throw refused('This sign-in request has expired. Start a new connection.', 'expired');
         if (
           callback.origin !== expected.origin ||
           callback.pathname !== expected.pathname ||
@@ -541,15 +538,15 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
           callback.searchParams.getAll('state').length !== 1 ||
           callback.searchParams.get('state') !== state
         )
-          throw new ModelAuthError('This sign-in callback is invalid or was declined.');
+          throw refused('This sign-in callback is invalid or was declined.', 'callback_mismatch');
         if (callback.searchParams.has('error')) {
           if (
             callback.searchParams.getAll('error').length !== 1 ||
             !callback.searchParams.get('error') ||
             callback.searchParams.has('code')
           )
-            throw new ModelAuthError('This sign-in callback is invalid.');
-          const declined = canceled();
+            throw refused('This sign-in callback is invalid.', 'invalid_callback');
+          const declined = canceled('declined');
           claimed = true;
           refuse(declined);
           throw declined;
@@ -564,7 +561,7 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
             ? issued[0]
             : undefined;
         if (codes.length !== 1 || !codes[0] || !clientId)
-          throw new ModelAuthError('This sign-in callback is invalid.');
+          throw refused('This sign-in callback is invalid.', 'invalid_callback');
         claimed = true;
         grant({ code: codes[0], clientId });
       };
@@ -576,7 +573,7 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
           response.end(page.html);
         };
         try {
-          const callback = new URL(request.url ?? '/', callbackUrl);
+          const callback = new URL(request.url ?? '/', expected);
           if (request.method !== 'GET' || callback.pathname !== expected.pathname) {
             send(404);
             return;
@@ -586,7 +583,13 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
             () => send(200),
             () => send(400),
           );
-        } catch {
+        } catch (error) {
+          if (!claimed)
+            logFailure('model_sign_in_failed', Object(error).cause, {
+              provider: 'openai',
+              reason: Object(Object(error).cause).reason,
+              phase: 'callback',
+            });
           send(400);
         }
       });
@@ -601,26 +604,43 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
           });
           server.closeIdleConnections();
         }));
-      try {
-        await new Promise<void>((resolve, reject) => {
+      const listen = (port: number) =>
+        new Promise<void>((resolve, reject) => {
           server.once('error', reject);
-          server.listen(Number(expected.port), expected.hostname, () => {
+          server.listen(port, expected.hostname, () => {
             server.off('error', reject);
             resolve();
           });
         });
+      try {
+        await listen(Number(expected.port)).catch(() => listen(0));
         server.on('error', () => controller.abort());
         if (signal.aborted) throw canceled();
       } catch (error) {
         signal.removeEventListener('abort', abort);
         await close();
         if (error instanceof ModelAuthError) throw error;
-        throw new ModelAuthError(
-          error instanceof Error && 'code' in error && error.code === 'EADDRINUSE'
-            ? 'Port 1455 is already in use. Close the other Nod app or another sign-in, then try again.'
-            : 'ChatGPT sign-in couldn’t start. Try again.',
-        );
+        throw new ModelAuthError('ChatGPT sign-in couldn’t start. Try again.', false, {
+          cause: { reason: 'callback_server_failed', code: Object(error).code },
+        });
       }
+      expected.port = String((server.address() as AddressInfo).port);
+      const url = new URL(`${issuer}/api/accounts/authorize`);
+      url.search = new URLSearchParams({
+        client_id: saved?.clientId ?? registration,
+        ...(saved
+          ? { id_token_hint: saved.idToken, ...(saved.email ? { login_hint: saved.email } : {}) }
+          : { agent_name_hint: 'Nod' }),
+        ext_agent_host_id: `urn:uuid:${hostId}`,
+        response_type: 'code',
+        redirect_uri: expected.href,
+        scope: `openid profile email offline_access resource.invoke ${planScope}`,
+        resource,
+        state,
+        nonce,
+        code_challenge: createHash('sha256').update(verifier).digest('base64url'),
+        code_challenge_method: 'S256',
+      }).toString();
       exchange = (async (): Promise<ModelCredential> => {
         try {
           const { code, clientId } = await granted;
@@ -630,7 +650,7 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
               client_id: clientId,
               code,
               code_verifier: verifier,
-              redirect_uri: callbackUrl,
+              redirect_uri: expected.href,
             },
             signal,
           );
@@ -702,12 +722,14 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
           },
         );
         if (!response.ok) {
-          await response.body?.cancel();
+          const error = await modelServiceError(response, 'Anthropic workspace discovery', [
+            credential.key,
+          ]);
           if ([400, 401, 403, 404].includes(response.status))
             throw new ModelAuthError(
-              'Nod couldn’t discover a workspace for this key. Enter its Workspace ID from the Claude Console.',
+              `${error.message} Enter its Workspace ID from the Claude Console.`,
             );
-          throw new Error(`Anthropic workspace discovery failed (${response.status}).`);
+          throw error;
         }
         workspaces = z
           .object({
@@ -728,8 +750,13 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
           })
           .parse(await response.json());
       } catch (cause) {
-        if (cause instanceof ModelAuthError) throw cause;
-        throw new Error('The model list couldn’t be loaded. Try again.', { cause });
+        if (cause instanceof ModelAuthError || cause instanceof ModelServiceError) throw cause;
+        throw new Error(
+          `Anthropic workspace discovery failed: ${discoveryCause(cause, [credential.key])}.`,
+          {
+            cause,
+          },
+        );
       }
       if (!workspaces.data.length)
         throw new ModelAuthError(
@@ -773,18 +800,19 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
       if (provider === 'amazon-bedrock') return bedrockCatalog(local, credential);
       if (provider === 'google-vertex') return vertexCatalog(local, credential);
       if (provider === 'azure') return azureCatalog(local, credential);
-      if (provider !== 'openai' && provider !== 'anthropic' && provider !== 'openrouter')
+      const router =
+        provider === 'openrouter' || provider === 'hostinger' ? routers[provider] : undefined;
+      if (provider !== 'openai' && provider !== 'anthropic' && !router)
         return (await nativeCatalog(provider, local, credential, request)).map(definition);
       if (credential.type !== 'api_key' && credential.type !== 'oauth')
         throw new Error('This model connection is unavailable.');
       if (method === 'subscription') chatgptCredential(credential);
       const key = credential.type === 'api_key' ? credential.key : credential.access;
-      const url =
-        provider === 'openrouter'
-          ? 'https://openrouter.ai/api/v1/models'
-          : provider === 'anthropic'
-            ? 'https://api.anthropic.com/v1/models?limit=1000'
-            : `${method === 'api_key' && credential.type === 'api_key' ? openAIBaseUrl(credential.region) : resource}/models`;
+      const url = router
+        ? `${router.baseUrl}/models`
+        : provider === 'anthropic'
+          ? 'https://api.anthropic.com/v1/models?limit=1000'
+          : `${method === 'api_key' && credential.type === 'api_key' ? openAIBaseUrl(credential.region) : resource}/models`;
       const headers: Record<string, string> =
         provider === 'anthropic'
           ? {
@@ -812,7 +840,7 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         if (response.status !== 401) return response;
         await response.body?.cancel();
         throw method === 'subscription'
-          ? new ModelAuthError('Reconnect your ChatGPT account in Settings > Models.', true)
+          ? new ModelAuthError(reconnectChatGpt, true)
           : new ModelAuthError(
               `${modelProviderNames[provider]} didn’t accept this API key. Check it and try again.`,
             );
@@ -855,7 +883,7 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
       const data = await jsonResponse(response, `${modelProviderNames[provider]} model discovery`, [
         key,
       ]);
-      if (provider !== 'openrouter') {
+      if (!router) {
         const list = entries(
           method === 'subscription' ? data.models : data.data,
           z.object({
@@ -867,6 +895,12 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         const ids = new Set(
           list.filter((m) => !m.visibility || m.visibility === 'list').map((m) => m.slug ?? m.id),
         );
+        if (provider === 'openai')
+          local.push(
+            ...openAIModels(credential.type === 'api_key' ? credential.region : undefined).filter(
+              (model) => !local.some(({ id }) => id === model.id),
+            ),
+          );
         return local.filter((m) => ids.has(m.id)).map(definition);
       }
       const list = entries(
@@ -875,7 +909,9 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
           id: z.string(),
           name: z.string(),
           context_length: z.number().positive(),
+          max_output_tokens: z.number().positive().nullable().optional(),
           supported_parameters: z.array(z.string()),
+          supported_endpoints: z.array(z.string()).optional(),
           architecture: z.object({
             input_modalities: z.array(z.string()),
             output_modalities: z.array(z.string()),
@@ -900,7 +936,8 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
             m.architecture.output_modalities.includes('text') &&
             m.architecture.output_modalities.every((modality) => modality === 'text') &&
             assistantModelId(m.id) &&
-            !m.id.includes(':batch'),
+            !m.id.includes(':batch') &&
+            (!m.supported_endpoints || m.supported_endpoints.includes('/v1/chat/completions')),
         )
         .map((m) => {
           const known = local.find((model) => model.id === m.id);
@@ -925,25 +962,26 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
             name: m.name,
             api: known?.api ?? 'openai-completions',
             provider,
-            baseUrl: known?.baseUrl ?? 'https://openrouter.ai/api/v1',
-            compat: known?.compat ?? { thinkingFormat: 'openrouter' },
+            baseUrl: known?.baseUrl ?? router.baseUrl,
+            compat: known?.compat ?? router.compat,
             reasoning,
             input: m.architecture.input_modalities.includes('image') ? ['text', 'image'] : ['text'],
             contextWindow: m.context_length,
             maxTokens:
               m.top_provider?.max_completion_tokens ??
+              m.max_output_tokens ??
               known?.maxTokens ??
               Math.min(32_768, Math.floor(m.context_length / 2)),
             cost: {
-              input: m.pricing.prompt * 1000000,
-              output: m.pricing.completion * 1000000,
+              input: m.pricing.prompt * router.perMillion,
+              output: m.pricing.completion * router.perMillion,
               cacheRead:
                 m.pricing.input_cache_read !== undefined
-                  ? m.pricing.input_cache_read * 1000000
+                  ? m.pricing.input_cache_read * router.perMillion
                   : (known?.cost.cacheRead ?? 0),
               cacheWrite:
                 m.pricing.input_cache_write !== undefined
-                  ? m.pricing.input_cache_write * 1000000
+                  ? m.pricing.input_cache_write * router.perMillion
                   : (known?.cost.cacheWrite ?? 0),
             },
             thinkingLevelMap: map,
@@ -1014,9 +1052,7 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         const terminal =
           error instanceof TokenRejected && [400, 401, 403].includes(error.statusCode);
         throw new ModelAuthError(
-          terminal
-            ? 'Reconnect your ChatGPT account in Settings > Models.'
-            : 'ChatGPT is temporarily unavailable. Try again.',
+          terminal ? reconnectChatGpt : 'ChatGPT is temporarily unavailable. Try again.',
           terminal,
           { cause: error },
         );
@@ -1026,6 +1062,16 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
 }
 
 function portableToolCallIds(messages: Context['messages'], model: string): Context['messages'] {
+  const portable = /^[A-Za-z0-9]{9}$/;
+  const used = new Set(
+    messages.flatMap((message) =>
+      message.role === 'assistant'
+        ? message.content.flatMap((part) =>
+            part.type === 'toolCall' && portable.test(part.id) ? [part.id] : [],
+          )
+        : [],
+    ),
+  );
   const ids = new Map<string, string>();
   return messages.map((message) => {
     if (message.role === 'toolResult') {
@@ -1038,13 +1084,34 @@ function portableToolCallIds(messages: Context['messages'], model: string): Cont
     return {
       ...message,
       content: message.content.map((part) => {
-        if (part.type !== 'toolCall' || /^[A-Za-z0-9]{9}$/.test(part.id)) return part;
-        const id = createHash('sha256').update(part.id).digest('hex').slice(0, 9);
+        if (part.type !== 'toolCall' || portable.test(part.id)) return part;
+        let id = createHash('sha256').update(part.id).digest('hex').slice(0, 9);
+        for (let attempt = 1; used.has(id); attempt++)
+          id = createHash('sha256').update(`${attempt}:${part.id}`).digest('hex').slice(0, 9);
+        used.add(id);
         ids.set(part.id, id);
         return { ...part, id };
       }),
     };
   });
+}
+
+function textContentParts(event: unknown) {
+  const choices = (event as { choices?: unknown } | null)?.choices;
+  if (!Array.isArray(choices)) return;
+  for (const choice of choices as Array<{ delta?: { content?: unknown } } | null>) {
+    const delta = choice?.delta;
+    if (delta && Array.isArray(delta.content))
+      delta.content = delta.content
+        .map((part: { type?: unknown; text?: unknown } | string | null) =>
+          typeof part === 'string'
+            ? part
+            : part?.type === 'text' && typeof part.text === 'string'
+              ? part.text
+              : '',
+        )
+        .join('');
+  }
 }
 
 export async function createPiModelRuntime(
@@ -1065,7 +1132,7 @@ export async function createPiModelRuntime(
   const provider = access.provider;
   const reconnect = async (credential?: ModelCredential) => {
     await access.needsReconnect?.(credential);
-    return new ModelAuthError('Reconnect your ChatGPT account in Settings > Models.', true);
+    return new ModelAuthError(reconnectChatGpt, true);
   };
   if (
     subscription &&
@@ -1156,12 +1223,13 @@ export async function createPiModelRuntime(
       };
     };
   }
+  const limits = modelContext(
+    access.definition.spec as unknown as Model<Api>,
+    access.textModel?.definition.spec as unknown as Model<Api> | undefined,
+  ).model;
   runtime.registerProvider(provider, {
     models: [access.definition, ...(access.textModel ? [access.textModel.definition] : [])].map(
-      ({ spec }) => ({
-        ...supportedModel(spec as unknown as Model<Api>),
-        contextWindow: modelContextBudget(spec as unknown as Model<Api>).window,
-      }),
+      ({ spec }) => modelContext(supportedModel(spec as unknown as Model<Api>), limits).model,
     ) as unknown as ProviderModelConfig[],
   });
   await runtime.refresh({ allowNetwork: false });
@@ -1180,14 +1248,18 @@ export async function createPiModelRuntime(
       ),
     };
     const audio = readsNativeAudio(model) ? nativeAudioRequest(context, readAudio) : undefined;
-    const target = audio && !audio.active && textModel ? textModel : model;
+    const companion = audio && !audio.active ? textModel : undefined;
+    const { model: target } = modelContext(companion ?? model, limits);
     const usage = audio?.active ? audioUsage() : undefined;
     const cacheWarm = options?.maxTokens === 1 && options.maxRetries === 0;
     let phase: ModelRequestFacts['requestPhase'] = 'prepare';
     let status: number | undefined;
     let transportCause: string | undefined;
-    let completeRequest: ((error?: string) => Promise<void>) | undefined;
+    let completeRequest: ((error?: string, status?: number) => Promise<void>) | undefined;
     let settleBudget: ((spentUsd: number | null) => Promise<void>) | undefined;
+    const silence = new AbortController();
+    let silenceTimer: ReturnType<typeof setTimeout> | undefined;
+    const heard = () => clearTimeout(silenceTimer);
     const guardedFetch =
       access.provider === 'compatible' ||
       access.provider === 'radius' ||
@@ -1200,26 +1272,29 @@ export async function createPiModelRuntime(
       access.provider === 'compatible'
         ? { ...sent, messages: portableToolCallIds(sent.messages, target.id) }
         : sent;
+    const output = Math.min(options?.maxTokens ?? target.maxTokens, target.maxTokens);
     const upstream = stream(target, replay, {
       ...options,
-      maxTokens:
-        options?.maxTokens && target.maxTokens > 0
-          ? Math.min(options.maxTokens, target.maxTokens)
-          : options?.maxTokens,
+      identity: nodIdentity,
+      signal: options?.signal ? AbortSignal.any([options.signal, silence.signal]) : silence.signal,
+      maxTokens: output,
       maxRetries: 0,
+      ...(access.provider === 'compatible' ? { timeoutMs: localModelSilenceMs } : {}),
       onResponse: async (response, model) => {
         phase = 'response';
         status = response.status;
         await options?.onResponse?.(response, model);
       },
       onProviderStreamEvent: async (event, model) => {
+        heard();
         phase = 'stream';
+        if (model.api === 'openai-completions') textContentParts(event);
         await options?.onProviderStreamEvent?.(event, model);
       },
       ...(target.provider === 'openrouter' && target.id === 'openrouter/free'
         ? { reasoning: options?.reasoning ?? 'minimal' }
         : {}),
-      ...(target !== model
+      ...(companion
         ? { reasoning: access.textModel!.effort === 'off' ? undefined : access.textModel!.effort }
         : {}),
       ...(guardedFetch ||
@@ -1241,7 +1316,7 @@ export async function createPiModelRuntime(
               if (headers.get('authorization') === `Bearer ${keyless}`)
                 headers.delete('authorization');
               phase = 'request';
-              const response = await (options?.fetch ?? fetch)(input, {
+              const response = await (options?.fetch ?? nodFetch)(input, {
                 ...init,
                 ...(guardedFetch ? { headers, redirect: 'error' } : {}),
                 ...(access.provider === 'compatible'
@@ -1264,6 +1339,8 @@ export async function createPiModelRuntime(
                 }
                 throw error;
               });
+              phase = 'response';
+              status = response.status;
               return usage ? usage.response(response) : response;
             },
           }
@@ -1272,10 +1349,6 @@ export async function createPiModelRuntime(
         completeRequest = await access.prepareRequest?.(target.id, automatic || cacheWarm);
         const changed = await options?.onPayload?.(payload, target);
         const body = (changed ?? payload) as Record<string, unknown>;
-        if (access.provider === 'compatible' && target.thinkingLevelMap?.high === 'true') {
-          body.think = body.reasoning_effort !== 'none' || target.thinkingLevelMap.off === null;
-          delete body.reasoning_effort;
-        }
         if (access.provider === 'openrouter')
           body.provider = { require_parameters: true, allow_fallbacks: false };
         if (
@@ -1349,34 +1422,12 @@ export async function createPiModelRuntime(
             );
         }
 
-        const budget = modelContextBudget(target);
-        const available = budget.window - estimateModelTokens(body) - budget.margin;
-        if (available < 128)
-          throw new Error(
-            `Context length exceeded: This request does not fit ${target.id}'s ${budget.window}-token context. Use a model with a larger context or a shorter request.`,
-          );
-        const output = Math.min(options?.maxTokens ?? budget.output, budget.output, available);
-        for (const field of ['max_tokens', 'max_completion_tokens', 'max_output_tokens'])
-          if (field in body) body[field] = output;
-        for (const [field, key] of [
-          ['generationConfig', 'maxOutputTokens'],
-          ['inferenceConfig', 'maxTokens'],
-        ] as const) {
-          const config = body[field];
-          if (config && typeof config === 'object')
-            (config as Record<string, unknown>)[key] = output;
-        }
-
         const prepared = audio?.active
           ? await audio.payload(body, options?.signal ?? AbortSignal.timeout(120000))
           : body;
         settleBudget = await access.reserve?.(() => {
           const prices = target.cost;
-          return prices &&
-            [prices.input, prices.output, prices.cacheRead, prices.cacheWrite].every(
-              (price) => Number.isFinite(price) && price >= 0,
-            ) &&
-            Math.max(prices.input, prices.output, prices.cacheRead, prices.cacheWrite) > 0
+          return boundedPrice(prices)
             ? (Buffer.byteLength(JSON.stringify(prepared)) *
                 Math.max(prices.input * 2, prices.cacheWrite, prices.cacheRead) +
                 output * prices.output) /
@@ -1384,6 +1435,11 @@ export async function createPiModelRuntime(
             : null;
         });
         phase = 'payload';
+        if (access.provider !== 'compatible') {
+          heard();
+          silenceTimer = setTimeout(() => silence.abort(), modelFirstEventMs);
+          silenceTimer.unref?.();
+        }
         return prepared;
       },
     });
@@ -1403,15 +1459,29 @@ export async function createPiModelRuntime(
               }),
             ),
           );
+        if (event.type === 'done' || event.type === 'error') heard();
+        if (event.type === 'error' && silence.signal.aborted && !options?.signal?.aborted) {
+          event.error.stopReason = 'error';
+          event.error.errorMessage = `${modelProviderNames[access.provider]} sent no response for ${modelFirstEventMs / 1000} seconds, so the request timed out.`;
+        }
         if (event.type === 'error') {
           const error = event.error;
           error.errorMessage = `${error.errorMessage || 'The provider gave no reason.'}${status ? ` (HTTP ${status})` : ''}${transportCause ? ` (transport cause: ${transportCause})` : ''} [request phase: ${phase}]`;
         }
         if ((event.type === 'done' || event.type === 'error') && phase !== 'prepare') {
           const message = event.type === 'done' ? event.message : event.error;
-          if (message.stopReason !== 'aborted' && !options?.signal?.aborted)
+          if (
+            message.stopReason !== 'aborted' &&
+            !options?.signal?.aborted &&
+            (message.stopReason !== 'error' ||
+              !(
+                isRetryableAssistantError(message) ||
+                isContextOverflow(message, target.contextWindow)
+              ))
+          )
             await completeRequest?.(
               message.stopReason === 'error' ? message.errorMessage : undefined,
+              status,
             );
         }
         if (event.type === 'done' || event.type === 'error') {
@@ -1419,6 +1489,7 @@ export async function createPiModelRuntime(
           await settleBudget?.(piUsageMetrics(message.usage).costUsd ?? null);
           requestFacts.set(message, {
             requestPhase: phase,
+            requestKind: cacheWarm ? 'cache_warm' : 'regular',
           });
         }
         events.push(event);
@@ -1449,6 +1520,7 @@ export async function createPiModelRuntime(
           costUsd: null,
           pricing: 'unavailable',
           ...piUsageMetrics(message?.usage),
+          pricingSignature: modelPricingSignature(target.cost, target.api),
         });
       };
       const cancel = () => report();

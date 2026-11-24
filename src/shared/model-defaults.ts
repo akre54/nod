@@ -10,7 +10,7 @@ export const agentModels: Partial<Record<ModelProvider, string>> = {
   'cloudflare-workers-ai': '@cf/moonshotai/kimi-k2.7-code',
   deepseek: 'deepseek-flash',
   fireworks: 'accounts/fireworks/models/kimi-k3',
-  google: 'gemini-3.8-flash',
+  google: 'gemini-4-argon',
   'google-vertex': 'gemini-4-argon',
   groq: 'qwen/qwen3.8-27b',
   huggingface: 'moonshotai/Kimi-K3',
@@ -26,6 +26,7 @@ export const agentModels: Partial<Record<ModelProvider, string>> = {
   opencode: 'gpt-6.1-sol',
   'opencode-go': 'kimi-k3',
   openrouter: 'openai/gpt-6.1-sol',
+  hostinger: 'default-hostinger',
   'qwen-token-plan': 'qwen3.8-max',
   'qwen-token-plan-cn': 'qwen3.8-max',
   'qwen-token-plan-individual': 'qwen3.8-max',
@@ -45,6 +46,7 @@ export const memoryModels: Partial<Record<ModelProvider, string>> = {
   openai: 'gpt-6-luna',
   anthropic: 'claude-haiku-5-5',
   openrouter: 'openai/gpt-6-luna',
+  hostinger: 'gpt-6-luna',
   google: 'gemini-3.8-flash',
   'google-vertex': 'gemini-3.8-flash',
   mistral: 'mistral-small-latest',
@@ -56,6 +58,7 @@ export const memoryModels: Partial<Record<ModelProvider, string>> = {
 export function defaultModel(provider: ModelProvider, models: ModelChoice[], method?: ModelMethod) {
   if (provider === 'amazon-bedrock' && models.length > 1) return undefined;
   const preferred =
+    (provider === 'openai' && models.find((model) => model.id === 'gpt-6.2-sol')) ||
     (method === 'subscription' && models.find((model) => model.id === 'gpt-6-sol')) ||
     models.find((model) => model.id === agentModels[provider]);
   if (preferred || provider === 'google') return preferred;

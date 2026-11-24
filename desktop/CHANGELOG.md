@@ -2,6 +2,728 @@
 
 Releases from before the rename to Nod are the `desktop-v*` [GitHub releases](https://github.com/n8n-io/nod/releases).
 
+## 0.9.6 - 2026-11-24
+
+### Fixes
+
+- **errors:** Name disk-full and local connection failures and keep startup error codes. [#1465](https://github.com/n8n-io/nod/pull/1465) (6670bc2)
+- **trust:** Let one request cover every step and keep approvals answerable. [#1464](https://github.com/n8n-io/nod/pull/1464) (853d473)
+- **models:** Preserve Mistral invalid-key discovery errors. [#1463](https://github.com/n8n-io/nod/pull/1463) (92987ee)
+- **models:** Identify Nod to every model, speech and decision service. [#1462](https://github.com/n8n-io/nod/pull/1462) (ef9d789)
+- **models:** Identify Nod's provider requests as nod instead of pi. [#1460](https://github.com/n8n-io/nod/pull/1460) (058889a)
+
+[Full changelog](https://github.com/n8n-io/nod/compare/nod-v0.9.5...6670bc233b6b7dddaa75b25b89b4a89f0e92bcac)
+
+<details>
+<summary>Build details</summary>
+
+Source: `6670bc233b6b7dddaa75b25b89b4a89f0e92bcac`
+Previous release: `nod-v0.9.5`
+
+</details>
+
+## 0.9.5 - 2026-11-23
+
+### Features
+
+- **models:** Continue on the owner's backup models when a model request fails. [#1361](https://github.com/n8n-io/nod/pull/1361) (2118c35)
+
+### Fixes
+
+- **desktop:** Restore Windows install choices and recovery. [commit](https://github.com/n8n-io/nod/commit/0c3e0ff651d71cc6c4a6676b62ce2aa6ee938394) (0c3e0ff)
+- **browser:** Let the sign-in method picker accept buttons under click-through layers. [#1453](https://github.com/n8n-io/nod/pull/1453) (dcf495e)
+- **vault:** Refuse sign-in steps for controls that are not on the page, and click any sign-in button. [#1452](https://github.com/n8n-io/nod/pull/1452) (ee386a4)
+
+[Full changelog](https://github.com/n8n-io/nod/compare/nod-v0.9.4...0c3e0ff651d71cc6c4a6676b62ce2aa6ee938394)
+
+<details>
+<summary>Build details</summary>
+
+Source: `0c3e0ff651d71cc6c4a6676b62ce2aa6ee938394`
+Previous release: `nod-v0.9.4`
+
+</details>
+
+## 0.9.4 - 2026-11-23
+
+### Features
+
+- **analytics:** Send a daily runtime\_active event while Nod runs. [#1448](https://github.com/n8n-io/nod/pull/1448) (9ed5562)
+- **schedules:** Personal schedule ideas from your own messages. [#1444](https://github.com/n8n-io/nod/pull/1444) (fbd8bc3)
+
+### Fixes
+
+- **chat:** Keep the recovery notice when Try again or Use model fails. [#1213](https://github.com/n8n-io/nod/pull/1213) (f358bc7)
+- **schedules:** Scheduled page review fixes from #1441. [#1447](https://github.com/n8n-io/nod/pull/1447) (571158b)
+
+[Full changelog](https://github.com/n8n-io/nod/compare/nod-v0.9.3...f358bc7353e286c901bb82a9b91968149f301f56)
+
+<details>
+<summary>Build details</summary>
+
+Source: `f358bc7353e286c901bb82a9b91968149f301f56`
+Previous release: `nod-v0.9.3`
+
+</details>
+
+## 0.9.3 - 2026-11-23
+
+### Features
+
+- **schedules:** Choose each schedule's model on the Scheduled page, with compact rows and ideas. [#1441](https://github.com/n8n-io/nod/pull/1441) (3b20226)
+- **approvals:** Bold the few values to check in approval questions. [#1432](https://github.com/n8n-io/nod/pull/1432) (a9c1c0f)
+- **models:** Add Hostinger AI Router as a model provider. [commit](https://github.com/n8n-io/nod/commit/501d7a72158f2f3ce16e46c8ecb7c9c5ea503951) (501d7a7)
+- **tasks:** Show running tasks on Nod's status line instead of task previews in chat. [#1430](https://github.com/n8n-io/nod/pull/1430) (c7b0951)
+- **results:** Compact result cards with See details and a Check on site button. [#1431](https://github.com/n8n-io/nod/pull/1431) (638cf16)
+- **apps:** List connected MCP tool names in the agent context. [#1367](https://github.com/n8n-io/nod/pull/1367) (73fde1f)
+
+### Fixes
+
+- **ci:** Install Nod in its usual folder in the Windows startup check. [#1445](https://github.com/n8n-io/nod/pull/1445) (552d017)
+- **models:** Don't treat a busy model check as a connection problem. [#1374](https://github.com/n8n-io/nod/pull/1374) (aee91e8)
+- **desktop:** Start reliably on Windows after an install, an update or a WSL failure. [#1440](https://github.com/n8n-io/nod/pull/1440) (812c047)
+- **chat:** Open Nod's status line to read a long step in full. [#1442](https://github.com/n8n-io/nod/pull/1442) (a6ca9ab)
+- **tasks:** Tasks line review fixes from #1430. [#1439](https://github.com/n8n-io/nod/pull/1439) (608e403)
+- **results:** Result card review fixes from #1431. [#1433](https://github.com/n8n-io/nod/pull/1433) (fb00f1c)
+- **desktop:** Read hidden, slow and large windows in computer use. [#1257](https://github.com/n8n-io/nod/pull/1257) (1631927)
+- **schedules:** Keep skipped runs on rename and drop the watch on a change to one-time. [#1427](https://github.com/n8n-io/nod/pull/1427) (89e7e66)
+- **schedules:** Show the finished reply and shared files in run history. [#1426](https://github.com/n8n-io/nod/pull/1426) (d3b43ba)
+- **schedules:** Open Scheduled after an unconfirmed task save. [#1428](https://github.com/n8n-io/nod/pull/1428) (69105e9)
+- **schedules:** Save observations after a run resumes. [#1425](https://github.com/n8n-io/nod/pull/1425) (e58d535)
+- **browser:** Upgrade agent-browser to 0.43.0 so popup downloads stop hanging. [#1413](https://github.com/n8n-io/nod/pull/1413) (a7a6826)
+- **tasks:** Name the interrupted task and send one notice after a hand-off. [#1411](https://github.com/n8n-io/nod/pull/1411) (6f02f2f)
+- **privacy:** Redact secret fields across text and structured data. [#1296](https://github.com/n8n-io/nod/pull/1296) (fd7536a)
+- **server:** Refuse text with a null character with a clear error. [#1339](https://github.com/n8n-io/nod/pull/1339) (940c88a)
+- **models:** Say why model discovery failed. [#1336](https://github.com/n8n-io/nod/pull/1336) (3e467aa)
+- **models:** Keep Bedrock, Vertex and Azure discovery reasons. [#1335](https://github.com/n8n-io/nod/pull/1335) (6d55136)
+- **usage:** Count today's spend after a DST change. [#1316](https://github.com/n8n-io/nod/pull/1316) (b2f9d80)
+- **account:** Keep the reason setup could not finish. [#1340](https://github.com/n8n-io/nod/pull/1340) (f4cc1e7)
+- **web:** Keep the status and reason of API errors without a JSON error. [#1343](https://github.com/n8n-io/nod/pull/1343) (855d8a7)
+- **desktop:** Trim the server token before checking it. [#1346](https://github.com/n8n-io/nod/pull/1346) (f508b12)
+- **channels:** Decode an escaped backslash in shared contacts. [#1310](https://github.com/n8n-io/nod/pull/1310) (35bb6a9)
+- **speech:** Keep voice preview audio attached to the document. [#1365](https://github.com/n8n-io/nod/pull/1365) (2e1c422)
+
+### Performance
+
+- **self-host:** Stop compressing the bundle archive a second time. [#1429](https://github.com/n8n-io/nod/pull/1429) (ee2768c)
+- **ci:** Build self-host bundle images with the runner's local layer cache. [#1412](https://github.com/n8n-io/nod/pull/1412) (55718ee)
+- **ci:** Stop tests sleeping through real-time windows and run more files at once. [#1379](https://github.com/n8n-io/nod/pull/1379) (94894af)
+- **apps:** Load MCP tools with their guide in one step and fetch tool lists at startup. [#1370](https://github.com/n8n-io/nod/pull/1370) (24bd1b0)
+
+### Documentation
+
+- **readme:** Link section titles to their sections. [#1272](https://github.com/n8n-io/nod/pull/1272) (33c0b8e)
+- **apps:** List every CLI environment name ending Nod accepts. [#1280](https://github.com/n8n-io/nod/pull/1280) (4ce8f23)
+
+<details>
+<summary>Maintenance (25 changes)</summary>
+
+- **deps-dev:** Bump vitest from 5.1.0 to 5.1.1. [#1418](https://github.com/n8n-io/nod/pull/1418) (b180364)
+- **deps:** Bump @fastify/rate-limit from 11.2.0 to 11.2.2. [#1423](https://github.com/n8n-io/nod/pull/1423) (e63bdf3)
+- **deps:** Bump libphonenumber-js from 1.13.15 to 1.13.17. [#1422](https://github.com/n8n-io/nod/pull/1422) (6095ae9)
+- **deps-dev:** Bump emoji-picker-react from 4.22.3 to 5.1.4. [#1415](https://github.com/n8n-io/nod/pull/1415) (2fd75e9)
+- **deps:** Bump tldts from 7.4.24 to 7.5.5. [#1421](https://github.com/n8n-io/nod/pull/1421) (6eef391)
+- **deps:** Bump @fastify/multipart from 10.1.7 to 10.1.9. [#1420](https://github.com/n8n-io/nod/pull/1420) (50f4550)
+- **deps-dev:** Bump @vitejs/plugin-react from 6.1.2 to 6.3.0. [#1419](https://github.com/n8n-io/nod/pull/1419) (d4f61c1)
+- **deps-dev:** Bump @napi-rs/canvas from 1.1.0 to 1.1.1. [#1417](https://github.com/n8n-io/nod/pull/1417) (479557e)
+- **deps:** Bump jose from 6.2.17 to 6.2.18. [#1416](https://github.com/n8n-io/nod/pull/1416) (aa5a2d3)
+- **deps:** Bump @fastify/static from 10.1.7 to 10.1.12. [#1414](https://github.com/n8n-io/nod/pull/1414) (fa9cc28)
+- **deps:** Bump @composio/core to 0.30.0 and @composio/client to 2.1.33. [#1407](https://github.com/n8n-io/nod/pull/1407) (81139f0)
+- **deps-dev:** Bump bun from 1.4.4 to 1.4.5. [#1406](https://github.com/n8n-io/nod/pull/1406) (d21e154)
+- **deps-dev:** Bump jsdom from 30.1.3 to 31.0.1. [#1403](https://github.com/n8n-io/nod/pull/1403) (8f32101)
+- **deps:** Bump pg-boss from 12.38.0 to 12.38.2. [#1402](https://github.com/n8n-io/nod/pull/1402) (99a3bb3)
+- **deps-dev:** Bump posthog-js from 1.438.5 to 1.453.0. [#1401](https://github.com/n8n-io/nod/pull/1401) (ae18894)
+- **deps:** Bump @pedrobef/vozz from 0.2.7 to 0.3.0. [#1400](https://github.com/n8n-io/nod/pull/1400) (091f49b)
+- **deps:** Bump the chat-sdk group across 1 directory with 4 updates. [#1397](https://github.com/n8n-io/nod/pull/1397) (5347861)
+- **deps:** Bump the docs group across 1 directory with 4 updates. [#1399](https://github.com/n8n-io/nod/pull/1399) (9856b0a)
+- **deps:** Bump the actions group across 1 directory with 2 updates. [#1393](https://github.com/n8n-io/nod/pull/1393) (4224740)
+- **deps:** Bump actions/cache/restore from 4.3.0 to 6.1.0. [#1395](https://github.com/n8n-io/nod/pull/1395) (4d7d080)
+- **deps:** Bump actions/cache/save from 4.3.0 to 6.1.0. [#1394](https://github.com/n8n-io/nod/pull/1394) (5ef3d61)
+- **deps:** Bump tar from 7.5.22 to 7.5.23. [#1405](https://github.com/n8n-io/nod/pull/1405) (b121646)
+- **deps-dev:** Bump the tiptap group across 1 directory with 9 updates. [#1396](https://github.com/n8n-io/nod/pull/1396) (0ff9531)
+- **url-guards:** Cover the browser proxy refusing a WebSocket upgrade to a private destination. [#1161](https://github.com/n8n-io/nod/pull/1161) (4f3f6ab)
+- Bump tldts to 7.4.24 and preserve hostname redaction. [#1274](https://github.com/n8n-io/nod/pull/1274) (5567564)
+
+</details>
+
+[Full changelog](https://github.com/n8n-io/nod/compare/nod-v0.9.2...552d017fff511550f4b3a9f9151aa9ccc4d632c5)
+
+<details>
+<summary>Build details</summary>
+
+Source: `552d017fff511550f4b3a9f9151aa9ccc4d632c5`
+Previous release: `nod-v0.9.2`
+
+</details>
+
+## 0.9.2 - 2026-11-22
+
+### Features
+
+- **flights:** Find flights in seconds with a Google Flights tool. [#1304](https://github.com/n8n-io/nod/pull/1304) (3107b65)
+- **clarity:** Always show what Nod is working on, so it feels faster. [#1264](https://github.com/n8n-io/nod/pull/1264) (6531747)
+
+### Fixes
+
+- **chat:** Just do short app work, run schedules when started and show approvals once. [#1362](https://github.com/n8n-io/nod/pull/1362) (5336545)
+- **local-files:** Move folders across drives on Windows. [#1349](https://github.com/n8n-io/nod/pull/1349) (e702f98)
+- **models:** Wrap a connection's buttons below its details when space runs out. [#1360](https://github.com/n8n-io/nod/pull/1360) (234ca01)
+- **runtime:** Drop the leftover "No subagents." from the prompt. [commit](https://github.com/n8n-io/nod/commit/1b42e689a814a4acff13f0aff7d32070214f109a) (1b42e68)
+- **tasks:** Keep each task on the request it serves, and fix four basics found under stress. [#1347](https://github.com/n8n-io/nod/pull/1347) (7a45f1c)
+- **models:** Keep reasoning\_effort for Ollama boolean thinking. [commit](https://github.com/n8n-io/nod/commit/42adb858fd445378b3aaed64e8dfca857f320054) (42adb85)
+- **cards:** Mark noted seats, clean chart labels and state the live check-in cost. [#1300](https://github.com/n8n-io/nod/pull/1300) (4a8e91b)
+- **language:** Align the language rule, labels and docs after review. [#1299](https://github.com/n8n-io/nod/pull/1299) (e7f5519)
+- **tasks:** Run outside work in its own task and close stale questions. [#1293](https://github.com/n8n-io/nod/pull/1293) (c7ff621)
+- **chat:** Don't repeat a task's question or result on its chat line. [#1297](https://github.com/n8n-io/nod/pull/1297) (8673dfc)
+- **language:** Keep everything Nod shows in the conversation's language. [#1295](https://github.com/n8n-io/nod/pull/1295) (3de25be)
+- **chat:** Deliver results with their card and tidy result cards. [#1289](https://github.com/n8n-io/nod/pull/1289) (1cf59be)
+- **runtime:** Act on stated choices instead of asking to confirm them. [#1287](https://github.com/n8n-io/nod/pull/1287) (a913aec)
+- **approvals:** Name what a browser step commits to in its question. [#1286](https://github.com/n8n-io/nod/pull/1286) (73e2243)
+- **web:** Show the HTTP status and reason when connecting to a server fails. [#1234](https://github.com/n8n-io/nod/pull/1234) (080d3d3)
+- **desktop:** Keep the cause when the server connection check fails. [#1046](https://github.com/n8n-io/nod/pull/1046) (31b057e)
+- **channels:** Keep the Telegram reply and show the reason when a file is refused. [#1045](https://github.com/n8n-io/nod/pull/1045) (d736bd9)
+- **apps:** Record expired app sign-ins and name their step correctly. [#1128](https://github.com/n8n-io/nod/pull/1128) (c54f021)
+- **memory:** Save standing rules in settings instead of memory notes. [#1275](https://github.com/n8n-io/nod/pull/1275) (1813519)
+- **apps:** End only the stopped MCP call on a shared connection. [#1110](https://github.com/n8n-io/nod/pull/1110) (9e637e8)
+- **chat:** Don't offer a bug report when a model reply is cut off. [#1071](https://github.com/n8n-io/nod/pull/1071) (59e0112)
+- **feedback:** Let a bug report be sent again after a rejected attempt. [#1059](https://github.com/n8n-io/nod/pull/1059) (1fe476f)
+- **channels:** Do not post an empty text body on WhatsApp Cloud before a reply with no text. [#1043](https://github.com/n8n-io/nod/pull/1043) (5420a4e)
+- **chat:** Insert a new line on Return on touch keyboards. [#1248](https://github.com/n8n-io/nod/pull/1248) (c96630c)
+- **apps:** Allow encoded slashes and percents in API paths without allowing traversal. [#1090](https://github.com/n8n-io/nod/pull/1090) (cb7929c)
+- **apps:** Cap joined OAuth scopes at 500 characters in the app format. [#1088](https://github.com/n8n-io/nod/pull/1088) (05d160b)
+- **server:** Run afterRollback callbacks when a transaction aborts before commit. [#1260](https://github.com/n8n-io/nod/pull/1260) (7a8d0d5)
+- **workspace:** Name the time or output limit a command hit. [#1086](https://github.com/n8n-io/nod/pull/1086) (780ad49)
+- **channels:** Send Telegram voice, contact and location replies with allow\_sending\_without\_reply. [#1042](https://github.com/n8n-io/nod/pull/1042) (a833e5c)
+- **apps:** Discard an owned connected account when its sign-in check fails. [#1169](https://github.com/n8n-io/nod/pull/1169) (2ebe201)
+
+### Performance
+
+- **prompt:** Cut Nod's context by a third and stop resending it every turn. [#1353](https://github.com/n8n-io/nod/pull/1353) (d0e4d57)
+
+### Documentation
+
+- **agents:** Keep AGENTS.md to the rules every change follows. [#1279](https://github.com/n8n-io/nod/pull/1279) (3ae7479)
+- **n8n:** Distinguish MCP tokens from REST API keys. [#1262](https://github.com/n8n-io/nod/pull/1262) (4522ab2)
+
+<details>
+<summary>Maintenance (1 changes)</summary>
+
+- **e2e:** Run the real Nod with a scripted model on every change. [#1348](https://github.com/n8n-io/nod/pull/1348) (929f9d6)
+
+</details>
+
+[Full changelog](https://github.com/n8n-io/nod/compare/nod-v0.9.1...d0e4d57b29bb0eeeb720f443b8d48efadb0168ff)
+
+<details>
+<summary>Build details</summary>
+
+Source: `d0e4d57b29bb0eeeb720f443b8d48efadb0168ff`
+Previous release: `nod-v0.9.1`
+
+</details>
+
+## 0.9.1 - 2026-11-20
+
+### Features
+
+- **web:** Restyle the sidebars and replace collapse-to-icons with hide and resize. [#1206](https://github.com/n8n-io/nod/pull/1206) (517d7f5)
+- **apps:** Rename custom MCP connections (LAB-1203). [commit](https://github.com/n8n-io/nod/commit/563ebc20d871f18cc849bb7afd6d097b6eb2bd48) (563ebc2)
+- **schedules:** Show live activity for scheduled runs (LAB-1287). [commit](https://github.com/n8n-io/nod/commit/8d4881276c911d2b0f00fc604185117e62fc2f4a) (8d48812)
+- **chat:** Link selected text when pasting a URL (LAB-1404). [#1196](https://github.com/n8n-io/nod/pull/1196) (2f744ab)
+
+### Fixes
+
+- **models:** Keep the HTTP status and reason when Google Vertex AI model discovery fails. [#1227](https://github.com/n8n-io/nod/pull/1227) (71a46bf)
+- **apps:** Refuse control characters in app display names. [#1075](https://github.com/n8n-io/nod/pull/1075) (a85e234)
+- **desktop:** Only update the title bar overlay on windows that have one. [#1158](https://github.com/n8n-io/nod/pull/1158) (edca30b)
+- **trust:** Treat a saved sign-in use as never a read. [#1266](https://github.com/n8n-io/nod/pull/1266) (376cc1c)
+- **schedules:** Reject time zones the rest of the app cannot format. [#1159](https://github.com/n8n-io/nod/pull/1159) (d9e73c7)
+- **apps:** Name a missing MCP server instead of reporting a wrong type. [#1094](https://github.com/n8n-io/nod/pull/1094) (33c3014)
+- **memory:** Keep notes that differ only in Devanagari vowel signs. [#1219](https://github.com/n8n-io/nod/pull/1219) (0b26ed0)
+- **apps:** Refuse connected CLI arguments with a null byte. [#1082](https://github.com/n8n-io/nod/pull/1082) (62c0cd8)
+- **trust:** Never treat opening a file or signing in as a read. [#1265](https://github.com/n8n-io/nod/pull/1265) (8ac789f)
+- **docs:** Keep list items and quoted paragraphs apart in docs search. [#1173](https://github.com/n8n-io/nod/pull/1173) (f2fdefb)
+- **onboarding:** Ignore the Enter that confirms an IME composition in Something else. [#1211](https://github.com/n8n-io/nod/pull/1211) (0e24a6e)
+- **desktop:** Keep comparisons and underscored names in notification previews. [#1216](https://github.com/n8n-io/nod/pull/1216) (ca6278d)
+- **desktop:** Pass AWS\_BEDROCK\_FORCE\_HTTP1 to the engine. [#1144](https://github.com/n8n-io/nod/pull/1144) (f11599a)
+- **onboarding:** Keep the brief after a link when masking links. [#1212](https://github.com/n8n-io/nod/pull/1212) (9962948)
+- **browser:** Ignore mouse side buttons in browser handoff. [#1214](https://github.com/n8n-io/nod/pull/1214) (d9dbaf0)
+- **apps:** Send Content-Type on connected API requests only with a body. [#1080](https://github.com/n8n-io/nod/pull/1080) (9967b93)
+- **local-files:** Keep a byte order mark when Nod edits a text file. [#1172](https://github.com/n8n-io/nod/pull/1172) (bd44ee8)
+- **speech:** Show the ElevenLabs reason when voices fail to load. [#1160](https://github.com/n8n-io/nod/pull/1160) (fcaeb4e)
+- **desktop:** Show the engine's status and reason when the Welcome choice is refused. [#1233](https://github.com/n8n-io/nod/pull/1233) (f37c323)
+- **schedules:** Keep an emoji whole when a run track title is shortened. [#1097](https://github.com/n8n-io/nod/pull/1097) (7f99b2d)
+- **apps:** Keep the connection service reason in the pause after a refused upload, enrollment or connect request. [#1221](https://github.com/n8n-io/nod/pull/1221) (1f4694a)
+- **channels:** Keep the HTTP status when a Telegram attachment download is refused. [#1232](https://github.com/n8n-io/nod/pull/1232) (b4eefe6)
+- **apps:** Keep the HTTP status when a connected app's file download is refused. [#1228](https://github.com/n8n-io/nod/pull/1228) (d3c449d)
+- **apps:** Trim pasted connector tokens again. [#1073](https://github.com/n8n-io/nod/pull/1073) (f3411a9)
+- **models:** Keep the service's reason when a model key's model list can't be loaded. [#1220](https://github.com/n8n-io/nod/pull/1220) (5795268)
+- **evals:** Re-prove the gate and keep it from going stale. [#1255](https://github.com/n8n-io/nod/pull/1255) (8e5df67)
+- **models:** Ask to reconnect when a provider rejects the key on a request. [#1250](https://github.com/n8n-io/nod/pull/1250) (8e8bbdf)
+- **models:** Preserve compatible server discovery errors. [#1247](https://github.com/n8n-io/nod/pull/1247) (96c86cc)
+- **desktop:** Preserve queued restart requests while installer runs. [commit](https://github.com/n8n-io/nod/commit/ba0700b708c2581e9ef41225a718940a2739791f) (ba0700b)
+- **workspace:** Explain how to check a named script. [#1241](https://github.com/n8n-io/nod/pull/1241) (b8bbf38)
+- **desktop:** Report startup failures without restarting the engine. [#1236](https://github.com/n8n-io/nod/pull/1236) (d7649a6)
+- **privacy:** Mask feedback from original data. [#1244](https://github.com/n8n-io/nod/pull/1244) (09a2fad)
+- **memory:** Accept a quote that differs only in curly or straight quote marks. [#1218](https://github.com/n8n-io/nod/pull/1218) (7713955)
+- **browser:** Route private frame clicks and keep refusal causes. [#1237](https://github.com/n8n-io/nod/pull/1237) (7473a45)
+- **vault:** Keep save and update failure reasons. [#1242](https://github.com/n8n-io/nod/pull/1242) (56ef6ed)
+- **trust:** Do not log stopped reviews as failures. [#1243](https://github.com/n8n-io/nod/pull/1243) (8d1f37f)
+- **trust:** Keep draft review after message edits. [#1235](https://github.com/n8n-io/nod/pull/1235) (7b6dfcb)
+- **tools:** Include all action choices in validation errors. [#1240](https://github.com/n8n-io/nod/pull/1240) (0e2d9a9)
+- **privacy:** Explain managed app data before sign-in. [#1230](https://github.com/n8n-io/nod/pull/1230) (d28d132)
+- **models:** Use the loaded Ollama context limit. [#1238](https://github.com/n8n-io/nod/pull/1238) (0db6d58)
+- **apps:** Close the connection browser attempt when an app sign-in is discarded. [#1168](https://github.com/n8n-io/nod/pull/1168) (fb8c0ce)
+- **runtime:** Preserve completed calls after a script failure. [#1229](https://github.com/n8n-io/nod/pull/1229) (208cd49)
+- **mail:** Keep bounded safety check failure details. [#1225](https://github.com/n8n-io/nod/pull/1225) (a182cdd)
+- **chat:** Keep state reads moving during server updates. [#1226](https://github.com/n8n-io/nod/pull/1226) (2d4af19)
+- **desktop:** Submit the Welcome choice once when the engine restarts during setup. [#1223](https://github.com/n8n-io/nod/pull/1223) (aa20ea4)
+- **channels:** Show approval buttons in Telegram (LAB-1520). [commit](https://github.com/n8n-io/nod/commit/f3e752a67b77a79d0bd5f0c177589114700ffe14) (f3e752a)
+- **chat:** Align the artifact file picker with its filename (LAB-1209). [commit](https://github.com/n8n-io/nod/commit/d0a8475d289b1df47215e06710ac2908feefc069) (d0a8475)
+- **chat:** Space file previews below reply text (LAB-1206). [commit](https://github.com/n8n-io/nod/commit/1ad13860d28396361fa4ced4ef61b32012f1d551) (1ad1386)
+- **models:** Forecast work at current model rates (LAB-1654). [commit](https://github.com/n8n-io/nod/commit/a9bf9adcf32632e2c1ec8d0b0f64cfb051974fae) (a9bf9ad)
+- Correct confirmation and saved-work failures. [commit](https://github.com/n8n-io/nod/commit/fda6784191cba946e636f3e48db4fdbe3a1f986c) (fda6784)
+- **traces:** Classify provider errors and preserve conversation IDs (LAB-1658). [#1199](https://github.com/n8n-io/nod/pull/1199) (83354df)
+- **evals:** Budget for cancelled memory requests (LAB-1401). [#1195](https://github.com/n8n-io/nod/pull/1195) (e2bcced)
+- **browser:** Explain invalid wait conditions (LAB-1500). [#1191](https://github.com/n8n-io/nod/pull/1191) (51a2ffe)
+- **browser:** Explain rejected snapshot selectors (LAB-1656). [#1190](https://github.com/n8n-io/nod/pull/1190) (614d1ba)
+- **traces:** Add usage joins, error types, and known costs (LAB-1658). [#1188](https://github.com/n8n-io/nod/pull/1188) (26fb141)
+- **activity:** Show each completed progress step once (LAB-1639). [#1189](https://github.com/n8n-io/nod/pull/1189) (a13c94a)
+- **pi:** Bound OpenRouter completion allowances (LAB-1607). [#1186](https://github.com/n8n-io/nod/pull/1186) (2ccf1ba)
+- **browser:** Resolve scrolled sign-in and action targets (LAB-1559). [#1183](https://github.com/n8n-io/nod/pull/1183) (af52e57)
+- **speech:** Report local pronunciation limits accurately (LAB-1547). [#1185](https://github.com/n8n-io/nod/pull/1185) (836d3ee)
+- **models:** Offer account-listed GPT-6.2 models (LAB-1647). [#1184](https://github.com/n8n-io/nod/pull/1184) (8a70880)
+- **desktop:** Keep WSL diagnostics out of runtime command results. [commit](https://github.com/n8n-io/nod/commit/0e1bf88d3b7cfbe34b7c4ef7f3eed741491aefbc) (0e1bf88)
+- **apps:** Show where to find the n8n MCP token. [#1126](https://github.com/n8n-io/nod/pull/1126) (c8a220a)
+- **desktop:** Gate update actions while Mac installer runs. [commit](https://github.com/n8n-io/nod/commit/b92d6d2e540b57a503552ef5819b96581ba22d3e) (b92d6d2)
+- **desktop:** Defer Mac update checks while ShipIt is running. [commit](https://github.com/n8n-io/nod/commit/0d4685100fb8230a8bc8473013e46b7e68be3145) (0d46851)
+
+### Documentation
+
+- **deploy:** Clarify public server bundle availability. [#1254](https://github.com/n8n-io/nod/pull/1254) (54f55a1)
+- Use the current names for renamed controls. [#1217](https://github.com/n8n-io/nod/pull/1217) (4ca90ba)
+- **get-started:** List Windows for source installs. [#1174](https://github.com/n8n-io/nod/pull/1174) (e8baf47)
+- Match release and CI facts to the code. [#1171](https://github.com/n8n-io/nod/pull/1171) (f8ed6f6)
+- **use:** Say automatic preparation is off by default and other apps are not polled. [#1157](https://github.com/n8n-io/nod/pull/1157) (71d2ed6)
+- **apps:** List OAuth sign-in for HTTP API access paths. [#1092](https://github.com/n8n-io/nod/pull/1092) (80bc626)
+- **desktop:** State the conditional first update check delay. [commit](https://github.com/n8n-io/nod/commit/4f36298d8e78c466dbe8f1fb4177031cd0f4a524) (4f36298)
+- **desktop:** Show where to switch servers (LAB-1414). [#1192](https://github.com/n8n-io/nod/pull/1192) (5c15757)
+
+### Other changes
+
+- Restyle the sidebars and replace collapse-to-icons with hide and resize. [#1267](https://github.com/n8n-io/nod/pull/1267) (554581e)
+
+<details>
+<summary>Maintenance (7 changes)</summary>
+
+- **url-guards:** Refuse a name when any of its DNS answers is private. [#1035](https://github.com/n8n-io/nod/pull/1035) (ea79f1a)
+- **trust:** Cut the trust layer to real commitments only. [#1251](https://github.com/n8n-io/nod/pull/1251) (74661c6)
+- **desktop:** Cover shared installer waits and restart checks. [commit](https://github.com/n8n-io/nod/commit/e0dd545a6c4c8d468a488f7b3554ede684e39514) (e0dd545)
+- **ci:** Record native app sign-in diagnostics. [#1245](https://github.com/n8n-io/nod/pull/1245) (b6686bb)
+- **desktop:** Verify update waits through the startup path. [commit](https://github.com/n8n-io/nod/commit/ce2733f72a9c10bb9226d986df7536cae1e72be1) (ce2733f)
+- Bump vite 8.3.5 → 8.3.7 (patch) in nod to clear 1 Aikido finding. [#1180](https://github.com/n8n-io/nod/pull/1180) (997adad)
+- **desktop:** Cover startup ShipIt update gating. [commit](https://github.com/n8n-io/nod/commit/e393579ec1b500a777cdf0971a56328dd5940cd3) (e393579)
+
+</details>
+
+[Full changelog](https://github.com/n8n-io/nod/compare/nod-v0.9.0...71a46bf5499efd6e24a5a8d33dd2d4b8a92f3079)
+
+<details>
+<summary>Build details</summary>
+
+Source: `71a46bf5499efd6e24a5a8d33dd2d4b8a92f3079`
+Previous release: `nod-v0.9.0`
+
+</details>
+
+## 0.9.0 - 2026-11-19
+
+### Features
+
+- **schedules:** Stop the current run without pausing future runs. [commit](https://github.com/n8n-io/nod/commit/533dab26319ca40ee2f824056722fcc854d41bb1) (533dab2)
+- Start a fresh chat with /clear (LAB-1360). [#1135](https://github.com/n8n-io/nod/pull/1135) (557a468)
+- **desktop:** Resume Windows downloads and install updates on quit. [#1113](https://github.com/n8n-io/nod/pull/1113) (74b36bd)
+
+### Fixes
+
+- Bind browser confirmations to current selections. [#1166](https://github.com/n8n-io/nod/pull/1166) (09dfedc)
+- **schedules:** Show complete checked instructions. [#1176](https://github.com/n8n-io/nod/pull/1176) (493c569)
+- **calendar:** Identify events before approval. [#1175](https://github.com/n8n-io/nod/pull/1175) (23b3716)
+- **desktop:** Keep password subtrees out of computer use focus and close review gaps. [commit](https://github.com/n8n-io/nod/commit/de4aa883afbaabf56232fc8692183581031c3e70) (de4aa88)
+- **privacy:** Explain data sharing by service. [#1164](https://github.com/n8n-io/nod/pull/1164) (2201eee)
+- **approvals:** Confirm explicit repeated actions. [#1152](https://github.com/n8n-io/nod/pull/1152) (30f7497)
+- **browser:** Start sign-in receipt wait after dispatch. [commit](https://github.com/n8n-io/nod/commit/eed3de9cd05a7e12f9b190b5e391a435e7b808cf) (eed3de9)
+- **files:** Fence unknown errors after a read starts. [commit](https://github.com/n8n-io/nod/commit/ed369d588205e985d08002f321d56737449410a9) (ed369d5)
+- **browser:** Inspect the control that receives a click. [commit](https://github.com/n8n-io/nod/commit/a8078d9cb8a0a0d125479c443a923bcb080d4235) (a8078d9)
+- **files:** Refuse stale read targets before opening. [commit](https://github.com/n8n-io/nod/commit/1c327a8cf231a0b2b869cd697e2399d83a012d5a) (1c327a8)
+- **files:** Keep failed opens available for a fresh read. [commit](https://github.com/n8n-io/nod/commit/c83d661015c0bd1f72b7136fcfcc1fe077c305ac) (c83d661)
+- **files:** Report a removed file during preparation. [commit](https://github.com/n8n-io/nod/commit/f8ac76f97642f481e0b381fe3865f055f67aa4ab) (f8ac76f)
+- **files:** Check import version before its size limit. [commit](https://github.com/n8n-io/nod/commit/343789c470bdfb0dcb4803c40bd21a67b98af598) (343789c)
+- **files:** Keep path check error details. [commit](https://github.com/n8n-io/nod/commit/cb166d7cc83a2aa4537a0b604fb5f6767ea23451) (cb166d7)
+- **files:** Recheck the path after an open file read. [commit](https://github.com/n8n-io/nod/commit/a05fe65ae4021492ff6d1bf3e415571b2ea702b0) (a05fe65)
+- **files:** Retain completed reads after stale questions expire. [commit](https://github.com/n8n-io/nod/commit/ec43a276ec15ef37a87944d2c53a8b2943bcd1e4) (ec43a27)
+- **files:** Preserve safe read outcomes and replay fences. [commit](https://github.com/n8n-io/nod/commit/29f11fae655bb4698d2e478ac2b3ec7589c995a3) (29f11fa)
+- **files:** Read the current file after an edit. [commit](https://github.com/n8n-io/nod/commit/479af449f3c086977dccabdefd4f09f1f8c760a3) (479af44)
+- **browser:** Retain page changes during private submission. [commit](https://github.com/n8n-io/nod/commit/89d2f9f4174c06c21297435b67a15d6d84ff87a1) (89d2f9f)
+- **browser:** Use the selected control name. [commit](https://github.com/n8n-io/nod/commit/0a3a377f9c633c24a43d2b9ba62b3ea42ebb5660) (0a3a377)
+- **browser:** Refuse unnamed point approvals. [commit](https://github.com/n8n-io/nod/commit/e1deaabffa2f1a533d80be3187088f4195046ea4) (e1deaab)
+- **browser:** Match native Enter key combinations. [commit](https://github.com/n8n-io/nod/commit/2f33476ce51ef990a1f0fc26fa5e9c717c6f950b) (2f33476)
+- **browser:** Inspect unidentified steps before approval. [commit](https://github.com/n8n-io/nod/commit/646fb18d2efbad3da6766c3622163e9e5ab8fec8) (646fb18)
+- **approvals:** Handle sentence marks and unmatched brackets. [commit](https://github.com/n8n-io/nod/commit/0c3054d74aaa970f4e34ca8a913e0950e7b63d14) (0c3054d)
+- **approvals:** Keep URL boundaries in confirmation questions. [commit](https://github.com/n8n-io/nod/commit/1b172624e617bd68951c88b9f1658a709431bb6f) (1b17262)
+- **approvals:** Review the visible confirmation text. [commit](https://github.com/n8n-io/nod/commit/477be9f275181ebdab0fd11461e93b8ed4727762) (477be9f)
+- **ui:** Start task and activity details closed. [commit](https://github.com/n8n-io/nod/commit/05b9c37e8dcc8b10cc96eabc46fe3e087d59a13e) (05b9c37)
+- **models:** Let cancellable reviews use provider deadlines. [commit](https://github.com/n8n-io/nod/commit/5312b884bb6d1943cb6b9fc00c52961bd41d9425) (5312b88)
+- **schedules:** Keep confirmed stop state during refresh races. [commit](https://github.com/n8n-io/nod/commit/b322a69ec1ae51ee182f2053d633516ed45e9d0e) (b322a69)
+- **usage:** Preserve completed results when usage writes fail. [commit](https://github.com/n8n-io/nod/commit/d062186885b15c1e5d2ce6e55ea2aed1c9bd517f) (d062186)
+- **approvals:** Keep the HTTP account fixed during review. [commit](https://github.com/n8n-io/nod/commit/10c9895e7e761a268af3e42408f8f7f9231dd66c) (10c9895)
+- **approvals:** Describe the exact HTTP request. [commit](https://github.com/n8n-io/nod/commit/4503cb5a621cffa4603702e7eb0e588a6b4c47d7) (4503cb5)
+- **approvals:** Describe the selected MCP tool. [commit](https://github.com/n8n-io/nod/commit/5594ab0f487694e11ffea5559a667f76b9b9396b) (5594ab0)
+- **browser:** Describe clicks without replay commands. [#1154](https://github.com/n8n-io/nod/pull/1154) (3ab125c)
+- **workspace:** Check command effects before execution. [#1150](https://github.com/n8n-io/nod/pull/1150) (08a2098)
+- **vault:** Match root and www login hosts (LAB-1579). [#1142](https://github.com/n8n-io/nod/pull/1142) (4c5a68d)
+- **approvals:** Keep confirmed action failure reasons (LAB-1355). [#1141](https://github.com/n8n-io/nod/pull/1141) (0a4fc60)
+- **desktop:** Show update failures and recovery controls (LAB-1570). [#1139](https://github.com/n8n-io/nod/pull/1139) (ea5a696)
+- **browser:** Keep private submission cancellable during validation (LAB-1417). [#1138](https://github.com/n8n-io/nod/pull/1138) (650da94)
+- **vault:** Keep safe browser reasons after private entry fails (LAB-1511). [#1133](https://github.com/n8n-io/nod/pull/1133) (b5f81d2)
+- **tasks:** Exclude withdrawn requests from resume prompts (LAB-1399). [#1131](https://github.com/n8n-io/nod/pull/1131) (7f7e594)
+- **vault:** Say why a control cannot be a sign-in choice (LAB-1510). [#1127](https://github.com/n8n-io/nod/pull/1127) (3030d9a)
+- **apps:** Refuse app actions the connection service does not offer (LAB-1453). [#1121](https://github.com/n8n-io/nod/pull/1121) (0d4f768)
+- **pi:** Keep send\_message loaded for small-context models (LAB-1394). [#1123](https://github.com/n8n-io/nod/pull/1123) (f8b7c29)
+- **desktop:** Ignore empty groups when binding a computer use step to its window. [commit](https://github.com/n8n-io/nod/commit/ac444426d322347dc44ffb6b8b1d49ac9abbf69e) (ac44442)
+- **desktop:** Trim only long lists in computer use checks and keep incomplete reads refused. [commit](https://github.com/n8n-io/nod/commit/11e6cf8c0dafa272f0a356fa21c821883d725190) (11e6cf8)
+- **browser:** Bind sign-in controls in frames and under overlays (LAB-1513). [#1124](https://github.com/n8n-io/nod/pull/1124) (8937f98)
+- **apps:** Keep one slow email check from stopping its read (LAB-1508). [#1125](https://github.com/n8n-io/nod/pull/1125) (40c7aa4)
+- **desktop:** Check long app windows by the items a computer step needs. [commit](https://github.com/n8n-io/nod/commit/cca88809e2751bd041b06941fceb4b15f8b5ae60) (cca8880)
+- Open waiting run questions in chat. [#904](https://github.com/n8n-io/nod/pull/904) (5a641cd)
+- Keep the original request when retrying a task. [#1114](https://github.com/n8n-io/nod/pull/1114) (f9f0739)
+- **models:** Show and change the current model in Manage. [#1117](https://github.com/n8n-io/nod/pull/1117) (4858b4c)
+- **desktop:** Remove retired files on Windows upgrade and name duplicate skills (LAB-1490). [#1122](https://github.com/n8n-io/nod/pull/1122) (046e0c3)
+- **desktop:** Check menu actions before the first window opens. [commit](https://github.com/n8n-io/nod/commit/ae7dbe4f3d68cdbef075c4327825c166a3734665) (ae7dbe4)
+- **desktop:** Bind computer actions to current window state. [commit](https://github.com/n8n-io/nod/commit/09fcc097c889db6092c14309e5bcedb442c7e876) (09fcc09)
+- **chat:** Keep strikethrough and bare addresses intact next to formatting (LAB-1509). [#1120](https://github.com/n8n-io/nod/pull/1120) (d5c99a9)
+- **chat:** Stop plain delimiters pairing with composer formatting (LAB-1473). [#1115](https://github.com/n8n-io/nod/pull/1115) (5788051)
+- **memory:** Say why a memory save kept nothing (LAB-1405). [#1107](https://github.com/n8n-io/nod/pull/1107) (897a140)
+- **desktop:** Keep every typed field in computer use checks and close fence gaps. [commit](https://github.com/n8n-io/nod/commit/b79be918f9a570c7404193c195f32f0a1471ea1b) (b79be91)
+- **desktop:** Check replaced text, typed sends and password fields in computer use. [commit](https://github.com/n8n-io/nod/commit/97a5670daa290a310d9db5acc4056335c0b886b6) (97a5670)
+- **desktop:** Give focus back to the owner's window after Stop. [commit](https://github.com/n8n-io/nod/commit/d517748207a4815b1aa28d436c8484aecf1f6586) (d517748)
+- **chat:** Keep formatting intact when plain text touches it (LAB-1406). [#1106](https://github.com/n8n-io/nod/pull/1106) (818d924)
+- **pi:** Keep the apps tool loaded for small-context models (LAB-1302). [#1108](https://github.com/n8n-io/nod/pull/1108) (2b0c335)
+- **apps:** Propose the regional MCP address for the owner's workspace (LAB-821). [#1112](https://github.com/n8n-io/nod/pull/1112) (dcf386b)
+- **desktop:** Show Stop while opening an app and tighten the computer use evals. [commit](https://github.com/n8n-io/nod/commit/faf329716e611fc4ec2dd9c97bde4ea3ebbc4aa3) (faf3297)
+- **apps:** Accept any MCP server name the server accepts (LAB-1196). [#1100](https://github.com/n8n-io/nod/pull/1100) (4c14dd7)
+- **apps:** Keep long MCP calls open while the server reports progress (LAB-1192). [#1109](https://github.com/n8n-io/nod/pull/1109) (e6d1f3c)
+- **desktop:** Stop running computer steps on Stop and address review feedback. [commit](https://github.com/n8n-io/nod/commit/a4518c95777f1b8cc7ee25d68ac2080a29eb5f4a) (a4518c9)
+- **chat:** Stop fast typing from tripping React's update limit (LAB-900). [#1105](https://github.com/n8n-io/nod/pull/1105) (ecdc69c)
+- **channels:** Reject reassigned WhatsApp sender IDs. [commit](https://github.com/n8n-io/nod/commit/219f97254425b0dbbead755814cff0fa941e6d72) (219f972)
+- **apps:** Show the service's reason when Notion or Linear sign-in fails (LAB-1402). [#1102](https://github.com/n8n-io/nod/pull/1102) (c44ea1f)
+- **desktop:** Ask the right permission question when opening apps and files. [commit](https://github.com/n8n-io/nod/commit/f2e38fa000b67797506733ffabb35eb8e6f54131) (f2e38fa)
+- **onboarding:** Greet only a chat the owner hasn't written in (LAB-1461). [#1103](https://github.com/n8n-io/nod/pull/1103) (b3d3e82)
+- **channels:** Use WhatsApp sender mapping updates (LAB-1437). [commit](https://github.com/n8n-io/nod/commit/9980ee3be3654879471cf46defc5baa3c784c3ad) (9980ee3)
+- **desktop:** Place the computer use glow in scaled pixels on Windows. [commit](https://github.com/n8n-io/nod/commit/d8eb6a89faffa4c5846b443661760df0afcdaedb) (d8eb6a8)
+
+### Performance
+
+- **onboarding:** Check model connections in the background. [commit](https://github.com/n8n-io/nod/commit/249119bdff3c1c2828ad1690914541326ca2bf8c) (249119b)
+
+### Documentation
+
+- **files:** Include copies in file change checks. [commit](https://github.com/n8n-io/nod/commit/b84fb768f4afe727363a375bd536bebb7dd9e0e5) (b84fb76)
+- **browser:** Name the steps that need an identified target. [commit](https://github.com/n8n-io/nod/commit/d841445faa9d9cbffa194ccc6848204df1f7d19a) (d841445)
+- **tasks:** Match guidance to closed work details. [commit](https://github.com/n8n-io/nod/commit/c57f9d3e2f21b83d55f2a1d7dc1552c9ad19eafc) (c57f9d3)
+- **approvals:** State which reviews use provider limits. [commit](https://github.com/n8n-io/nod/commit/a919c37b57ef83cf96c247812ffddd8fd7b68ae9) (a919c37)
+- **usage:** Include voice results in usage recovery. [commit](https://github.com/n8n-io/nod/commit/9d09d62e273967a12b7e8775b9c025d00e769693) (9d09d62)
+- **usage:** State the pending charge restart limit. [commit](https://github.com/n8n-io/nod/commit/e3105f952166d6708d5725d19c934c8fa1819a78) (e3105f9)
+- **desktop:** Write release highlights in plain words. [#1134](https://github.com/n8n-io/nod/pull/1134) (30b5d11)
+- Clarify documentation-only contribution workflow. [commit](https://github.com/n8n-io/nod/commit/6719c5379bdbea821bd73162524e3bd939f1e9b5) (6719c53)
+
+<details>
+<summary>Maintenance (13 changes)</summary>
+
+- Isolate manual proactive reads. [commit](https://github.com/n8n-io/nod/commit/4bcd9d9e14084ab213e527d2f633aa072da80821) (4bcd9d9)
+- **files:** Enable access in the read failure fixture. [commit](https://github.com/n8n-io/nod/commit/10af9137c08666d4d0ff7c13c9e359fa814f0a6a) (10af913)
+- **files:** Keep read failures uncertain after an attempt. [commit](https://github.com/n8n-io/nod/commit/95cea5321c96b95d7f677ab72401ae7d1754a1bc) (95cea53)
+- **files:** Use observed file revisions in race checks. [commit](https://github.com/n8n-io/nod/commit/11bc80c49c273fb97680750c91fbc5d28aa508b9) (11bc80c)
+- **files:** Record metadata for the concurrent write check. [commit](https://github.com/n8n-io/nod/commit/2c67d565056e3ad86a12b0167fb0f29c7fc3ef73) (2c67d56)
+- **browser:** Assert the exact confirmed command. [commit](https://github.com/n8n-io/nod/commit/76e8354e64bcfa1a1f135cd49bc8b6aedd9b6b1b) (76e8354)
+- **pi:** Select the active restart fixture session. [commit](https://github.com/n8n-io/nod/commit/8da1a4412a6f5bf4ac36e2cf5fb8398e5e4fd0a4) (8da1a44)
+- **approvals:** Require the exact MCP endpoint. [commit](https://github.com/n8n-io/nod/commit/3eac03a88e22cd96f03de79b46561a7dba2385f5) (3eac03a)
+- **approvals:** Cover Markdown file names. [commit](https://github.com/n8n-io/nod/commit/f2375ef9934c933ea98a0a892fec31c12a0f7bd1) (f2375ef)
+- **approvals:** Check rendered line and paragraph breaks. [commit](https://github.com/n8n-io/nod/commit/cd9710b3300e34fcdd2d5236adfc3a633932f76e) (cd9710b)
+- **approvals:** Check a refused HTTP request directly. [commit](https://github.com/n8n-io/nod/commit/bb219ec0aa1aa053f688957fc05ac474f850dcfc) (bb219ec)
+- **workspace:** Measure RTK at its protected path. [#1156](https://github.com/n8n-io/nod/pull/1156) (623eee9)
+- **whatsapp:** Reproduce dropped bot-mode messages. [commit](https://github.com/n8n-io/nod/commit/85712d1ae22ce4c7c4fddb35c3a21965b8eba770) (85712d1)
+
+</details>
+
+More commits are included; review the full Git history.
+[Full changelog](https://github.com/n8n-io/nod/compare/nod-v0.8.4...94fe4b57b42e3a046ac8c6514cab0aa423f95409)
+
+<details>
+<summary>Build details</summary>
+
+Source: `94fe4b57b42e3a046ac8c6514cab0aa423f95409`
+Previous release: `nod-v0.8.4`
+
+</details>
+
+## 0.8.4 - 2026-11-17
+
+### Features
+
+- **apps:** Support API and CLI community connectors. [#1034](https://github.com/n8n-io/nod/pull/1034) (cc81434)
+- **desktop:** Open the file menu when right-clicking a file in the preview panel (LAB-1129). [#1023](https://github.com/n8n-io/nod/pull/1023) (8cbfd3f)
+- **apps:** Add community connectors and contributor tools. [#1019](https://github.com/n8n-io/nod/pull/1019) (54a6b50)
+- **feedback:** Rename the feedback button to Report bug and offer it when Nod fails (LAB-1344). [#1001](https://github.com/n8n-io/nod/pull/1001) (7c794d4)
+- **apps:** Allow an owner-typed private MCP address in Connect MCP. [#911](https://github.com/n8n-io/nod/pull/911) (7f64c5f)
+- **analytics:** Record whether a clicked task card was learned or common (LAB-1348). [#998](https://github.com/n8n-io/nod/pull/998) (b3d9777)
+- **chat:** Show recent work in the activity line. [#994](https://github.com/n8n-io/nod/pull/994) (c025b64)
+
+### Fixes
+
+- **models:** Use another free port when ChatGPT sign-in can't open 1455 (LAB-1338). [#1020](https://github.com/n8n-io/nod/pull/1020) (71b98cd)
+- **apps:** Close sign-in expiry races at the 10-minute boundary (LAB-1255). [#1027](https://github.com/n8n-io/nod/pull/1027) (242f7cf)
+- **apps:** Show the service's reason when MCP sign-in can't start (LAB-1204). [#1026](https://github.com/n8n-io/nod/pull/1026) (b80d239)
+- **memory:** Save details an explicit remember request points back to (LAB-1357). [#1025](https://github.com/n8n-io/nod/pull/1025) (3a47f4d)
+- **apps:** Record where an expired app sign-in stopped (LAB-1255). [#1024](https://github.com/n8n-io/nod/pull/1024) (6d100a5)
+- **apps:** Remove the ambiguous plus from connected app cards (LAB-1200). [#1022](https://github.com/n8n-io/nod/pull/1022) (7318f39)
+- **apps:** Keep the connection service's reason and status when a file upload fails (LAB-1256). [#1012](https://github.com/n8n-io/nod/pull/1012) (9297b24)
+- **runtime:** Remove set\_status and improve request diagnostics. [commit](https://github.com/n8n-io/nod/commit/156c32520b25162c87f125d7474a3a1d6ed95359) (156c325)
+- **memory:** Keep line breaks in notes the owner writes (LAB-1301). [#1018](https://github.com/n8n-io/nod/pull/1018) (16f7d34)
+- **account:** Accept every local address the access check allows (LAB-1248). [#1010](https://github.com/n8n-io/nod/pull/1010) (518b79e)
+- **chat:** Save replies that name workspace paths Nod can't attach (LAB-1334). [#1015](https://github.com/n8n-io/nod/pull/1015) (ac08d71)
+- **apps:** Send a User-Agent on every remote MCP and API request (LAB-997). [#1013](https://github.com/n8n-io/nod/pull/1013) (9f8c319)
+- **activation:** Show setup failures and add Open chat after connection. [commit](https://github.com/n8n-io/nod/commit/93c7f96f5959cfc195d14fc58703d56bb9fb209c) (93c7f96)
+- **chat:** Recover after terminal context errors. [#1009](https://github.com/n8n-io/nod/pull/1009) (c1e186e)
+- **pi:** Read streamed content part arrays as answer text (LAB-968). [#1014](https://github.com/n8n-io/nod/pull/1014) (2bc0a9f)
+- **chat:** Leave large earlier tool results out of a cold request (LAB-1211). [#995](https://github.com/n8n-io/nod/pull/995) (001b23f)
+- Name Settings screens from the shared page list. [#962](https://github.com/n8n-io/nod/pull/962) (62a9a7f)
+- **trust:** Match quotes that differ from the owner's words only in accents (LAB-1038). [#981](https://github.com/n8n-io/nod/pull/981) (3b4182f)
+- **analytics:** Show each survey only once (LAB-1214). [#1000](https://github.com/n8n-io/nod/pull/1000) (6e57923)
+
+### Performance
+
+- **pi:** Keep tools loaded earlier in a session for later turns (LAB-1169). [#993](https://github.com/n8n-io/nod/pull/993) (a04a751)
+
+<details>
+<summary>Maintenance (2 changes)</summary>
+
+- **desktop:** Remove the partial file when an artifact export fails. [#965](https://github.com/n8n-io/nod/pull/965) (dec58c7)
+- **url-guards:** Prove the pinned transport stops reading at its byte limit. [#964](https://github.com/n8n-io/nod/pull/964) (0813f46)
+
+</details>
+
+[Full changelog](https://github.com/n8n-io/nod/compare/nod-v0.8.3...cc81434d87b2ad15f7c2d0934c4ac6824c4db0fb)
+
+<details>
+<summary>Build details</summary>
+
+Source: `cc81434d87b2ad15f7c2d0934c4ac6824c4db0fb`
+Previous release: `nod-v0.8.3`
+
+</details>
+
+## 0.8.3 - 2026-11-17
+
+### Fixes
+
+- **proactivity:** Don't start automatic preparation on a model without a price. [#990](https://github.com/n8n-io/nod/pull/990) (357f34d)
+- **pi:** Remove duplicate context budgeting. [commit](https://github.com/n8n-io/nod/commit/3017a9448fc96cc1bf95f60eb370c143e79f53f6) (3017a94)
+- **browser:** Pace handoff frames to display. [commit](https://github.com/n8n-io/nod/commit/6cebf4f0941cdae2f2f40f7cdbf61a4720944ec7) (6cebf4f)
+- **apps:** Start the email check time limit when the check runs. [#976](https://github.com/n8n-io/nod/pull/976) (990285a)
+- **agent:** Balance feedback during long tasks. [#975](https://github.com/n8n-io/nod/pull/975) (47cfee3)
+- **workspace:** Recover after an uncertain command and keep long self-hosted commands open. [#972](https://github.com/n8n-io/nod/pull/972) (64dd140)
+- **channels:** Accept the owner's WhatsApp messages sent from a private ID. [#974](https://github.com/n8n-io/nod/pull/974) (48970da)
+- **browser:** Open a profile locked by a replaced browser container. [#973](https://github.com/n8n-io/nod/pull/973) (78d9fb6)
+- **desktop:** Skip expired system certificates. [#971](https://github.com/n8n-io/nod/pull/971) (f43c22e)
+- **desktop:** Restart from the update notice without asking again. [#970](https://github.com/n8n-io/nod/pull/970) (f89047f)
+- **pi:** Send tool schemas that match JSON Schema draft 2020-12. [#968](https://github.com/n8n-io/nod/pull/968) (c892150)
+- **apps:** Sign connection service requests again when the computer clock is off. [#967](https://github.com/n8n-io/nod/pull/967) (c4816b1)
+
+### Performance
+
+- **ci:** Share PR setup and stage platform release checks. [#980](https://github.com/n8n-io/nod/pull/980) (7c65518)
+
+<details>
+<summary>Maintenance (2 changes)</summary>
+
+- **pi:** Pin that a long turn extends each request unchanged until Pi compacts. [#991](https://github.com/n8n-io/nod/pull/991) (adc3c06)
+- **channels:** Pin the Telegram download size limits. [commit](https://github.com/n8n-io/nod/commit/f5e288ca0117276058329069714cec49a26319c6) (f5e288c)
+
+</details>
+
+[Full changelog](https://github.com/n8n-io/nod/compare/nod-v0.8.2...adc3c0603d4847603df3fe2c0b5e701af6a2c07c)
+
+<details>
+<summary>Build details</summary>
+
+Source: `adc3c0603d4847603df3fe2c0b5e701af6a2c07c`
+Previous release: `nod-v0.8.2`
+
+</details>
+
+## 0.8.2 - 2026-11-16
+
+### Features
+
+- **local-files:** Enable file access through chat approval. [#949](https://github.com/n8n-io/nod/pull/949) (d87da94)
+
+### Fixes
+
+- **desktop:** Install guest images atomically and recover first starts. [#913](https://github.com/n8n-io/nod/pull/913) (60598bd)
+- **channels:** Parse quoted contact card parameters. [#915](https://github.com/n8n-io/nod/pull/915) (1201345)
+- **desktop:** Separate account onboarding from device setup. [commit](https://github.com/n8n-io/nod/commit/bdec709de4698e9857946890b0a9bcb975728353) (bdec709)
+- **apps:** Count one connection service refusal per wait step. [commit](https://github.com/n8n-io/nod/commit/9fc4cc9d5f946f89ec276648f40da73e21eb1cc3) (9fc4cc9)
+- **models:** Recommend Gemini 4 Argon for Google. [#950](https://github.com/n8n-io/nod/pull/950) (866158b)
+- **pi:** Fit requests before context overflow. [#946](https://github.com/n8n-io/nod/pull/946) (48e853c)
+
+<details>
+<summary>Maintenance (1 changes)</summary>
+
+- **evals:** Add local files capability evals. [#941](https://github.com/n8n-io/nod/pull/941) (d4a1b6c)
+
+</details>
+
+[Full changelog](https://github.com/n8n-io/nod/compare/nod-v0.8.1...60598bd3cac73a5ea6bc3814cf28faf46e7aaf18)
+
+<details>
+<summary>Build details</summary>
+
+Source: `60598bd3cac73a5ea6bc3814cf28faf46e7aaf18`
+Previous release: `nod-v0.8.1`
+
+</details>
+
+## 0.8.1 - 2026-11-16
+
+### Fixes
+
+- **integrations:** Defer Gmail polling after proxy refusals. [#944](https://github.com/n8n-io/nod/pull/944) (b40b632)
+- **apps:** Include Cloudflare Ray ID on HTML 403s. [#943](https://github.com/n8n-io/nod/pull/943) (13cda50)
+- **schedules:** Skip watch polling for stale jobs. [#942](https://github.com/n8n-io/nod/pull/942) (7438960)
+- **apps:** Keep the connection service's status and code when an app connection can't start. [#877](https://github.com/n8n-io/nod/pull/877) (67298e9)
+
+<details>
+<summary>Maintenance (13 changes)</summary>
+
+- **deps:** Keep only the reviewed dependency changes. [commit](https://github.com/n8n-io/nod/commit/b72529fe8b78de0ef227c4bc0c8ca366100789aa) (b72529f)
+- **deps-dev:** Bump the tiptap group across 1 directory with 9 updates. [commit](https://github.com/n8n-io/nod/commit/1912c3220591e4c3eddb68c4b75637935485bf6a) (1912c32)
+- **deps:** Bump the docs group across 1 directory with 2 updates. [commit](https://github.com/n8n-io/nod/commit/c9dbec4c462966d93b09bfe91c8a448c7a09e1ac) (c9dbec4)
+- **deps-dev:** Bump the tailwindcss group across 1 directory with 2 updates. [commit](https://github.com/n8n-io/nod/commit/74cf053714cf4d22cdd07173a460133971010b37) (74cf053)
+- **deps:** Bump the pi group across 1 directory with 2 updates. [commit](https://github.com/n8n-io/nod/commit/bfe15cf06bc560c01a22d83754260f2cfa8df49e) (bfe15cf)
+- **deps:** Bump posthog-node from 5.60.1 to 5.71.0. [commit](https://github.com/n8n-io/nod/commit/e27b383249d9fe87dc0f8b313cade6a4c2ec4a18) (e27b383)
+- **deps:** Bump parse5 from 8.0.1 to 8.1.1. [commit](https://github.com/n8n-io/nod/commit/bbd9c57c51ea9dcd9f46ad62fc9612cb8b3683d9) (bbd9c57)
+- **deps:** Bump dotenv from 18.0.9 to 18.0.10. [commit](https://github.com/n8n-io/nod/commit/e40879fef970804d481fdfb89ad2fd2f4f546850) (e40879f)
+- **deps-dev:** Bump unist-util-visit from 5.1.0 to 5.2.0. [commit](https://github.com/n8n-io/nod/commit/5f78872989e2b581456ef8211191234e112e0da9) (5f78872)
+- **deps-dev:** Bump lucide-react from 1.61.0 to 1.72.0. [commit](https://github.com/n8n-io/nod/commit/cb3e81569b7928c3f2e1dbbff4279e48a7024da5) (cb3e815)
+- **deps:** Bump jose from 6.2.14 to 6.2.17. [commit](https://github.com/n8n-io/nod/commit/4ee956c645078241198f23a8f7796bab6a15d31f) (4ee956c)
+- **deps:** Bump peter-evans/create-pull-request. [commit](https://github.com/n8n-io/nod/commit/8155369f177f02cb501c829a2c7acc9fb0b3a421) (8155369)
+- **deps:** Bump rust in /. [commit](https://github.com/n8n-io/nod/commit/3def1e2bc084bd5210512716a22b3a5ff77e666c) (3def1e2)
+
+</details>
+
+[Full changelog](https://github.com/n8n-io/nod/compare/nod-v0.8.0...b40b6329e34a78f4f1628a741efb776950683fb1)
+
+<details>
+<summary>Build details</summary>
+
+Source: `b40b6329e34a78f4f1628a741efb776950683fb1`
+Previous release: `nod-v0.8.0`
+
+</details>
+
+## 0.8.0 - 2026-11-16
+
+### Features
+
+- **desktop:** Keep the computer awake while a local task runs. [commit](https://github.com/n8n-io/nod/commit/df4cd6015090b80f2970f2b00326b82a22222d7e) (df4cd60)
+- **models:** Choose a model for schedules, Nod's own work and each task. [#910](https://github.com/n8n-io/nod/pull/910) (7635ffd)
+- **chat:** Show which task or schedule a question belongs to and its progress. [#887](https://github.com/n8n-io/nod/pull/887) (49ac827)
+- **evals:** Add a model capability matrix and computer-use cases. [commit](https://github.com/n8n-io/nod/commit/7c5fffa2c68a7de78648d71f4a172fac2d3cfcbc) (7c5fffa)
+
+### Fixes
+
+- **backend:** Correct the NOD\_PUBLIC\_URL host checks and document the error. [#893](https://github.com/n8n-io/nod/pull/893) (e1cf299)
+- **models:** Recover from failing model connections without guessing at error text. [#912](https://github.com/n8n-io/nod/pull/912) (27f202c)
+- **chat:** Guide users to a first useful task. [commit](https://github.com/n8n-io/nod/commit/cfa92109461c2efcc6aa12f1297f29f38b8b2abf) (cfa9210)
+- **pi:** Use native context recovery. [commit](https://github.com/n8n-io/nod/commit/d40be9c247872f819da7d0b8152564ed58bfaa5c) (d40be9c)
+- **apps:** Mark a write as not run when the connection service refuses session create. [#907](https://github.com/n8n-io/nod/pull/907) (15397ab)
+- **models:** Handle partial metadata across compatible servers. [commit](https://github.com/n8n-io/nod/commit/f41c721e2c1a0b2a8d27779ae2727f3d30946cf9) (f41c721)
+- **models:** Treat OpenAI-compatible servers as Ollama only when /api…. [commit](https://github.com/n8n-io/nod/commit/73f5b7eb0d94ae9693ffc0eefc43c6512228cc1f) (73f5b7e)
+- **local-files:** Attach a local file when the owner asks to see it. [#901](https://github.com/n8n-io/nod/pull/901) (3813cd6)
+- **deps:** Override vulnerable adm-zip to 0.6.1. [commit](https://github.com/n8n-io/nod/commit/ee7c178517cd8a846e2a266d8d73ee59d16bf921) (ee7c178)
+- **trust:** Preserve owner instructions across schedule updates. [#888](https://github.com/n8n-io/nod/pull/888) (9be6b24)
+- **deps:** Update vulnerable transitive dependencies. [commit](https://github.com/n8n-io/nod/commit/fb1cacd07cdb177be6783e561e48a6259aa7df72) (fb1cacd)
+- **local-files:** Expand \~ to the home folder in file paths. [#889](https://github.com/n8n-io/nod/pull/889) (b2c6f5d)
+- **deps:** Update HTTP dependencies for DEVP-1541. [commit](https://github.com/n8n-io/nod/commit/526ba31acbf6080dfafd9a6aa8a21de7d32fdb35) (526ba31)
+- **desktop:** Move the preview note below the server link on the welcome screen. [#886](https://github.com/n8n-io/nod/pull/886) (f77f9b2)
+- **apps:** Back off connection service reads after a rate limit. [commit](https://github.com/n8n-io/nod/commit/ac8854aceea1a7e1e5d6b14f5f8069a5750f50dd) (ac8854a)
+
+<details>
+<summary>Maintenance (1 changes)</summary>
+
+- **deps:** Bump undici to 7.30.2. [commit](https://github.com/n8n-io/nod/commit/f6400141f7c00223d59bdcd3f042ec935530aa00) (f640014)
+
+</details>
+
+[Full changelog](https://github.com/n8n-io/nod/compare/nod-v0.7.6...e1cf299e14a83973ec665ead9404b99bf4ab969b)
+
+<details>
+<summary>Build details</summary>
+
+Source: `e1cf299e14a83973ec665ead9404b99bf4ab969b`
+Previous release: `nod-v0.7.6`
+
+</details>
+
+## 0.7.6 - 2026-11-13
+
+### Features
+
+- **desktop:** Add font size controls to appearance settings. [#868](https://github.com/n8n-io/nod/pull/868) (5b9e1b2)
+- **tasks:** Show workspace commands in Usage and CSV exports. [#830](https://github.com/n8n-io/nod/pull/830) (d978807)
+- **proactivity:** Skip idle work and batch changes through quiet hours. [commit](https://github.com/n8n-io/nod/commit/842becde0adeac0fcb3eabfb8b813deeb0efdffc) (842becd)
+
+### Fixes
+
+- **integrations:** Recover Gmail polling after transient proxy errors. [#875](https://github.com/n8n-io/nod/pull/875) (3ab2f07)
+- **composio:** Preserve catalog proxy failures (LAB-983). [#874](https://github.com/n8n-io/nod/pull/874) (76ecbb2)
+- Trust system certificates in desktop engine (LAB-983). [#873](https://github.com/n8n-io/nod/pull/873) (675886f)
+- **approvals:** Restore clear questions and action labels. [#864](https://github.com/n8n-io/nod/pull/864) (9b82c5f)
+- Fit onboarding window to screen and clean up chat UI. [#863](https://github.com/n8n-io/nod/pull/863) (a239b50)
+- **sign-in:** Keep fresh method choices open for 30 minutes. [#869](https://github.com/n8n-io/nod/pull/869) (5ac5f3d)
+- **proactivity:** Stagger periodic checks by installation. [#870](https://github.com/n8n-io/nod/pull/870) (3816f36)
+- **payments:** Clarify web approval and unblock unrelated chat. [#796](https://github.com/n8n-io/nod/pull/796) (cf362e5)
+
+### Documentation
+
+- Keep the cover shadow inside its frame and let the results heading wrap on phones. [commit](https://github.com/n8n-io/nod/commit/0889cc0283203149d34670a559fd6c92b6ac868e) (0889cc0)
+- Restore the results heading with the test run count. [commit](https://github.com/n8n-io/nod/commit/3f86e131519bee7ed1644e6d302adcc1fc756a0b) (3f86e13)
+- Match the README roadmap to the landing page. [commit](https://github.com/n8n-io/nod/commit/63ebe1b38166c5daeebab90e66e79f37b1d7090f) (63ebe1b)
+- Use the new hero collage, add a shadow to the video cover and expand the video on play. [commit](https://github.com/n8n-io/nod/commit/742c08ca0d418789dbbfc0c56cbea7beb34b2c8c) (742c08c)
+- Keep the video poster visible while loading and honour reduced motion in the FAQ. [commit](https://github.com/n8n-io/nod/commit/d076b181451308149338520e59e5cd4a9a56e871) (d076b18)
+- Tighten the landing page hero and give the video cover more room. [commit](https://github.com/n8n-io/nod/commit/360e59719c2fb9986bd8dc163de53ea09d33e90e) (360e597)
+- Centre the memory and results sections, reorder the landing page and tighten the hero. [commit](https://github.com/n8n-io/nod/commit/2a7f152a900a7a1c5ac6e34c51b090f2f49e99f1) (2a7f152)
+- Rework the landing page footer and hero tag, and shrink the headline. [commit](https://github.com/n8n-io/nod/commit/212ca0d00516aef0482a327ddcf914843a7cfefe) (212ca0d)
+- Restyle the landing page header, use an app screenshot as the video cover and move the closing button onto the dot grid. [commit](https://github.com/n8n-io/nod/commit/555ad4a3cfa224c7a3aab12dacc98a12bdeef1e6) (555ad4a)
+- Self-host the landing page demo video and rework the memory, stats and roadmap sections. [commit](https://github.com/n8n-io/nod/commit/cd9045f1c9660f33cf15b7e46b3c1db07a4f2727) (cd9045f)
+- Polish the landing page stats, roadmap icons, links and FAQ. [commit](https://github.com/n8n-io/nod/commit/b1bd0ff3fa960e6ef7c2dec47df35be40d0e6420) (b1bd0ff)
+- Rework the landing page stats, headings and hero spacing. [commit](https://github.com/n8n-io/nod/commit/3abe57ff88ca84f403779a2dfe3d9d706630adbe) (3abe57f)
+- Rework the landing page header, hero and section order. [commit](https://github.com/n8n-io/nod/commit/cd83994564948a413a0563fbbb1d5ed0389e5315) (cd83994)
+- Simplify the landing page and add platform icons. [commit](https://github.com/n8n-io/nod/commit/e5d801b96f2b93e06f28a878075460d6fa6149d5) (e5d801b)
+- Match the landing page dot grid to the n8n site. [commit](https://github.com/n8n-io/nod/commit/52a323fd58abec0799669ab27fee8f0c66149538) (52a323f)
+- Polish the landing page FAQ. [commit](https://github.com/n8n-io/nod/commit/5d95a5ce11b392a8c4f30e40128061999c2731c0) (5d95a5c)
+
+[Full changelog](https://github.com/n8n-io/nod/compare/nod-v0.7.5...3ab2f076766bff409567ce850a2cb18bc5628dbf)
+
+<details>
+<summary>Build details</summary>
+
+Source: `3ab2f076766bff409567ce850a2cb18bc5628dbf`
+Previous release: `nod-v0.7.5`
+
+</details>
+
 ## 0.7.5 - 2026-11-13
 
 ### Features

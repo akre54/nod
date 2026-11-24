@@ -5,17 +5,26 @@ sidebar:
   order: 5
 ---
 
-Local files lets Nod work with files on your computer, for example to tidy your Downloads folder, rename invoices by their content or save a report it made next to your other documents. It works in the desktop app on macOS and Windows, and in the Linux Flatpak preview, with nothing to set up. A source install or a self-hosted server doesn't offer it.
+Local files lets Nod work with files on your computer. For example, ask it to organize Downloads, rename invoices, or save a report in Documents. It works in the desktop app on macOS and Windows, and in the Linux Flatpak preview. A source install or a self-hosted server does not offer it.
 
 ## Start with a request
 
-Open chat in the desktop app and tell Nod what to do. You do not need to add a folder in **Apps**.
+Open chat in the desktop app and tell Nod what to do. Local file access starts off. You do not need to open Settings first.
 
 - "List the files in my Downloads folder."
 - "Read invoice.pdf in Downloads and summarize it."
 - "Save this report as report.md in Documents."
+- "Show me the screenshot on my Desktop." Nod copies it into its workspace and attaches it to the reply, so you can open its preview.
 
-If Nod asks for confirmation, review the file path and proposed action before you approve it.
+When access is off, Nod asks to turn it on in chat before it opens your files. Reply "yes" or select the approval button. Nod saves the setting, then continues your request. If you decline, access stays off.
+
+Work Nod starts on its own cannot request local file access. A schedule you create can ask you to enable access in chat.
+
+This setting covers allowed locations in your home folder and on external drives. It does not give access to one folder only. The file checks below still apply to each action.
+
+You can tell Nod to turn local file access on or off. You can also change **Local file access** in **Settings → Privacy & data**.
+
+If Nod asks for confirmation of a file action, review the file path and proposed action before you approve it.
 
 ## Where Nod can work
 
@@ -53,9 +62,15 @@ Nod works with your files only in work you started: a message you sent, a task t
 | Move          | Moves or renames up to 200 items at once, and never overwrites.                                     |
 | Trash         | Moves up to 200 items to the Trash or Recycle Bin, where you can restore them.                      |
 
-Each action goes through the same [trust check](/trust/approvals/) as an app action, with the real paths after links are followed. Listing a folder is a read and runs without asking. Opening a file, by reading it or copying it to Nod, needs your words: Nod opens a file you named or one in a folder you asked it to work on, and asks first before it opens one that only a file or message mentions. Nod asks before it writes, moves or trashes files your words don't cover.
+Each action goes through the same [trust check](/trust/approvals/) as an app action, with the real paths after links are followed. A path that is `~`, or starts with `~/` (`~\` on Windows), such as `~/Documents`, means your home folder. Listing a folder is a read and runs without asking. Opening a file, by reading it or copying it to Nod, needs your words: Nod opens a file you named or one in a folder you asked it to work on, and asks first before it opens one that only a file or message mentions. Nod asks before it writes, moves or trashes files your words don't cover.
 
 Nod never deletes a file outright. When it replaces or edits a file, the previous version goes to the Trash from its own place, so **Put Back** returns it there; if the Trash step fails, nothing changes. Nod marks files it writes, edits or copies from its workspace as downloaded when the system allows it, so macOS and Windows check them before they open.
+
+When Nod reads, copies or edits a file, it opens the file without following links where the system supports it, and the opened file must be the same one the check saw, or the action stops. Before a write, edit or move, Nod checks the target's folder again right before the change.
+
+Nod checks the file's identity, size and change times before and after an approved read or copy to Nod. If these checks detect a change, the action stops with an error. These checks depend on the file system: an outside edit with the same size and reported times can go undetected. A new read or copy checks the file again and asks for approval when your words do not cover it. A read or copy approved in an older Nod version may also stop and need a fresh check. Nod does not repeat a read or copy you refused, or one whose outcome is uncertain, in the same request.
+
+An input/output failure after reading starts can leave the result uncertain, even when no content reaches chat. Nod keeps the specific error and blocks another attempt in that request. Start a new request to try again.
 
 ## Limits
 

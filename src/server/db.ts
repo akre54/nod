@@ -11,9 +11,12 @@ function poolSize(value: string | undefined, fallback: number) {
   return size;
 }
 
-function createPool(config: pg.PoolConfig) {
+export function createPool(config: pg.PoolConfig) {
   const created = new pg.Pool({
     connectionTimeoutMillis: 10_000,
+    query_timeout: 30_000,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10_000,
     ...config,
   });
   created.on('error', (error) => logFailure('database_idle_error', error));
@@ -68,6 +71,8 @@ export async function initializeDatabase() {
     );
     CREATE UNIQUE INDEX IF NOT EXISTS threads_active_owner ON threads(owner_id) WHERE archived_at IS NULL;
     ALTER TABLE threads ADD COLUMN IF NOT EXISTS observer_session_id uuid NOT NULL DEFAULT gen_random_uuid();
+    ALTER TABLE threads ADD COLUMN IF NOT EXISTS chat_restarted_at timestamptz;
+    ALTER TABLE threads ADD COLUMN IF NOT EXISTS chat_cleared_at timestamptz;
     CREATE TABLE IF NOT EXISTS turns (
       id uuid PRIMARY KEY, owner_id text NOT NULL, thread_id uuid NOT NULL REFERENCES threads(id),
       session_id uuid NOT NULL, source text NOT NULL, source_id text, message_id uuid, prompt text NOT NULL,
@@ -80,7 +85,10 @@ export async function initializeDatabase() {
     ALTER TABLE turns ADD COLUMN IF NOT EXISTS proactive boolean NOT NULL DEFAULT false;
     ALTER TABLE turns ADD COLUMN IF NOT EXISTS start_after timestamptz;
     ALTER TABLE turns ADD COLUMN IF NOT EXISTS withdrawn boolean NOT NULL DEFAULT false;
+    ALTER TABLE turns ADD COLUMN IF NOT EXISTS context_exhausted boolean NOT NULL DEFAULT false;
+    ALTER TABLE turns ADD COLUMN IF NOT EXISTS outside_action_at timestamptz;
     CREATE INDEX IF NOT EXISTS turns_withdrawn_message ON turns(message_id) WHERE withdrawn;
+    CREATE INDEX IF NOT EXISTS turns_reaction_message ON turns(owner_id,message_id) WHERE starts_with(source_id,'reaction-reply:');
     CREATE OR REPLACE FUNCTION turns_session() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
       NEW.session_id := COALESCE(NEW.session_id, CASE WHEN NEW.background THEN NEW.id ELSE NEW.thread_id END);
       RETURN NEW;
@@ -97,10 +105,12 @@ export async function initializeDatabase() {
       summary text NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS turn_events_turn_time ON turn_events(turn_id,created_at);
+    CREATE INDEX IF NOT EXISTS turn_events_progress ON turn_events(turn_id,created_at,id) WHERE type IN ('step','steered');
     ALTER TABLE turn_events ADD COLUMN IF NOT EXISTS run_id uuid;
     ALTER TABLE turn_events ADD COLUMN IF NOT EXISTS parent_run_id uuid;
     ALTER TABLE turn_events ADD COLUMN IF NOT EXISTS session_id uuid;
     ALTER TABLE turn_events ADD COLUMN IF NOT EXISTS browser_id text;
+    ALTER TABLE turn_events ADD COLUMN IF NOT EXISTS detail text;
     ALTER TABLE turn_events ADD COLUMN IF NOT EXISTS call_id uuid;
     ALTER TABLE turn_events ADD COLUMN IF NOT EXISTS site text;
     ALTER TABLE turn_events ADD COLUMN IF NOT EXISTS command jsonb;
@@ -115,9 +125,15 @@ export async function initializeDatabase() {
       hidden_at timestamptz
     );
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_quote text;
+    CREATE TABLE IF NOT EXISTS feedback_drafts (
+      id uuid PRIMARY KEY, owner_id text NOT NULL, thread_id uuid NOT NULL,
+      summary text NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS feedback_drafts_thread ON feedback_drafts(owner_id,thread_id,created_at);
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS display_text text;
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_caption text;
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS suggestions jsonb;
+    CREATE INDEX IF NOT EXISTS messages_task_suggestions ON messages(thread_id) WHERE suggestions IS NOT NULL;
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS presentation jsonb;
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS answer_choices jsonb;
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS question_answer jsonb;
@@ -128,7 +144,7 @@ export async function initializeDatabase() {
     ALTER TABLE turns ADD COLUMN IF NOT EXISTS handoff_browser_id text;
     DROP INDEX IF EXISTS messages_hidden_thread;
     CREATE INDEX IF NOT EXISTS messages_hidden_thread_recent ON messages(owner_id,thread_id,hidden_at DESC,id DESC) WHERE hidden_at IS NOT NULL;
-    CREATE INDEX IF NOT EXISTS messages_owner_agent_reaction_time ON messages(owner_id,assistant_reacted_at DESC) WHERE assistant_reacted_at IS NOT NULL;
+    DROP INDEX IF EXISTS messages_owner_agent_reaction_time;
     CREATE TABLE IF NOT EXISTS approvals (
       id uuid PRIMARY KEY, owner_id text NOT NULL, thread_id uuid REFERENCES threads(id),
       turn_id uuid REFERENCES turns(id), execution_turn_id uuid REFERENCES turns(id),
@@ -138,9 +154,13 @@ export async function initializeDatabase() {
       confirmation_message_id uuid REFERENCES messages(id) ON DELETE SET NULL,
       result jsonb
     );
+    ALTER TABLE approvals ADD COLUMN IF NOT EXISTS instruction_change jsonb;
     ALTER TABLE approvals ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now(),
       ADD COLUMN IF NOT EXISTS expected_revision integer,
-      ADD COLUMN IF NOT EXISTS details jsonb;
+      ADD COLUMN IF NOT EXISTS details jsonb,
+      ADD COLUMN IF NOT EXISTS title text,
+      ADD COLUMN IF NOT EXISTS decline text,
+      ADD COLUMN IF NOT EXISTS card_question text;
     CREATE INDEX IF NOT EXISTS approvals_turn ON approvals(turn_id);
     CREATE INDEX IF NOT EXISTS approvals_execution_turn ON approvals(execution_turn_id);
     CREATE INDEX IF NOT EXISTS approvals_confirmation_message ON approvals(confirmation_message_id);
@@ -167,8 +187,12 @@ export async function initializeDatabase() {
     ALTER TABLE preferences ADD COLUMN IF NOT EXISTS proactive_paused boolean NOT NULL DEFAULT true;
     ALTER TABLE preferences ALTER COLUMN proactive_paused SET DEFAULT true;
     ALTER TABLE preferences ADD COLUMN IF NOT EXISTS local_keep_out text[] NOT NULL DEFAULT '{}';
+    ALTER TABLE preferences ADD COLUMN IF NOT EXISTS local_files_enabled boolean NOT NULL DEFAULT false;
+    ALTER TABLE preferences ADD COLUMN IF NOT EXISTS computer_use boolean NOT NULL DEFAULT false;
+    ALTER TABLE preferences ADD COLUMN IF NOT EXISTS computer_keep_out text[] NOT NULL DEFAULT '{}';
     CREATE INDEX IF NOT EXISTS messages_owner_time ON messages(owner_id,created_at);
     CREATE INDEX IF NOT EXISTS messages_thread_time ON messages(thread_id,created_at);
+    DROP TABLE IF EXISTS draft_instructions;
     CREATE INDEX IF NOT EXISTS messages_turn_time ON messages(turn_id,created_at);
     CREATE INDEX IF NOT EXISTS messages_attachments ON messages USING gin (attachments jsonb_path_ops);
     CREATE INDEX IF NOT EXISTS messages_text_search ON messages USING gin (to_tsvector('english',text));

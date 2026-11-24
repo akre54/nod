@@ -9,9 +9,16 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import type { Pool } from 'pg';
 import { Compile } from 'typebox/compile';
+import { validateToolArguments } from '@earendil-works/pi-ai';
 import { unified } from 'unified';
 import remarkParse from 'remark-parse';
-import { appConfirmation } from '../src/ports/agent.ts';
+import {
+  appConfirmation,
+  ContextLimitError,
+  ModelRequestError,
+  OutputLimitError,
+  ToolFailureError,
+} from '../src/ports/agent.ts';
 import type {
   Agent,
   AgentEvent,
@@ -24,12 +31,13 @@ import { createSkillLibrary } from '../src/providers/pi/skills.ts';
 import { createDocumentation } from '../src/server/documentation.ts';
 import { coreSkills } from '../src/runtime/prompt.ts';
 import { localResultTimes } from '../src/runtime/time-context.ts';
-import { personalActions, toolDefinitions } from '../src/runtime/tools.ts';
+import { memoryActions, nodActions, toolDefinitions } from '../src/runtime/tools.ts';
 import { createAgentRuntime } from '../src/runtime/index.ts';
 import {
   inlineAppResult,
   privateEmailResult,
   mailCheckText,
+  noMailCheck,
   type MailCheck,
 } from '../src/server/integration-result.ts';
 import { untrustedBlock } from '../src/shared/untrusted.ts';
@@ -46,6 +54,61 @@ import { sourceReadSchema } from '../src/shared/proactivity.ts';
 import { memoryObjectStore } from './fixtures/object-store.ts';
 import { createCommandRedactor, createErrorRedactor } from '../src/server/redaction.ts';
 import type { WorkspaceCommandRecord } from '../src/shared/execution.ts';
+
+test('only a terminal context failure requests a chat context restart', async (t) => {
+  for (const ending of [
+    'context',
+    'context-length',
+    'recovered',
+    'summary-access',
+    'quota',
+    'output',
+  ] as const)
+    await t.test(ending, async () => {
+      const run = () =>
+        fixture(async (_tools, emit) => {
+          emit({ type: 'message_start' });
+          if (ending === 'context-length' || ending === 'output') {
+            emit({
+              type: 'message_end',
+              status: 'incomplete',
+              contextExhausted: ending === 'context-length',
+            });
+            return;
+          }
+          emit({
+            type: 'error',
+            message:
+              ending === 'quota'
+                ? 'Synthetic quota exceeded.'
+                : 'Synthetic context window exceeded.',
+            contextExhausted: ending !== 'quota',
+          });
+          emit({ type: 'message_end', status: 'failed' });
+          if (ending === 'summary-access')
+            emit({ type: 'error', message: 'Compaction failed: HTTP 401 access denied.' });
+          if (ending === 'recovered') {
+            emit({ type: 'retry', model: 'Synthetic model', attempt: 1, attempts: 3 });
+            emit({ type: 'message_start' });
+            emit({ type: 'final', text: 'Synthetic recovered answer.' });
+            emit({ type: 'message_end', status: 'succeeded' });
+          }
+        });
+      if (ending === 'recovered') assert.equal((await run()).result.status, 'succeeded');
+      else
+        await assert.rejects(run, (error: unknown) => {
+          if (ending === 'context' || ending === 'context-length')
+            return error instanceof ContextLimitError;
+          if (ending === 'quota' || ending === 'summary-access')
+            return (
+              error instanceof ModelRequestError &&
+              !(error instanceof ContextLimitError) &&
+              error.message.includes(ending === 'quota' ? 'Synthetic quota exceeded.' : 'HTTP 401')
+            );
+          return error instanceof OutputLimitError && !(error instanceof ModelRequestError);
+        });
+    });
+});
 
 async function fixture(
   run: (
@@ -124,6 +187,23 @@ async function fixture(
     await runtime.dispose();
     await rm(directory, { recursive: true, force: true });
   }
+}
+
+function taskFixture(...[run, overrides = {}, runtimeOptions]: Parameters<typeof fixture>) {
+  return fixture(
+    run,
+    {
+      taskContext: {
+        id: randomUUID(),
+        title: 'Synthetic task',
+        brief: 'Do the synthetic task.',
+        doneWhen: 'The synthetic task is done.',
+        revision: 1,
+      },
+      ...overrides,
+    },
+    runtimeOptions,
+  );
 }
 
 async function call(tools: Map<string, AgentTool>, name: string, args: Record<string, unknown>) {
@@ -248,56 +328,63 @@ test('command output removes whole secrets before taking a bounded tail', async 
   assert.equal(records[5]?.output, '{"name":"password","value":"[redacted]"}');
 });
 
-test('live status stays out of chat replies and removes known secrets', async () => {
-  const events: Array<{ type: string; summary: string }> = [];
-  const statuses = ['Finding flights back from Copenhagen', 'Comparing flight prices'];
-  let delegated = false;
-  const result = await fixture(
-    async (tools, emit, options) => {
-      if (options.parentRunId) {
-        assert.equal(tools.has('set_status'), false);
-        delegated = true;
-        emit({ type: 'final', text: 'The synthetic flight comparison is complete.' });
-        return;
-      }
-      const status = tools.get('set_status')!;
-      assert.ok(status.eager, 'Live status must be available before tool discovery.');
-      for (const prompt of [options.systemPrompt, options.compactInstructions?.systemPrompt])
-        assert.ok(
-          prompt?.includes(status.name),
-          'Every model context needs the status capability.',
-        );
-      await call(tools, 'set_status', { text: statuses[0] });
-      await call(tools, 'set_status', { text: statuses[1] });
-      await call(tools, 'set_status', { text: 'Checking synthetic-private-code' });
-      await assert.rejects(call(tools, 'set_status', { text: ' '.repeat(3) }));
-      await assert.rejects(call(tools, 'set_status', { text: 'x'.repeat(141) }));
-      await call(tools, 'delegate', {
-        title: 'Check synthetic flights',
-        instruction: 'Compare the two synthetic flight options.',
-      });
-      emit({ type: 'final', text: 'Two flights meet your budget.' });
-    },
-    {
-      emit: async (type, summary) => {
-        events.push({ type, summary });
+test('partial delivery continues across app reads in chat and browser reads in saved tasks', async () => {
+  for (const task of [false, true]) {
+    const delivered: string[] = [];
+    const first = 'The public plan costs EUR 12 per seat. The account price is not checked yet.';
+    const final = 'Your account price is EUR 10 per seat, so keep your current plan.';
+    let reads = 0;
+    const { result, aborted } = await fixture(
+      async (tools, _emit, options) => {
+        if (task)
+          await call(tools, 'browser', { action: 'open', url: 'https://example.com/pricing' });
+        await call(tools, 'send_message', { text: first, intent: 'update' });
+        assert.deepEqual(delivered, [first]);
+        assert.equal(options.shouldStop(), false);
+        await call(tools, 'apps', {
+          action: 'READ_PLAN',
+          args: { plan_id: 'synthetic-plan' },
+        });
+        await call(tools, 'send_message', { text: final, intent: 'final' });
+        assert.equal(options.shouldStop(), true);
       },
-    },
-    { redactError: (text) => String(text).replaceAll('synthetic-private-code', '[redacted]') },
-  );
-  assert.equal(delegated, true);
-  assert.deepEqual(
-    events.filter(({ type }) => type === 'step').map(({ summary }) => summary),
-    [...statuses, 'Checking [redacted]'],
-  );
-  assert.deepEqual(result.replies, ['Two flights meet your budget.']);
-  assert.equal(result.result.status, 'succeeded');
-  await fixture(
-    async (tools) => {
-      assert.equal(tools.has('set_status'), false);
-    },
-    { background: true },
-  );
+      {
+        ...(task
+          ? {
+              background: true,
+              taskContext: {
+                id: randomUUID(),
+                title: 'Compare synthetic prices',
+                brief: 'Compare the public and account prices for the synthetic plan.',
+                doneWhen: 'Both prices are checked and the comparison is delivered.',
+                revision: 1,
+              },
+            }
+          : {}),
+        integration: async () => {
+          reads++;
+          assert.deepEqual(delivered, [first]);
+          return { pricePerSeat: 10, currency: 'EUR' };
+        },
+        reply: async (text) => {
+          delivered.push(text);
+        },
+      },
+      {
+        computer: fakeComputer({
+          act: async () => {
+            reads++;
+            assert.deepEqual(delivered, []);
+            return { url: 'https://example.com/pricing', text: 'EUR 12 per seat.' };
+          },
+        }),
+      },
+    );
+    assert.equal(reads, task ? 2 : 1);
+    assert.deepEqual(delivered, [first, final]);
+    assert.equal(result.status, 'succeeded');
+    assert.equal(aborted, false);
+  }
 });
 
 test('native visual replies need no filler and deduplicate only identical content', async () => {
@@ -976,10 +1063,17 @@ test('nested mail records receive separate checks on each read', async () => {
   const unchecked = (await privateEmailResult(input, async (emails) => {
     requests.push(emails);
     return [];
-  })) as typeof input;
+  })) as { contentWithheld: { emails: number }; result: typeof input };
   assert.equal(requests.length, 2);
   assert.deepEqual(requests[1], requests[0]);
-  assert.ok(unchecked.every((mail) => !('payload' in mail)));
+  assert.equal(unchecked.contentWithheld.emails, 2);
+  assert.ok(unchecked.result.every((mail) => !('payload' in mail)));
+  const spoofed = (await privateEmailResult(
+    { contentWithheld: 'nothing withheld', messages: input },
+    async () => [],
+  )) as { contentWithheld: { emails: number } };
+  assert.equal(Object.keys(spoofed)[0], 'contentWithheld');
+  assert.equal(spoofed.contentWithheld.emails, 2);
 });
 
 test('payload mail remains private when outer check text is truncated or its identity differs', async (t) => {
@@ -1070,7 +1164,7 @@ test('mail checks do not reuse a decision from an earlier read', async () => {
   });
   const emails = [{ from: 'fixture@example.test', subject: 'Notice', text: 'Synthetic notice.' }];
   assert.deepEqual(await check(emails), [false]);
-  assert.deepEqual(await check(emails), [undefined]);
+  assert.deepEqual(await check(emails), ['the check model request failed']);
   assert.equal(reads, 2);
 });
 
@@ -1093,7 +1187,10 @@ test('mail access requests preserve the full input and hide oversized records', 
       },
     },
   });
-  assert.deepEqual(await check(emails), [...Array<boolean>(11).fill(false), undefined]);
+  assert.deepEqual(await check(emails), [
+    ...Array<boolean>(11).fill(false),
+    'the email is too long to check',
+  ]);
   assert.equal(requests.length, 11);
 });
 
@@ -1112,7 +1209,7 @@ test('a failed or invalid decision hides its record without a second model', asy
         await check([
           { from: 'fixture@example.test', subject: 'Notice', text: 'Synthetic notice.' },
         ]),
-        [undefined],
+        ['the check model gave no valid answer'],
       );
     });
 });
@@ -1129,9 +1226,39 @@ test('single mail checks keep their provider contract and fail closed without a 
   };
   assert.deepEqual(await createMailCheck({ curator })([email]), [false]);
   assert.deepEqual(await createMailCheck({ curator: { ...curator, configured: false } })([email]), [
-    undefined,
+    'no model is available for the check',
   ]);
   assert.deepEqual(await createMailCheck({ curator })([]), []);
+  const leaky = (error: Error) =>
+    createMailCheck({
+      curator: {
+        ...curator,
+        async curate() {
+          throw error;
+        },
+      },
+    })([email]);
+  assert.deepEqual(await leaky(new Error('code 482913 at https://login.example.test/r?t=secret')), [
+    'the check model request failed',
+  ]);
+  assert.deepEqual(
+    await leaky(Object.assign(new Error('Synthetic secret 482913'), { status: 429 })),
+    ['the check model request failed (HTTP 429)'],
+  );
+  let calls = 0;
+  assert.deepEqual(
+    await createMailCheck({
+      curator: {
+        ...curator,
+        async curate() {
+          calls += 1;
+          if (calls === 1) throw new DOMException('Synthetic provider timeout', 'TimeoutError');
+          return { access: false };
+        },
+      },
+    })([email, email]),
+    ['the check model request failed', false],
+  );
 });
 
 test('queued mail checks preserve caller attribution, cancel without invoking providers and bound concurrency', async () => {
@@ -1174,7 +1301,10 @@ test('queued mail checks preserve caller attribution, cancel without invoking pr
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(observed, Array<string>(6).fill('first:first@example.test'));
   controller.abort();
-  assert.deepEqual(await cancelled, Array.from({ length: 100 }));
+  assert.deepEqual(
+    await cancelled,
+    Array<string>(100).fill('the read was stopped before its check finished'),
+  );
   assert.equal(observed.length, 6);
   pending.splice(0).forEach((finish) => finish());
   await new Promise((resolve) => setImmediate(resolve));
@@ -1186,15 +1316,98 @@ test('queued mail checks preserve caller attribution, cancel without invoking pr
   assert.deepEqual(await retained, Array<boolean>(20).fill(false));
   assert.equal(maximum, 6);
   assert.equal(active, 0);
-  assert.deepEqual(await check(second, AbortSignal.abort()), Array.from({ length: 20 }));
+  assert.deepEqual(
+    await check(second, AbortSignal.abort()),
+    Array<string>(20).fill('the read was stopped before its check finished'),
+  );
   assert.equal(observed.length, 26);
 });
 
-test('mail check timeout includes queued requests and does not wait for an unresponsive provider', async (t) => {
+test('slow mail checks keep only their own emails private while the model still answers the others', async (t) => {
+  const timers: AbortController[] = [];
+  t.mock.method(AbortSignal, 'timeout', () => {
+    const controller = new AbortController();
+    timers.push(controller);
+    return controller.signal;
+  });
+  const pending: Array<() => void> = [];
+  const check = createMailCheck({
+    curator: {
+      id: 'fixture',
+      configured: true,
+      curate: ({ input }) =>
+        new Promise((resolve) => {
+          const { email } = input as { email: { subject: string } };
+          if (email.subject !== 'Synthetic slow') pending.push(() => resolve({ access: false }));
+        }),
+    },
+  });
+  const emails = Array.from({ length: 42 }, (_, index) => ({
+    from: 'fixture@example.test',
+    subject: index % 6 ? 'Receipt' : 'Synthetic slow',
+    text: 'Synthetic receipt',
+  }));
+  const result = check(emails);
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  await settle();
+  for (let tick = 0; tick < 60; tick++) {
+    const started = timers.splice(0);
+    pending.splice(0).forEach((finish) => finish());
+    await settle();
+    for (const timer of started) timer.abort(new DOMException('Synthetic timeout', 'TimeoutError'));
+    await settle();
+  }
+  assert.deepEqual(
+    await result,
+    emails.map((_, index) =>
+      index % 6 ? false : 'the check model did not answer within 15 seconds',
+    ),
+  );
+});
+
+test('five mail check timeouts in a row do not stop a read whose sixth check is answered', async (t) => {
+  const timers: AbortController[] = [];
+  t.mock.method(AbortSignal, 'timeout', () => {
+    const controller = new AbortController();
+    timers.push(controller);
+    return controller.signal;
+  });
+  const pending: Array<() => void> = [];
+  const check = createMailCheck({
+    curator: {
+      id: 'fixture',
+      configured: true,
+      curate: () => new Promise((resolve) => pending.push(() => resolve({ access: false }))),
+    },
+  });
+  const result = check(
+    Array.from({ length: 12 }, () => ({
+      from: 'fixture@example.test',
+      subject: 'Receipt',
+      text: 'Synthetic receipt',
+    })),
+  );
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  await settle();
+  pending.splice(0, 5);
+  for (const timer of timers.slice(0, 5))
+    timer.abort(new DOMException('Synthetic timeout', 'TimeoutError'));
+  for (let tick = 0; tick < 20; tick++) {
+    await settle();
+    pending.splice(0).forEach((finish) => finish());
+  }
+  assert.deepEqual(await result, [
+    ...Array<string>(5).fill('the check model did not answer within 15 seconds'),
+    ...Array<boolean>(7).fill(false),
+  ]);
+});
+
+test('mail check timeouts in every slot stop the rest of the read without waiting for an unresponsive provider', async (t) => {
   const timeout = new AbortController();
+  let timers = 0;
   t.mock.method(AbortSignal, 'timeout', (duration: number) => {
     assert.equal(duration, 15_000);
-    return timeout.signal;
+    return timers++ < 6 ? timeout.signal : new AbortController().signal;
   });
   let called = 0;
   const pending: Array<() => void> = [];
@@ -1218,10 +1431,207 @@ test('mail check timeout includes queued requests and does not wait for an unres
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(called, 6);
   timeout.abort(new DOMException('Synthetic timeout', 'TimeoutError'));
-  assert.deepEqual(await result, Array.from({ length: 100 }));
-  pending.forEach((finish) => finish());
+  assert.deepEqual(await result, [
+    ...Array<string>(6).fill('the check model did not answer within 15 seconds'),
+    ...Array<string>(94).fill('the read was stopped before its check finished'),
+  ]);
+  const later = check([
+    { from: 'later@example.test', subject: 'Receipt', text: 'Synthetic receipt' },
+  ]);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(called, 6);
+  assert.equal(called, 7);
+  pending.forEach((finish) => finish());
+  assert.deepEqual(await later, [false]);
+});
+
+test('parallel thread reads check every message when checks queue longer than one check timeout', async (t) => {
+  let now = 0;
+  const timers: Array<{ at: number; controller: AbortController }> = [];
+  t.mock.method(AbortSignal, 'timeout', (duration: number) => {
+    const controller = new AbortController();
+    timers.push({ at: now + duration, controller });
+    return controller.signal;
+  });
+  const pending: Array<() => void> = [];
+  const check = createMailCheck({
+    curator: {
+      id: 'fixture',
+      configured: true,
+      curate: () => new Promise((resolve) => pending.push(() => resolve({ access: false }))),
+    },
+  });
+  const threads = Array.from({ length: 11 }, (_, thread) => ({
+    data: {
+      messages: Array.from({ length: 6 }, (_, index) => ({
+        messageId: `message-${thread}-${index}`,
+        threadId: `thread-${thread}`,
+        sender: 'colleague@example.test',
+        to: 'owner@example.test',
+        subject: `Synthetic project update ${thread}-${index}`,
+        messageText: `Synthetic body ${thread}-${index}`,
+      })),
+    },
+    error: null,
+    successful: true,
+  }));
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  const reads = Promise.all(threads.map((thread) => privateEmailResult(thread, check)));
+  await settle();
+  for (let tick = 0; tick < 40 && pending.length; tick++) {
+    now += 2_000;
+    for (const timer of timers)
+      if (timer.at <= now && !timer.controller.signal.aborted)
+        timer.controller.abort(new DOMException('Synthetic timeout', 'TimeoutError'));
+    await settle();
+    pending.splice(0).forEach((finish) => finish());
+    await settle();
+  }
+  const results = (await reads) as typeof threads;
+  const hidden = results.flatMap((result) =>
+    result.data.messages.filter((message) => !('messageText' in message)),
+  );
+  assert.equal(hidden.length, 0);
+  assert.deepEqual(results, threads);
+});
+
+test('an unchecked mail body stays private and the result names how many were withheld and why', async () => {
+  const body = 'Synthetic recovery link https://login.example.test/recover?token=fixture-482913';
+  const thread = {
+    data: {
+      messages: [
+        {
+          messageId: 'checked',
+          threadId: 'thread',
+          sender: 'colleague@example.test',
+          subject: 'Synthetic agenda',
+          messageText: 'Synthetic agenda body',
+        },
+        ...['refused', 'invalid'].map((messageId) => ({
+          messageId,
+          threadId: 'thread',
+          sender: 'login@example.test',
+          subject: 'Synthetic account notice',
+          messageText: body,
+        })),
+      ],
+    },
+    error: null,
+    successful: true,
+  };
+  let calls = 0;
+  const check = createMailCheck({
+    curator: {
+      id: 'fixture',
+      configured: true,
+      async curate() {
+        calls += 1;
+        if (calls === 2) throw new Error('Synthetic provider refusal: 429 Too Many Requests.');
+        return calls === 1 ? { access: false } : { access: 'unknown' };
+      },
+    },
+  });
+  const result = (await privateEmailResult(thread, check)) as {
+    contentWithheld: { emails: number; message: string };
+    data: { messages: Array<Record<string, unknown>> };
+    error: null;
+  };
+  assert.equal(JSON.stringify(result).includes(body), false);
+  assert.equal(JSON.stringify(result).includes('Synthetic account notice'), false);
+  assert.deepEqual(result.data.messages[0], thread.data.messages[0]);
+  assert.deepEqual(
+    result.data.messages.slice(1).map(({ messageId, threadId, sender }) => ({
+      messageId,
+      threadId,
+      sender,
+    })),
+    thread.data.messages.slice(1).map(({ messageId, threadId, sender }) => ({
+      messageId,
+      threadId,
+      sender,
+    })),
+  );
+  assert.equal(result.error, null);
+  assert.equal(Object.keys(result)[0], 'contentWithheld');
+  assert.equal(result.contentWithheld.emails, 2);
+  assert.match(result.contentWithheld.message, /the check model request failed/);
+  assert.doesNotMatch(result.contentWithheld.message, /Synthetic provider refusal/);
+  assert.match(result.contentWithheld.message, /no valid answer/);
+  const unavailable = (await privateEmailResult(thread, noMailCheck)) as typeof result;
+  assert.equal(JSON.stringify(unavailable).includes('Synthetic agenda body'), false);
+  assert.equal(unavailable.contentWithheld.emails, 3);
+  assert.match(unavailable.contentWithheld.message, /Mail checks are unavailable\./);
+  const checked = await privateEmailResult(thread.data.messages[0], async () => [false]);
+  assert.deepEqual(checked, thread.data.messages[0]);
+});
+
+test('skill actions keep their required fields and refuse fields from other actions', async () => {
+  const managed: Array<{ action: string; args: unknown }> = [];
+  await fixture(
+    async (tools) => {
+      const skill = tools.get('skills')!;
+      const valid: Array<Record<string, string>> = [
+        { action: 'list' },
+        { action: 'read', name: 'schedules-and-watches' },
+        {
+          action: 'save',
+          name: 'synthetic-procedure',
+          description: 'A verified synthetic procedure.',
+          body: 'Read the synthetic record.',
+        },
+        {
+          action: 'patch',
+          name: 'synthetic-procedure',
+          old: 'Read the synthetic record.',
+          new: 'Read the revised synthetic record.',
+        },
+      ];
+      for (const args of valid)
+        await skill.execute(
+          validateToolArguments(skill, {
+            type: 'toolCall',
+            id: randomUUID(),
+            name: skill.name,
+            arguments: args,
+          }),
+        );
+      assert.deepEqual(
+        managed.map(({ action }) => action),
+        ['skill_save', 'skill_patch'],
+      );
+      const invalid = [
+        {},
+        { action: 'schedule_create', args: {} },
+        ...valid.flatMap((args, index) => [
+          ...Object.keys(args).map((key) =>
+            Object.fromEntries(Object.entries(args).filter(([name]) => name !== key)),
+          ),
+          { ...args, extra: true },
+          { ...args, action: valid[(index + 1) % valid.length]!.action },
+        ]),
+      ];
+      for (const args of invalid) {
+        let parsed;
+        try {
+          parsed = validateToolArguments(skill, {
+            type: 'toolCall',
+            id: randomUUID(),
+            name: skill.name,
+            arguments: args,
+          });
+        } catch {
+          continue;
+        }
+        await assert.rejects(skill.execute(parsed), /Invalid skills input/);
+      }
+      assert.equal(managed.length, 2);
+    },
+    {
+      manage: async (action, args) => {
+        managed.push({ action, args });
+        return { saved: true };
+      },
+    },
+  );
 });
 
 test('skill reads cannot escape the trusted library or load workspace instructions', async () => {
@@ -1348,17 +1758,17 @@ test('documentation search ranks sections, bounds reads and cannot read files ou
   let calls = 0;
   await fixture(
     async (tools) => {
-      const read = tools.get('nod_docs')!;
+      const read = tools.get('nod')!;
       assert.ok(read.parallel);
-      const output = await read.execute({ action: 'read', id: results[0].id });
+      const output = await read.execute({ action: 'docs_read', args: { id: results[0].id } });
       assert.match(JSON.stringify(output), /untrusted_tool_result/);
       await assert.rejects(
-        read.execute({ action: 'read', id: '../private.md' }),
+        read.execute({ action: 'docs_read', args: { id: '../private.md' } }),
         /section was not found/,
       );
       await assert.rejects(
-        read.execute({ action: 'read', id: results[0].id, offset: -1 }),
-        /Invalid nod_docs/,
+        read.execute({ action: 'docs_read', args: { id: results[0].id, offset: -1 } }),
+        /offset/,
       );
     },
     {
@@ -1516,12 +1926,25 @@ test('past the spending check-in a turn stops working but can ask, and one that 
         },
       });
       assert.equal(options.shouldStop(), false);
-      await assert.rejects(read(tools), /\$5\.50 \(\$1\.50 of it ChatGPT plan usage/);
-      await call(tools, 'ask_user', { question: 'Read 12 of 40 threads. Keep going?' });
+      await assert.rejects(read(tools), /passed the \$5 check-in.*ChatGPT plan usage/);
+      await assert.rejects(
+        call(tools, 'ask_user', {
+          question: 'This used $5.50. Read 12 of 40 threads. Keep going?',
+        }),
+        /\{spent\}/,
+      );
+      emit(usage(0.25));
+      await call(tools, 'ask_user', {
+        question: 'This used {spent}, {plan} of it plan usage. Read 12 of 40 threads. Keep going?',
+      });
     },
     { integration, checkIn },
   );
   assert.equal(asked.result.status, 'waiting_user');
+  assert.equal(
+    asked.result.message,
+    'This used $5.75, $1.50 of it plan usage. Read 12 of 40 threads. Keep going?',
+  );
   assert.equal(reads.length, 2);
   const kept = await fixture(
     async (tools, emit, options) => {
@@ -1566,7 +1989,7 @@ test('past the spending check-in chat task start and reply are refused while rep
         status: 'done',
         result: 'Synthetic done.',
       });
-      await call(tools, 'ask_user', { question: 'Keep going?' });
+      await call(tools, 'ask_user', { question: 'This used {spent}. Keep going?' });
     },
     {
       checkIn: { budgetUsd: 5, spentUsd: 6 },
@@ -1592,11 +2015,11 @@ test('past the monthly spending limit a turn can only reply and change spending 
         /spending limit/,
       );
       await assert.rejects(
-        call(tools, 'manage_personal_context', { action: 'schedule_list', args: {} }),
+        call(tools, 'nod', { action: 'schedule_list', args: {} }),
         /spending limit/,
       );
-      await call(tools, 'manage_personal_context', { action: 'usage_get', args: {} });
-      await call(tools, 'manage_personal_context', {
+      await call(tools, 'nod', { action: 'usage_get', args: {} });
+      await call(tools, 'nod', {
         action: 'limits_update',
         args: { monthlyUsd: null },
       });
@@ -1672,7 +2095,7 @@ test('outside results reach Pi in one untrusted block, scripts get them raw, and
   const page = (body: string) => async () => ({
     content: [{ type: 'text' as const, text: body }],
   });
-  await fixture(
+  await taskFixture(
     async (tools, _emit, options) => {
       texts.push(text(await call(tools, 'apps', { action: 'GMAIL_FETCH_EMAILS', args: {} })));
       await assert.rejects(call(tools, 'apps', { action: 'CONNECTED_HTTP', args: {} }), (error) => {
@@ -1775,7 +2198,7 @@ test('outside results reach Pi in one untrusted block, scripts get them raw, and
     [{ [appConfirmation]: 'Send this email?' }, 'waiting_user'],
   ] as const) {
     let notice = '';
-    const turn = await fixture(
+    const turn = await taskFixture(
       async (tools) => {
         notice = text(
           await call(tools, 'apps', {
@@ -1795,7 +2218,7 @@ test('outside results reach Pi in one untrusted block, scripts get them raw, and
   const held = new Promise<void>((resolve) => {
     release = resolve;
   });
-  await fixture(
+  await taskFixture(
     async (tools, _emit, options) => {
       const read = options.runTool('fetch_content', { urls: [] }, async () => {
         await held;
@@ -1896,7 +2319,7 @@ test('secure credential pause prevents subsequent tools in the same execution se
   ]) {
     let managed = false;
     const requested: unknown[] = [];
-    const result = await fixture(
+    const result = await taskFixture(
       async (tools) => {
         for (const invalid of [
           { kind: 'method' },
@@ -1937,7 +2360,7 @@ test('secure credential pause prevents subsequent tools in the same execution se
           action: 'Open secure step',
         });
         await assert.rejects(
-          call(tools, 'manage_personal_context', {
+          call(tools, 'nod', {
             action: 'schedule_create',
             args: { title: 'must not run' },
           }),
@@ -1977,7 +2400,7 @@ test('browser checks retain successful named checkbox choices only on their page
       ],
     ],
   ]);
-  await fixture(
+  await taskFixture(
     async (tools) => {
       await call(tools, 'browser', { action: 'open', url });
       await call(tools, 'browser', { action: 'fill', selector: '@query', text: 'Synthetic query' });
@@ -2029,13 +2452,52 @@ test('browser checks retain successful named checkbox choices only on their page
   assert.deepEqual(seen.find(({ selector }) => selector === '@other-save')?.typed, []);
 });
 
+test('links navigate without a check unless they send a known form', async () => {
+  const seen: string[] = [];
+  const url = 'https://example.com/results';
+  const pages = new Map<string, Record<string, unknown>>([
+    ['@link', { controls: [{ role: 'link', name: 'Click here' }], submits: 'unknown' }],
+    [
+      '@form-link',
+      {
+        controls: [{ role: 'link', name: 'Continue' }],
+        submits: { method: 'POST', to: 'https://example.com/book' },
+      },
+    ],
+    ['@button', { controls: [{ role: 'button', name: 'Click here' }], submits: 'unknown' }],
+  ]);
+  await taskFixture(
+    async (tools) => {
+      for (const selector of pages.keys())
+        await call(tools, 'browser', { action: 'click', selector });
+    },
+    {
+      browserStep: async ({ step }) => {
+        seen.push(step.selector ?? '');
+        return 'run';
+      },
+    },
+    {
+      computer: fakeComputer({
+        currentPage: async (_id, step) => ({
+          origin: 'https://example.com',
+          url,
+          ...pages.get(step?.selector ?? ''),
+        }),
+        act: async () => ({ url, text: 'Synthetic page' }),
+      }),
+    },
+  );
+  assert.deepEqual(seen, ['@form-link', '@button']);
+});
+
 test('browser handoff requires a live page, binds its session and stops further work without a link', async () => {
   const sessionId = randomUUID();
   let opened = false;
   let pageError: Error | undefined;
   let holdFails = true;
   const held: string[] = [];
-  const result = await fixture(
+  const result = await taskFixture(
     async (tools) => {
       await assert.rejects(
         call(tools, 'browser', { action: 'handoff', text: ' ' }),
@@ -2101,7 +2563,7 @@ test('browser handoff requires a live page, binds its session and stops further 
   assert.equal(result.result.handoffBrowserId, sessionId);
   assert.equal(result.result.message, 'Complete sign-in on this page, then return control.');
   assert.deepEqual(held, [sessionId]);
-  const ordinary = await fixture(async (tools) => {
+  const ordinary = await taskFixture(async (tools) => {
     await call(tools, 'ask_user', { question: 'What did [the browser](/browser) show?' });
   });
   assert.equal(ordinary.result.handoffBrowserId, undefined);
@@ -2113,7 +2575,7 @@ test('private entry returns page data once and stops before an observation after
     let entries = 0;
     let snapshots = 0;
     const run = () =>
-      fixture(
+      taskFixture(
         async (tools) => {
           const result = await call(tools, 'sign_in', {
             origin: 'https://example.com',
@@ -2161,7 +2623,7 @@ test('private entry returns page data once and stops before an observation after
 
 test('a subagent cannot hand over its browser to the owner', async () => {
   let refused = false;
-  const result = await fixture(async (tools, emit, execution) => {
+  const result = await taskFixture(async (tools, emit, execution) => {
     if (execution.parentRunId) {
       assert.equal(tools.has('create_audio'), false);
       await assert.rejects(
@@ -2278,6 +2740,39 @@ test('observer tools reject invalid read modes and incomplete saves before serve
   assert.equal(updates, 4);
 });
 
+test('bug report actions stay out of background work without a task', async () => {
+  const managed: string[] = [];
+  const manage = async (action: string) => {
+    managed.push(action);
+    return 'ok';
+  };
+  const draft = { action: 'bug_report_draft', args: { summary: 'Synthetic failure.' } };
+  await fixture(
+    async (tools) => {
+      await assert.rejects(call(tools, 'nod', draft), /only for work the owner follows/);
+    },
+    { background: true, manage },
+  );
+  assert.deepEqual(managed, []);
+  await fixture(
+    async (tools) => {
+      await call(tools, 'nod', draft);
+    },
+    {
+      background: true,
+      manage,
+      taskContext: {
+        id: randomUUID(),
+        title: 'Synthetic task',
+        brief: 'Find the synthetic result.',
+        doneWhen: 'The result is delivered.',
+        revision: 1,
+      },
+    },
+  );
+  assert.deepEqual(managed, ['bug_report_draft']);
+});
+
 test('proactive work has no write routes and cannot send model text', async () => {
   let handoffs = 0;
   let forbidden = 0;
@@ -2288,7 +2783,7 @@ test('proactive work has no write routes and cannot send model text', async () =
       assert.equal(options.restricted, true);
       assert.deepEqual([...tools.keys()].sort(), [
         'ask_user',
-        'manage_personal_context',
+        'memory',
         'proactive_issue',
         'read_source',
         'task',
@@ -2314,8 +2809,7 @@ test('proactive work has no write routes and cannot send model text', async () =
       ]);
       for (const nested of [false, true]) {
         for (const name of names) {
-          if (['read_source', 'proactive_issue', 'manage_personal_context', 'task'].includes(name))
-            continue;
+          if (['read_source', 'proactive_issue', 'memory', 'task'].includes(name)) continue;
           await assert.rejects(
             options.runTool(
               name,
@@ -2329,11 +2823,11 @@ test('proactive work has no write routes and cannot send model text', async () =
             /unavailable in proactive/,
           );
         }
-        for (const action of personalActions) {
+        for (const action of [...memoryActions, ...nodActions]) {
           if (reads.includes(action)) continue;
           await assert.rejects(
             options.runTool(
-              'manage_personal_context',
+              'memory',
               { action, args: { approved: true } },
               async () => {
                 forbidden++;
@@ -2345,7 +2839,7 @@ test('proactive work has no write routes and cannot send model text', async () =
           );
         }
         for (const action of reads)
-          await call(tools, 'manage_personal_context', {
+          await call(tools, 'memory', {
             action,
             args: { path: 'preferences', query: 'Synthetic preference' },
           });
@@ -2419,7 +2913,9 @@ test('a spending check-in stops the observer from starting more tasks', async ()
         }),
         /check-in/,
       );
-      await call(tools, 'ask_user', { question: 'Continue the synthetic observer?' });
+      await call(tools, 'ask_user', {
+        question: 'This used {spent}. Continue the synthetic observer?',
+      });
     },
     {
       background: true,
@@ -2966,12 +3462,9 @@ test(
           let preparationStartedAt = 0;
           let agentStartedAt: number | undefined;
           const { result, replies } = await fixture(
-            async (_tools, emit, options) => {
+            async (_tools, emit, _options, request) => {
               if (explicit)
-                assert.ok(
-                  options.ownerContext?.includes(fact),
-                  'Explicit recall must reach the main agent.',
-                );
+                assert.ok(request.includes(fact), 'Explicit recall must reach the main agent.');
               emit({ type: 'final', text: 'Synthetic answer.' });
             },
             {
@@ -3115,11 +3608,13 @@ test('repeated input, sign-in and action review failures stop while source text 
       'sign_in',
       'Nod could not confirm it was still on the page and control it checked, so nothing was done.',
     ],
-    [
-      'manage_personal_context',
-      'The action review model is unavailable. Synthetic provider failure.',
-    ],
+    ['nod', 'The action review model is unavailable. Synthetic provider failure.'],
     ['apps', 'Nod could not write an accurate confirmation for this action, so it did not run.'],
+    [
+      'bash',
+      'The workspace command did not run. Trust could not verify permission for all of its effects.',
+    ],
+    ['bash', 'The workspace command did not run because its Trust check failed: HTTP 503.'],
   ]) {
     let calls = 0;
     await assert.rejects(
@@ -3132,7 +3627,8 @@ test('repeated input, sign-in and action review failures stop while source text 
           if (options.shouldStop([{ name, error: reason }])) break;
         }
       }),
-      /failed five times/,
+      (error: unknown) =>
+        error instanceof ToolFailureError && /failed five times/.test(error.message),
     );
     assert.equal(calls, 5);
   }

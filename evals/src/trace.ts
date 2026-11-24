@@ -1,5 +1,5 @@
-import { readdir, readFile, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { readdir, readFile, readlink, stat } from 'node:fs/promises';
+import { join, relative } from 'node:path';
 import type { Write, AppsWorld } from './world/apps.ts';
 import type { Interaction, Session } from './session.ts';
 import { approvalOrder, type Stack } from './stack.ts';
@@ -8,6 +8,7 @@ import type { Visit } from './world/sites.ts';
 import { browserSessionId } from '../../src/providers/agent-browser/index.ts';
 import type { UsageDetails } from '../../src/shared/execution.ts';
 import { redactedInput } from './capture.ts';
+import { sumBudgetCosts, validCost } from './spend.ts';
 
 export interface ToolCall {
   id?: string;
@@ -63,6 +64,8 @@ export interface Run {
   userMessages: Array<{ at: number; text: string }>;
   writes: Write[];
   files: string[];
+  home: Record<string, Buffer>;
+  trashed: string[];
   artifacts: Array<{ id: string; threadId: string | null }>;
   schedules: Array<{
     title: string;
@@ -82,7 +85,8 @@ export interface Run {
     tokens: number;
     modelCalls: number;
     costUsd: number | null;
-    requests?: UsageDetails[];
+    budgetCostUsd?: number;
+    requests?: (UsageDetails & { budgetEstimateUsd?: number | null })[];
   };
   compactions?: number;
   firstReplySeconds: number | null;
@@ -218,6 +222,29 @@ export function handedReads(
   });
 }
 
+async function snapshot(root: string) {
+  const entries = await readdir(root, { recursive: true, withFileTypes: true });
+  const parents = new Set(entries.map((entry) => entry.parentPath));
+  const kept = entries.filter(
+    (entry) =>
+      entry.isFile() ||
+      entry.isSymbolicLink() ||
+      (entry.isDirectory() && !parents.has(join(entry.parentPath, entry.name))),
+  );
+  return Object.fromEntries(
+    await Promise.all(
+      kept.map(async (entry) => {
+        const path = join(entry.parentPath, entry.name);
+        const name = relative(root, path);
+        if (entry.isSymbolicLink())
+          return [name, Buffer.from(`symlink to ${await readlink(path)}`)];
+        if (entry.isDirectory()) return [`${name}/`, Buffer.alloc(0)];
+        return [name, await readFile(path)];
+      }),
+    ),
+  ) as Record<string, Buffer>;
+}
+
 export async function collectUsage(pool: Stack['pool']): Promise<Run['usage']> {
   const usage = (
     await pool.query(`SELECT m.cost_usd,m.details,
@@ -234,12 +261,30 @@ export async function collectUsage(pool: Stack['pool']): Promise<Run['usage']> {
       ),
     0,
   );
-  const cost = usage.reduce((total, row) => total + (row.cost_usd ?? 0), 0);
-  const costKnown = usage.length > 0 && usage.every((row) => row.cost_usd !== null);
+  const costs = usage.map(({ cost_usd, details }) => {
+    const estimate = details.status === 'cancelled' ? details.budgetEstimateUsd : undefined;
+    return estimate === undefined
+      ? { recorded: cost_usd, budget: cost_usd }
+      : {
+          recorded: null,
+          budget: validCost(estimate) ? Math.max(estimate, cost_usd ?? 0) : null,
+        };
+  });
+  const recorded = costs.map((row) => row.recorded);
+  const costUsd =
+    recorded.length && recorded.every(validCost)
+      ? recorded.reduce((total, price) => total + price, 0)
+      : null;
+  const estimates = costs.map((row) => row.budget);
+  const budgetCostUsd =
+    costUsd === null && estimates.length && estimates.every(validCost)
+      ? sumBudgetCosts(estimates)
+      : null;
   return {
     tokens,
     modelCalls: usage.length,
-    costUsd: costKnown ? cost : null,
+    costUsd,
+    ...(budgetCostUsd !== null ? { budgetCostUsd } : {}),
     requests: usage.map((row) => ({
       ...row.details,
       costUsd: row.cost_usd,
@@ -491,6 +536,8 @@ export async function collect(options: {
     userMessages: session.userMessages,
     writes: world.apps?.writes ?? [],
     files,
+    home: stack.home ? await snapshot(stack.home) : {},
+    trashed: [...(stack.trashed ?? [])],
     artifacts,
     schedules,
     scheduleRuns,

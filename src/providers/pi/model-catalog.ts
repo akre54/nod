@@ -1,14 +1,16 @@
 import type { Api, Model } from '@earendil-works/pi-ai';
 import { z } from 'zod';
 import { ModelAuthError, type ModelCredential } from '../../ports/models.ts';
-import { ModelServiceError, modelServiceError } from '../model-error.ts';
+import { ModelServiceError, modelErrorText, modelServiceError } from '../model-error.ts';
 import {
   cloudflareAccountPattern,
   cloudflareGatewayPattern,
   modelProviderInfo,
   modelProviderNames,
+  type OpenAIRegion,
   type ModelProvider,
 } from '../../shared/models.ts';
+import { openAIBaseUrl } from '../openai/api.ts';
 
 const modelId = z
   .string()
@@ -28,6 +30,71 @@ const catalogEndpoints = {
   together: 'https://api.together.xyz/v1/models',
   nvidia: 'https://integrate.api.nvidia.com/v1/models',
 } as const;
+
+export function openAIModels(region: OpenAIRegion = 'global'): Model<'openai-responses'>[] {
+  const rate = region === 'global' ? 1 : 1.1;
+  return [
+    {
+      id: 'gpt-6.2-sol',
+      name: 'GPT-6.2 Sol',
+      cost: { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 },
+    },
+    {
+      id: 'gpt-6.2-astra',
+      name: 'GPT-6.2 Astra',
+      cost: { input: 8, output: 40, cacheRead: 0.4, cacheWrite: 10 },
+    },
+  ].map((model) => ({
+    ...model,
+    provider: 'openai',
+    api: 'openai-responses',
+    baseUrl: openAIBaseUrl(region),
+    reasoning: true,
+    input: ['text', 'image'],
+    contextWindow: 1_050_000,
+    maxTokens: 128_000,
+    cost: {
+      input: model.cost.input * rate,
+      output: model.cost.output * rate,
+      cacheRead: model.cost.cacheRead * rate,
+      cacheWrite: model.cost.cacheWrite * rate,
+      tiers: [
+        {
+          inputTokensAbove: 272_000,
+          input: model.cost.input * 2 * rate,
+          output: model.cost.output * 1.5 * rate,
+          cacheRead: model.cost.cacheRead * 2 * rate,
+          cacheWrite: model.cost.cacheWrite * 2 * rate,
+        },
+      ],
+    },
+    thinkingLevelMap: {
+      off: null,
+      minimal: null,
+      low: 'low',
+      medium: 'medium',
+      high: 'high',
+      xhigh: 'xhigh',
+      max: 'max',
+    },
+    compat: {
+      supportsStrictMode: true,
+      supportsOpenAIGrammarTools: true,
+      supportsAdditionalTools: true,
+      supportsToolSearch: true,
+      supportsMidConvoSystemMessages: true,
+      supportsExplicitPromptCacheMode: true,
+      supportsMidConvoEffort: true,
+    },
+    inputLimits: {
+      maxRequestBytes: 536_870_912,
+      images: {
+        maxPerRequest: 1500,
+        resize: { maxWidth: 2000, maxHeight: 2000, maxBytes: 4_718_592, jpegQuality: 80 },
+      },
+    },
+  }));
+}
 
 export const nativeAudioModel: Model<'openai-completions'> = {
   id: 'gpt-audio-1.5',
@@ -93,47 +160,67 @@ export function cloudflareCredential(provider: ModelProvider, credential: ModelC
   return credential;
 }
 
+export function discoveryCause(error: unknown, secrets: string[] = []) {
+  if (Object(error).name === 'TimeoutError') return 'the request timed out';
+  let cause = error;
+  let detail = '';
+  for (let depth = 0; depth < 4 && cause instanceof Error; depth++) {
+    const code = (cause as Error & { code?: unknown }).code;
+    if (
+      typeof code === 'string' &&
+      code.length <= 64 &&
+      /^(?:E[A-Z_]+|UND_ERR_[A-Z_]+)$/.test(code)
+    )
+      return `the connection failed (${code})`;
+    if (cause.message && cause.message !== 'fetch failed') detail = cause.message;
+    cause = cause.cause;
+  }
+  const reason = modelErrorText(detail, secrets).trim();
+  return error instanceof SyntaxError || Object(error).name === 'ZodError'
+    ? 'it returned an invalid model list'
+    : reason && reason !== '[redacted]'
+      ? reason.slice(0, 2000)
+      : 'the connection failed';
+}
+
 export async function nativeCatalog(
   provider: ModelProvider,
   local: Model<Api>[],
   credential: ModelCredential,
   request: typeof fetch,
 ): Promise<Model<Api>[]> {
-  const failed = () =>
-    new Error(`${modelProviderNames[provider]} couldn’t load its models. Try again.`);
-  const denied = () =>
-    new ModelAuthError(
-      provider === 'cloudflare-ai-gateway'
-        ? 'Cloudflare couldn’t read this gateway. Check its Account ID, Gateway ID and token’s AI Gateway Read permission.'
-        : `${modelProviderNames[provider]} didn’t accept this API key. Check its permissions and try again.`,
-    );
+  const failed = (cause = 'it returned an invalid model list') =>
+    new Error(`${modelProviderNames[provider]} couldn’t load its models: ${cause}. Try again.`);
   const read = async (url: string | URL, headers: Record<string, string>) => {
-    try {
-      const response = await request(url, {
-        headers,
-        redirect: 'error',
-        signal: AbortSignal.timeout(15000),
-      });
-      if (!response.ok) {
-        const error = await modelServiceError(
-          response,
-          `${modelProviderNames[provider]} model discovery`,
-          Object.values(headers).map((value) => value.replace(/^Bearer /, '')),
-        );
-        if (
-          response.status === 401 ||
-          response.status === 403 ||
-          (provider === 'google' && response.status === 400) ||
-          (provider === 'cloudflare-ai-gateway' && response.status === 404)
-        )
-          throw new ModelAuthError(`${denied().message} ${error.message}`);
-        throw error;
-      }
-      return (await response.json()) as unknown;
-    } catch (error) {
-      if (error instanceof ModelAuthError || error instanceof ModelServiceError) throw error;
-      throw failed();
+    const secrets = [
+      String(url),
+      ...Object.values(headers).map((value) => value.replace(/^Bearer /, '')),
+    ];
+    const response = await request(url, {
+      headers,
+      redirect: 'error',
+      signal: AbortSignal.timeout(15000),
+    }).catch((error: unknown) => {
+      throw failed(discoveryCause(error, secrets));
+    });
+    if (!response.ok) {
+      const error = await modelServiceError(
+        response,
+        `${modelProviderNames[provider]} model discovery`,
+        secrets,
+      );
+      if (
+        response.status === 401 ||
+        response.status === 403 ||
+        (provider === 'google' && response.status === 400) ||
+        (provider === 'cloudflare-ai-gateway' && response.status === 404)
+      )
+        throw new ModelAuthError(error.message);
+      throw error;
     }
+    return (await response.json().catch((error: unknown) => {
+      throw failed(discoveryCause(error, secrets));
+    })) as unknown;
   };
   const parse = <T>(schema: z.ZodType<T>, value: unknown) => {
     const result = schema.safeParse(value);
@@ -228,23 +315,34 @@ export async function nativeCatalog(
       z.object({ data: z.array(z.unknown()).max(10000) }),
       await read('https://api.mistral.ai/v1/models', headers),
     );
-    return select(
-      list(
-        data.data,
-        z.object({
-          id: modelId,
-          archived: z.boolean().optional(),
-          capabilities: z.object({ completion_chat: z.boolean(), function_calling: z.boolean() }),
+    const models = list(
+      data.data,
+      z.object({
+        id: modelId,
+        archived: z.boolean().optional(),
+        capabilities: z.object({
+          completion_chat: z.boolean(),
+          function_calling: z.boolean(),
+          vision: z.boolean().optional(),
         }),
-      )
-        .filter(
-          (model) =>
-            !model.archived &&
-            model.capabilities.completion_chat &&
-            model.capabilities.function_calling,
-        )
-        .map((model) => model.id),
+      }),
+    ).filter(
+      (model) =>
+        !model.archived &&
+        model.capabilities.completion_chat &&
+        model.capabilities.function_calling,
     );
+    const vision = new Map(models.map((model) => [model.id, model.capabilities.vision]));
+    return select(models.map((model) => model.id)).map((model) => {
+      const supportsImages = vision.get(model.id);
+      if (supportsImages === undefined) return model;
+      return {
+        ...model,
+        input: supportsImages
+          ? [...new Set([...model.input, 'image' as const])]
+          : model.input.filter((input) => input !== 'image'),
+      };
+    });
   }
 
   if (provider === 'radius') {

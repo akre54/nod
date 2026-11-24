@@ -21,6 +21,7 @@ export const defaultJudge = 'anthropic/claude-sonnet-5-5';
 export interface RunOptions {
   root: string;
   model?: string;
+  backgroundModel?: string;
   effort?: ModelEffort;
   judge?: string;
   repeat: number;
@@ -76,7 +77,7 @@ export function select(
     'tier' | 'scenarioIds' | 'capability' | 'ignoreWindow' | 'includePending'
   >,
 ) {
-  const chosen = scenarios.filter(
+  let chosen = scenarios.filter(
     (item) =>
       (options.scenarioIds
         ? options.scenarioIds.includes(item.id)
@@ -104,6 +105,16 @@ export function select(
       timeZone: 'Europe/Madrid',
     }).format(Date.now()),
   );
+  const unsupported =
+    process.platform === 'win32'
+      ? chosen.filter((item) => item.world({ now: Date.now }).localFiles)
+      : [];
+  if (unsupported.length) {
+    console.log(
+      `Skipping ${unsupported.map((item) => item.id).join(', ')}: local-file evals need macOS or Linux.`,
+    );
+    chosen = chosen.filter((item) => !unsupported.includes(item));
+  }
   const outside = chosen.filter(
     (item) => item.window && (hour < item.window.from || hour >= item.window.to),
   );
@@ -119,11 +130,12 @@ export function select(
 async function attemptOnce(options: {
   directory: string;
   model: string;
+  backgroundModel?: string;
   effort?: ModelEffort;
   judge: string;
   task: { item: (typeof scenarios)[number]; attempt: number };
 }) {
-  const { directory, model, effort, judge, task } = options;
+  const { directory, model, backgroundModel, effort, judge, task } = options;
   const file = join(directory, 'attempts', `${task.item.id}.${task.attempt}.json`);
   const specPath = join(tmpdir(), `nod-eval-${randomUUID()}.json`);
   await writeFile(
@@ -133,6 +145,7 @@ async function attemptOnce(options: {
       attempt: task.attempt,
       outFile: file,
       model,
+      ...(backgroundModel ? { backgroundModel } : {}),
       effort,
       judge,
     }),
@@ -191,7 +204,7 @@ async function attemptOnce(options: {
     });
 }
 
-async function checkHarness(model: string, judge: string) {
+async function checkHarness(model: string, judge: string, backgroundModel?: string) {
   const item = scenarios.find((entry) => entry.id === 'harness-canary')!;
   const directory = join(tmpdir(), `nod-eval-canary-${randomUUID()}`);
   await mkdir(join(directory, 'attempts'), { recursive: true });
@@ -200,7 +213,13 @@ async function checkHarness(model: string, judge: string) {
   let failures = 0;
   let faults = 0;
   for (let attempt = 1; failures < 2; attempt++) {
-    const result = await attemptOnce({ directory, model, judge, task: { item, attempt } });
+    const result = await attemptOnce({
+      directory,
+      model,
+      backgroundModel,
+      judge,
+      task: { item, attempt },
+    });
     if (result.status === 'incomplete' && result.blame === 'infra' && faults < 2) {
       await sleep(Math.min(30_000 * 3 ** faults++, 90_000));
       continue;
@@ -237,6 +256,24 @@ export async function runSuite(options: RunOptions) {
   const existing = await readdir(join(directory, 'attempts')).catch(() => [] as string[]);
   if (existing.length && !options.resume)
     throw new Error(`Run ${label} already exists. Choose another --label or pass --resume.`);
+  if (existing.length) {
+    const saved = JSON.parse(
+      await readFile(join(directory, 'manifest.json'), 'utf8'),
+    ) as Partial<RunManifest>;
+    const wanted = {
+      model,
+      backgroundModel: options.backgroundModel,
+      effort: options.effort ?? 'high',
+      judge,
+    };
+    const changed = (Object.keys(wanted) as Array<keyof typeof wanted>).filter(
+      (key) => (saved[key] ?? (key === 'effort' ? 'high' : undefined)) !== wanted[key],
+    );
+    if (changed.length)
+      throw new Error(
+        `Run ${label} was saved with a different ${changed.join(', ')}. Resume it with the same options or choose another --label.`,
+      );
+  }
 
   let source = repository;
   let refCommit: string | undefined;
@@ -250,7 +287,7 @@ export async function runSuite(options: RunOptions) {
   } else delete process.env.NOD_EVAL_SOURCE;
   try {
     if (options.canary !== false && selected.some((item) => item.tier !== 'canary'))
-      await checkHarness(model, judge);
+      await checkHarness(model, judge, options.backgroundModel);
     const digest = async (image: string) =>
       (await runProcess('docker', ['image', 'inspect', image, '--format', '{{.Id}}'])).stdout
         .trim()
@@ -265,6 +302,7 @@ export async function runSuite(options: RunOptions) {
       dirty: options.ref ? false : git('status', '--porcelain', '--', 'src', 'evals').length > 0,
       ...(options.ref ? { ref: options.ref } : {}),
       model,
+      ...(options.backgroundModel ? { backgroundModel: options.backgroundModel } : {}),
       effort: options.effort ?? 'high',
       judge,
       repeat: options.repeat,
@@ -294,7 +332,7 @@ export async function runSuite(options: RunOptions) {
       console.log(
         accounting.unpriced()
           ? 'Stopped: completed model usage has no valid price. Remaining attempts and retries were not run.'
-          : `Stopped: spent $${accounting.knownCostUsd().toFixed(2)} of the $${options.budget} budget. Remaining attempts were not run.`,
+          : `Stopped: counted $${accounting.countedCostUsd().toFixed(2)} of the $${options.budget} budget. Remaining attempts were not run.`,
       );
     };
     const started = Date.now();
@@ -332,6 +370,7 @@ export async function runSuite(options: RunOptions) {
           result = await attemptOnce({
             directory,
             model,
+            ...(options.backgroundModel ? { backgroundModel: options.backgroundModel } : {}),
             effort: options.effort ?? 'high',
             judge,
             task,

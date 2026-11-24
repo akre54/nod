@@ -1,9 +1,11 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import type { AccountUpdate, AccountUser, SessionResponse } from '../shared/account.ts';
+import { logFailure } from '../ports/failure-log.ts';
 import type { AccountStore } from './account-store.ts';
 import { analyticsModel, snapshotAnalytics, type Analytics } from './analytics.ts';
 import { captureSettingChanges } from './analytics-settings.ts';
+import { redactSecretText } from './redaction.ts';
 
 const surveyActiveDays = 3;
 
@@ -18,7 +20,6 @@ const accountUpdate = z
 
 export function createAccountSession(options: {
   accounts: AccountStore;
-  origin: string;
   localUser: AccountUser;
   developerIds?: ReadonlySet<string>;
   analytics?: Analytics;
@@ -30,7 +31,6 @@ export function createAccountSession(options: {
   updatesEmail?: boolean;
   prepare?(signal: AbortSignal): Promise<void>;
 }) {
-  const origin = new URL(options.origin).origin;
   const user = options.localUser;
   const owner = user.id;
   let accountVersion = 0;
@@ -117,6 +117,7 @@ export function createAccountSession(options: {
       const surveys =
         analytics?.enabled &&
         (await options.accounts.activeDays(owner, surveyActiveDays)) >= surveyActiveDays;
+      const seenSurveys = surveys ? await options.accounts.seenSurveys(owner) : [];
       if (accountVersion !== version || pending) continue;
       return {
         user,
@@ -133,16 +134,12 @@ export function createAccountSession(options: {
           updatesEmail: options.updatesEmail === true,
         },
         ...(analytics && {
-          analytics: analytics.enabled ? { ...analytics, surveys } : analytics,
+          analytics: analytics.enabled ? { ...analytics, surveys, seenSurveys } : analytics,
         }),
       };
     }
   }
   function guard(request: FastifyRequest, reply: FastifyReply) {
-    if (request.headers.origin !== origin || request.headers['sec-fetch-site'] === 'cross-site') {
-      reply.code(403).send({ error: 'This origin is not permitted.' });
-      return false;
-    }
     const expected = request.headers['x-nod-account'];
     if (expected !== undefined && expected !== owner) {
       reply.code(401).send({ error: 'Sign in to continue.' });
@@ -161,14 +158,20 @@ export function createAccountSession(options: {
       reply.raw.off('close', abort);
     }
   }
+  function setupFailed(reply: FastifyReply, error: unknown, what: string) {
+    logFailure('setup_failed', error);
+    const reason =
+      error instanceof Error ? redactSecretText(error.message).trim().slice(0, 500) : '';
+    return reply.code(503).send({ error: reason ? `${what} ${reason}` : what });
+  }
   async function start(reply: FastifyReply, complete?: () => Promise<unknown>) {
     try {
       await prepare(reply);
       await options.start?.();
       await complete?.();
       return true;
-    } catch {
-      reply.code(503).send({ error: 'Setup could not be completed. Try again.' });
+    } catch (error) {
+      setupFailed(reply, error, 'Setup could not be completed.');
       return false;
     }
   }
@@ -183,7 +186,11 @@ export function createAccountSession(options: {
         .strict()
         .parse(request.body ?? {});
       reply.header('cache-control', 'no-store');
-      await prepare(reply);
+      try {
+        await prepare(reply);
+      } catch (error) {
+        return setupFailed(reply, error, 'Setup could not be completed.');
+      }
       return { ok: true };
     });
     app.post('/api/account/model-setup', async (request, reply) => {
@@ -228,8 +235,8 @@ export function createAccountSession(options: {
                     : 'Connect Gmail before finishing setup.',
                 step,
               });
-          } catch {
-            return reply.code(503).send({ error: 'Could not verify setup. Try again.' });
+          } catch (error) {
+            return setupFailed(reply, error, 'Could not verify setup.');
           }
         }
         if (
@@ -261,6 +268,16 @@ export function createAccountSession(options: {
         });
       reply.header('cache-control', 'no-store');
       return response();
+    });
+    app.post('/api/account/survey-seen', async (request, reply) => {
+      if (!guard(request, reply)) return;
+      const { survey } = z
+        .object({ survey: z.string().regex(/^[0-9a-f-]{36}(_\d{1,9})?$/i) })
+        .strict()
+        .parse(request.body);
+      await options.accounts.markSurveySeen(owner, survey);
+      reply.header('cache-control', 'no-store');
+      return { ok: true };
     });
     app.post('/api/account/welcome', async (request, reply) => {
       if (!guard(request, reply)) return;

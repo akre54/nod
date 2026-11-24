@@ -31,6 +31,8 @@ pnpm exec tsx --test tests/approvals.test.ts
 
 ## Available application checks
 
+App connector changes must pass `pnpm check:apps`. The required CI workflow always runs this command. See [Test the app](/contribute/apps/test/) for fixtures and separate provider acceptance.
+
 Use these commands when needed to verify an application change. They are not a condition for opening every pull request.
 
 ```sh title="Terminal"
@@ -40,7 +42,7 @@ pnpm run test:integration
 pnpm run build
 ```
 
-`pnpm run check` checks types, import boundaries, and formatting. `pnpm test` runs deterministic tests and skips database cases without `TEST_DATABASE_URL`. The integration command runs every test in Linux with disposable PostgreSQL and Chromium fixtures. The build command checks types and builds the app.
+`pnpm run check` checks types, lint rules, import boundaries, and formatting. `pnpm run typecheck` uses the pinned Bun type checker. `pnpm run lint` runs Oxlint and the import checks. `pnpm install` installs both tools. The application and its tests still run on Node.js. `pnpm test` runs deterministic tests and skips database cases without `TEST_DATABASE_URL`. The integration command runs every test in Linux with disposable PostgreSQL and Chromium fixtures. The build command checks types and builds the app.
 
 ## Git hooks
 
@@ -49,7 +51,7 @@ pnpm run build
 | Hook       | What runs                                                                                                                        |
 | ---------- | -------------------------------------------------------------------------------------------------------------------------------- |
 | Pre-commit | Prettier formats your staged files. If [Gitleaks](https://github.com/gitleaks/gitleaks) is installed, it scans them for secrets. |
-| Pre-push   | `pnpm run lint`: `pnpm run check` without formatting. It type-checks and checks import boundaries.                               |
+| Pre-push   | `pnpm run typecheck` and `pnpm run lint` run in parallel.                                                                        |
 
 Secret scanning skips its generic keyword check in tests and fixtures. Known key formats fail everywhere, so keep test values synthetic.
 
@@ -62,7 +64,7 @@ Secret scanning skips its generic keyword check in tests and fixtures. Known key
 | `evals/`                                | `pnpm --dir evals run check` and `pnpm --dir evals test`                                                                                      |
 | Docs site pages, configuration, or code | `pnpm --dir docs build`                                                                                                                       |
 
-For Linux release packaging, run **Build Linux desktop** in Actions. It builds the x64 runtime and Flatpak, installs the bundle, and checks the engine inside it. It saves checked bundle parts as `desktop-linux-x64`. The desktop release workflow requires this build. Full KVM startup and desktop integration still need a Linux desktop check. See [Linux builds](/contribute/desktop-releases/#build-a-linux-flatpak).
+For Linux release packaging, run **Build Linux desktop** in Actions. It builds the x64 runtime and Flatpak, installs the bundle, and checks the engine inside it. It also sends and releases sleep prevention requests through the installed sandbox to private D-Bus services. Removing either power-service permission must block its request. These checks do not suspend the runner. The workflow saves checked bundle parts as `desktop-linux-x64`. The desktop release workflow requires this build. Full KVM startup and desktop integration still need a Linux desktop check. See [Linux builds](/contribute/desktop-releases/#build-a-linux-flatpak).
 
 The [capability evals](/contribute/evals/) call live models, so they aren't part of these checks. They run nightly and on request.
 
@@ -81,6 +83,8 @@ CodeQL checks JavaScript, TypeScript, and Python when the repository is public. 
 CI also runs Gitleaks on all fetched Git refs and the checkout. It downloads the pinned scanner through the authenticated GitHub API and checks its SHA-256 before extraction. The exceptions in `.gitleaks.toml` name exact public values, source hashes, or synthetic fixtures. Do not add an exception for a live credential.
 
 Windows CI downloads Electron through the authenticated GitHub API. The download, cached archives, native fixtures and release build use the checksums shipped with the pinned Electron package. The download token is scoped to its preparation step and is not passed to the test apps.
+
+Windows CI downloads NSIS 3.13 from its publisher and checks the pinned SHA-256 before installation. Both Windows jobs use this compiler. They do not need the Chocolatey package feed.
 
 Native Mac update fixtures also use the checksums shipped with the pinned Electron package. They verify the archive without a separate checksum download.
 
@@ -116,11 +120,63 @@ flowchart LR
 
 The network has no internet access, and your source folders are mounted read-only. The run fails if any test is skipped.
 
+Keep independent browser cases in the matching test files so they can run in separate processes. Use short retry intervals in fixtures that check retry results, not the delay. Keep the same request count and failure checks.
+
+Don't let a test sleep through a real-time window, such as a timeout, a backoff, a rate limit or a refresh interval. Pass a short value through an option, move the stored deadline, or use the test runner's mock timers. A test that only waits makes every run slower for everyone.
+
+The approval application cases share one app and run in order, so they can't run in parallel inside one process. [`tests/approvals-application-cases.ts`](https://github.com/n8n-io/nod/blob/main/tests/approvals-application-cases.ts) holds the cases in three sections, and three small test files each run one section in their own process. Add a case to the section it belongs with. To run them all:
+
+```sh title="Terminal"
+pnpm exec tsx --test tests/approvals-application-*.test.ts
+```
+
 Wait for a controlled frame to finish loading before checking an old control binding. A reload can still show the previous document while navigation is pending.
+
+## End-to-end tests
+
+[`tests/e2e.test.ts`](https://github.com/n8n-io/nod/blob/main/tests/e2e.test.ts) checks what a user feels when they send several messages, steer and stop work, or Nod restarts. It starts the real Nod in a child process: the server, the thread worker, the Pi runtime, task sessions, schedules and the trust check, on a disposable schema in the PostgreSQL database at `TEST_DATABASE_URL`. Only the model is scripted. There is no memory or trust model, so an outside action asks, except in the approval scenarios: they add a scripted checker that allows a schedule pause only when an earlier owner message asks to pause the synthetic schedules, to check that the request still reaches the trust check in a task started from a short reply, and that a step nobody asked for still waits for the approval card. The run needs no key and gives the same result every time. The test talks to Nod over its HTTP API, like the web app, and restarts it after a real `SIGKILL`.
+
+```mermaid
+flowchart LR
+  test([Scenario]):::accent -- messages, replies, Stop --> nod[Real Nod<br/>in a child process]
+  nod --> pi[Pi runtime]
+  pi -- each request --> model[Scripted model]:::muted
+  nod --> db[(Disposable<br/>schema)]
+  test -- invariants --> db
+```
+
+The scripted model behaves like a real one in the ways that matter for the harness. It reads each owner message from the request data and acknowledges every new message with a reaction before it starts work, so steered messages pile up the way they do with a live model. Its tools go through `codemode`.
+
+| Message starts with | What the scripted model does                                                            |
+| ------------------- | --------------------------------------------------------------------------------------- |
+| `task:`             | Starts a task for that message. The task finishes with `Done:` and its instruction      |
+| `hold:`             | Waits until the scenario calls `release` with the same text, or the turn stops          |
+| Anything else       | Answers `Answer:` and the message. A scheduled run sends the answer with `send_message` |
+
+A `task:` message that also contains `linger:` keeps the chat turn working after it starts the task, until the scenario calls `release` with the same text. Add `hold:` to keep the task working too, as in `task: linger: hold: book the venue`. Use both to interrupt Nod while the chat and its new task run.
+
+After each scenario, `nod.violations()` checks the invariants a user relies on:
+
+- No turn stays queued or running, and no task stays open.
+- No turn failed, apart from the ones the scenario expects.
+- Each task's first turn starts from the owner message it serves, and its title matches that message.
+- Every owner message gets a reply, a reaction or a task.
+- No owner message runs more than once.
+
+To add a scenario, add a subtest to `tests/e2e.test.ts`. Drive Nod with `send`, `release`, `stopTask`, `stopAll`, `crash` and `restart`, check the user-visible result, then assert that `nod.violations()` is empty. A scenario must fail on the code without the fix it protects: run it against `main` once before you rely on it. Set `NOD_E2E_KEEP=1` to keep the data folder with the saved Pi sessions after a run.
+
+Point `TEST_DATABASE_URL` at a disposable PostgreSQL, never your normal local database:
+
+```sh title="Terminal"
+docker run -d --rm --name nod-e2e-db -p 127.0.0.1:55432:5432 -e POSTGRES_USER=nod -e POSTGRES_PASSWORD=nod postgres:17-alpine
+TEST_DATABASE_URL=postgres://nod:nod@127.0.0.1:55432/nod pnpm exec tsx --test tests/e2e.test.ts
+```
+
+CI runs it with the other tests whenever a change reaches the code it imports. Capability evals grade related outcomes with a real model every night, such as `two-requests-flight-then-tickets` for two requests in a row and `send-it-after-a-draft` for a send that needs no second question. See [evals](/contribute/evals/).
 
 ## Manual acceptance harness
 
-[`scripts/e2e-nod.ts`](https://github.com/n8n-io/nod/blob/main/scripts/e2e-nod.ts) runs manual scenarios with a configured model key, disposable local database schema, and isolated browser and workspace containers. The harness supplies memory and classification curators. Its onboarding and trust reviews use the selected model at its lightest effort, as production does. This is the first advertised `off`, `minimal`, `low`, or `medium` level, or the model's first advertised level if none of those is supported. You can check typed approval, decline, and expiry through the configured application path. Automated tests use synthetic curators and actions. They never call a live model or connected account.
+[`scripts/e2e-nod.ts`](https://github.com/n8n-io/nod/blob/main/scripts/e2e-nod.ts) runs manual scenarios with a configured model key, disposable local database schema, and isolated browser and workspace containers. The harness supplies memory and classification curators. Its onboarding and trust reviews use the selected model at its lightest effort, as production does. This is the first advertised `off`, `minimal`, `low`, or `medium` level, or the model's first advertised level if none of those is supported. You can check typed approval, decline, and expiry through the configured application path. Without a `nod-workspace` container, set `NOD_E2E_NETWORK` to a Docker network you created for the harness and `NOD_E2E_WORKSPACE_IMAGE` to a workspace image, such as `nod-eval-workspace:latest`. Automated tests use synthetic curators and actions. They never call a live model or connected account.
 
 ## Mac guest protection
 
@@ -169,42 +225,50 @@ To compare with an image built without RTK, run `--phase baseline --baseline <co
 
 ## What CI checks
 
-CI reads the changed files on pull requests, merge queue checks and pushes to `main`. Formatting, CI selection tests and secret scanning always run. The run summary lists the selected checks and the number of integration test files.
+CI reads the changed files on pull requests, merge queue checks and pushes to `main`. Formatting, CI selection tests and secret scanning always run. Formatting checks changed files. A change to formatter settings or root dependencies checks all files. The run summary lists the selected checks and the number of integration test files.
 
-The required **Checks, tests and build** result keeps its existing name. It waits for each selected job. A failed scope check, missing scope output, failed job or selected job that was skipped makes this result fail. The native Windows result is included. No branch protection change is needed.
+The required **Checks, tests and build** result keeps its existing name. One Linux runner installs dependencies once. It runs formatting, Oxlint, type checks, desktop contracts, eval contracts and application tests in parallel. A failed command fails the result. Failed or incomplete check selection also fails the result. No branch protection change is needed.
 
-Application, desktop, native, eval and container jobs can run in parallel after file selection. Linux checks do not wait for Mac checks. Type checks run once in the quality job. Integration tests build their own web fixture inside the cached test image. They use the dependencies in that image without an install on the runner, and run up to four test files at a time, within the available CPU count.
+The runner builds the clients before application tests. It uses the runner's Google Chrome and a disposable PostgreSQL service that keeps its data in memory. CI uses Chromium only when Google Chrome is missing. Each test file has its own process. Half the runner's processors set how many files run at once, which is eight on CI. Independent native browser control cases and interface cases also run in parallel inside their file, with separate profiles, servers and processes. Recorded file times put the slowest files first. Without recorded times, file size sets the order. Successful runs cache file paths and times. Test results and private content do not enter this cache.
+
+Pull requests and merge queue checks run the selected Linux checks and security scans. Native Mac, Windows installer and container deployment acceptance run on `main` when their inputs change. Daily and manual runs use every check. The desktop publication rehearsal also runs outside pull requests and the merge queue. Other selected desktop contracts stay on the PR path. Release packaging requires successful CI for the exact source revision. Release workflows also check the packaged apps before publication.
+
+On a pull request, Vitest lists files with `--changed` against the merge base. It follows imports and does not execute the tests. The existing Node.js runner executes the selected files with PostgreSQL and Chromium. A failed selection runs all files. Merge queue checks and pushes to `main` always run the full Linux suite.
+
+Inputs outside the import graph force a full test run. These include lockfiles, type and test configuration, client build settings, shared test fixtures, runtime skills and JSON data. Dynamically started provider worker entry points, mounted desktop code and self-host files also use full runs. Desktop runtime changes select desktop and network checks. Web source, public HTML and desktop UI code also use a full run because tests read the generated clients. Oxlint enables each stable rule that the current code can pass. Its configuration lists the rules disabled for existing findings.
 
 ```mermaid
 flowchart TD
   files[Changed files] --> scope{{Select checks}}:::accent
   scope -- text only --> light[Formatting and secrets]:::muted
-  scope -- web --> web[Client build and web tests]:::go
+  scope -- web --> web[Client build and Linux tests]:::go
   scope -- tests only --> tests[Changed test files]
-  scope -- server --> core[Full Linux test suite]:::go
-  scope -- platform or container --> area[Checks for that area]
-  scope -- unknown input --> all[Every check]:::go
+  scope -- server --> core[Tests reached through imports]:::go
+  scope -- platform or container --> area[Linux contracts for that area]
+  scope -- unknown input --> all[Every check for this stage]:::go
 ```
 
-| You change                                                                  | CI also runs                                                                                                                                                                    |
-| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `docs/`, Markdown files, `LICENSE` or `NOTICE`                              | No application checks. Docs changes also run the **Docs** workflow.                                                                                                             |
-| Only a release's version, manifest and changelog                            | The release metadata and source check. Installers are built after merge.                                                                                                        |
-| Web code or public HTML and JavaScript                                      | The client build and tests that refer to web code, built web files or public files. Web source changes also run type and import checks.                                         |
-| Web CSS or public images and fonts                                          | The client build. Web source changes also run type and import checks.                                                                                                           |
-| Test files only                                                             | Type checks and the changed test files that still exist. A renamed test runs under its new name. A change to a shared test fixture runs the full Linux suite.                   |
-| Server, runtime, provider, shared or port code                              | Type and import checks, the full Linux suite and eval harness checks. Shared and port code also select client and desktop checks.                                               |
-| Container recipes, container provider code or self-host deployment files    | Container build and deployment checks, plus desktop contracts.                                                                                                                  |
-| Desktop files                                                               | Desktop contracts. Desktop UI changes also select the client build and type checks. Native Mac and Windows checks run only for their source, package, fixture and build inputs. |
-| `evals/`                                                                    | Eval harness type and contract checks with disposable PostgreSQL schemas.                                                                                                       |
-| `deployment/n8n/`                                                           | n8n delivery contracts, plus Windows checks when installer inputs change.                                                                                                       |
-| Root package files, dependency patches, CI selection code or unknown inputs | Every check.                                                                                                                                                                    |
+| You change                                                                  | CI also runs                                                                                                                                                                                                                                                                                                                                                             |
+| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `docs/`, Markdown files, `LICENSE` or `NOTICE`                              | No application checks. Docs changes also run the **Docs** workflow.                                                                                                                                                                                                                                                                                                      |
+| Only a release's version, manifest and changelog                            | The release metadata and source check. Installers are built after merge.                                                                                                                                                                                                                                                                                                 |
+| Web code or public HTML and JavaScript                                      | The client build and full Linux suite. Web source changes also run type, lint and import checks.                                                                                                                                                                                                                                                                         |
+| Web CSS or public images and fonts                                          | The client build. Web source changes also run type and import checks.                                                                                                                                                                                                                                                                                                    |
+| Test files only                                                             | Type, lint, import and formatting checks, plus the changed test files that still exist. A renamed test runs under its new name. A change to a shared test fixture runs the full Linux suite.                                                                                                                                                                             |
+| Server, runtime, provider, shared or port code                              | Type, lint and import checks, tests reached through imports, and eval harness checks. Shared and port code also select client and desktop checks.                                                                                                                                                                                                                        |
+| Container recipes, container provider code or self-host deployment files    | Desktop contracts and affected Linux tests. Self-host files select the full Linux suite. Main also runs container build and deployment acceptance.                                                                                                                                                                                                                       |
+| Desktop files                                                               | Desktop contracts. Desktop main, preload and UI changes also select the full Linux suite. Runtime changes select desktop and network checks. UI changes select the client build and type checks. Application-only changes skip desktop release and runtime fixtures. Main selects native Mac and Windows acceptance for their source, package, fixture and build inputs. |
+| `evals/`                                                                    | Eval harness type and contract checks with disposable PostgreSQL schemas.                                                                                                                                                                                                                                                                                                |
+| `deployment/n8n/`                                                           | n8n delivery contracts. Main also selects Windows acceptance when installer inputs change.                                                                                                                                                                                                                                                                               |
+| Root package files, dependency patches, CI selection code or unknown inputs | Every check for the current stage.                                                                                                                                                                                                                                                                                                                                       |
 
-A daily CI run at 03:17 UTC uses every check, including both Mac architectures and full Windows update acceptance. A manual CI run also uses every check, except a run on `release/desktop`, which compares that branch with `main`. The scope job reads full Git history so a base branch update does not hide the diff base. If that base is unavailable, CI runs every check. New pull request commits cancel older runs for that pull request. Main runs stay bound to each commit because releases require CI to pass on their exact source. Daily runs have a separate group so a push cannot cancel them.
+A daily CI run at 03:17 UTC uses every check, including both Mac architectures and full Windows update acceptance. A manual CI run also uses every check, except a run on `release/desktop`, which compares that branch with `main`. The shared runner fetches two commits to read the merge base. A manual run on `release/desktop` fetches full history. If that base is unavailable, CI runs every check. New pull request commits cancel older runs for that pull request. Main runs stay bound to each commit because releases require CI to pass on their exact source. Daily runs have a separate group so a push cannot cancel them.
 
-The **Self-host bundle** workflow builds and checks both Linux architectures when package, container, deployment, or bundled documentation inputs change. It also runs each Sunday at 04:47 UTC and on request. Ordinary web and server changes do not create both bundles. To get a bundle for a specific revision, run that workflow on the revision. Draft release creation still needs its separate manual input.
+The daily and manual Windows startup job also tests WSL errors, unfinished registrations, and occupied disk folders.
 
-The selection and required-result rules are in [`.github/scripts/ci-scope.mjs`](https://github.com/n8n-io/nod/blob/main/.github/scripts/ci-scope.mjs). CI tests these rules with disposable Git repositories, including renames, removed tests and version-only releases. Workflow changes also run a pinned, checksum-verified actionlint to check syntax and expressions.
+The **Self-host bundle** workflow builds and checks both Linux architectures on `main` when package, container, deployment, or bundled documentation inputs change. Pull requests do not export these release bundles. It also runs each Sunday at 04:47 UTC and on request. Ordinary web and server changes do not create both bundles. To get a bundle for a specific revision, run that workflow on the revision. Draft release creation still needs its separate manual input.
+
+The selection rules are in [`.github/scripts/ci-scope.mjs`](https://github.com/n8n-io/nod/blob/main/.github/scripts/ci-scope.mjs). The shared runner selects checks and affected tests after installing the tools. It starts without waiting for a separate selection job. CI tests these rules with disposable Git repositories, including renames, removed tests and version-only releases. Workflow changes also run a pinned, checksum-verified actionlint to check syntax and expressions.
 
 Actionlint 1.7.12 [does not yet accept GitHub's `queue` key](https://github.com/rhysd/actionlint/issues/657). CI ignores that specific parser error and checks the queue values and cancellation settings in its own tests.
 

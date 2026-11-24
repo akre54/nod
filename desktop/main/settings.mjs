@@ -1,9 +1,9 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { access, mkdir, open, readFile, realpath, rename, rm } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { dirname, isAbsolute, resolve } from 'node:path';
 
-const preferenceFields = ['launchAtLogin', 'notifications', 'onboardingCompleted'];
+const preferenceFields = ['launchAtLogin', 'notifications'];
 const onboardingPreferenceSteps = ['notifications', 'launchAtLogin', 'complete'];
 
 export function desktopContentPolicy(posthogHost) {
@@ -49,6 +49,13 @@ export function serverOrigin(value) {
   }
 }
 
+export function serverToken(value) {
+  const token = typeof value === 'string' ? value.trim() : '';
+  if (!/^[A-Za-z0-9_-]{43,}$/.test(token))
+    throw new Error('Enter the authentication token configured on your server.');
+  return token;
+}
+
 export function createSettingsStore(path, encryption, platform = process.platform) {
   let current;
   let unsynced = false;
@@ -91,12 +98,15 @@ export function createSettingsStore(path, encryption, platform = process.platfor
     try {
       const file = await open(temporary, 'wx', 0o600);
       try {
-        await file.writeFile(JSON.stringify(value));
+        const { onboardingCompleted, ...saved } = value;
+        await file.writeFile(JSON.stringify({ ...saved, version: 2 }));
         await file.sync();
       } finally {
         await file.close();
       }
       await rename(temporary, path);
+      delete value.onboardingCompleted;
+      value.version = 2;
       current = value;
       unsynced = true;
       await durable();
@@ -112,9 +122,21 @@ export function createSettingsStore(path, encryption, platform = process.platfor
       const record = (input) => input && typeof input === 'object' && !Array.isArray(input);
       if (!record(value) || !record(value.secrets)) throw new Error();
       if (
-        value.version !== 1 ||
+        ![1, 2].includes(value.version) ||
         !['system', 'light', 'dark'].includes(value.theme) ||
         preferenceFields.some((field) => typeof value[field] !== 'boolean') ||
+        (value.version === 1
+          ? typeof value.onboardingCompleted !== 'boolean'
+          : value.onboardingCompleted !== undefined) ||
+        (value.zoomFactor !== undefined &&
+          (!Number.isFinite(value.zoomFactor) ||
+            value.zoomFactor < 0.25 ||
+            value.zoomFactor > 5)) ||
+        (value.computerDirectory !== undefined &&
+          (typeof value.computerDirectory !== 'string' ||
+            value.computerDirectory.length > 4096 ||
+            !isAbsolute(value.computerDirectory) ||
+            resolve(value.computerDirectory) !== value.computerDirectory)) ||
         (value.onboardingPreferenceStep !== undefined &&
           !onboardingPreferenceSteps.includes(value.onboardingPreferenceStep)) ||
         (value.serverUrl !== undefined &&
@@ -134,12 +156,13 @@ export function createSettingsStore(path, encryption, platform = process.platfor
     } catch (error) {
       if (error.code !== 'ENOENT') throw new Error('Nod could not open its saved settings.');
     }
+    if (value?.onboardingCompleted) value.onboardingPreferenceStep = 'complete';
     current = value ?? {
-      version: 1,
+      version: 2,
       theme: 'system',
       launchAtLogin: false,
       notifications: false,
-      onboardingCompleted: false,
+      onboardingPreferenceStep: 'launchAtLogin',
       secrets: {},
     };
     unsynced = !!value;
@@ -234,18 +257,19 @@ export function createSettingsStore(path, encryption, platform = process.platfor
       launchAtLogin: value.launchAtLogin,
       notifications: value.notifications,
       theme: value.theme,
-      onboardingCompleted: value.onboardingCompleted,
+      zoomFactor: value.zoomFactor ?? 1,
       ...(value.serverUrl ? { serverUrl: value.serverUrl } : {}),
       ...(value.welcome ? { welcome: { ...value.welcome } } : {}),
       onboardingPreferenceStep:
-        value.onboardingCompleted || value.onboardingPreferenceStep === 'complete'
-          ? 'complete'
-          : 'launchAtLogin',
+        value.onboardingPreferenceStep === 'complete' ? 'complete' : 'launchAtLogin',
     };
   }
   return {
     get() {
       return exclusive(async () => redacted(await read()));
+    },
+    computerDirectory() {
+      return exclusive(async () => (await read()).computerDirectory);
     },
     hasSavedKeys() {
       return exclusive(async () => Object.keys((await read()).secrets).length > 0);
@@ -280,13 +304,12 @@ export function createSettingsStore(path, encryption, platform = process.platfor
             !input ||
             typeof input !== 'object' ||
             Array.isArray(input) ||
-            Object.keys(input).some((field) => !['url', 'token'].includes(field)) ||
-            typeof input.token !== 'string' ||
-            !/^[A-Za-z0-9_-]{43,}$/.test(input.token)
+            Object.keys(input).some((field) => !['url', 'token'].includes(field))
           )
             throw new Error('Enter the authentication token configured on your server.');
+          const token = serverToken(input.token);
           value.serverUrl = serverOrigin(input.url);
-          value.secrets.serverToken = await protect(input.token);
+          value.secrets.serverToken = await protect(token);
         }
         await write(value);
         return redacted(value);
@@ -299,7 +322,14 @@ export function createSettingsStore(path, encryption, platform = process.platfor
         if (
           Object.keys(input).some(
             (key) =>
-              !['theme', ...preferenceFields, 'onboardingPreferenceStep', 'welcome'].includes(key),
+              ![
+                'theme',
+                'zoomFactor',
+                'computerDirectory',
+                ...preferenceFields,
+                'onboardingPreferenceStep',
+                'welcome',
+              ].includes(key),
           )
         )
           throw new Error('These settings are not supported.');
@@ -313,9 +343,26 @@ export function createSettingsStore(path, encryption, platform = process.platfor
             throw new Error('Choose a supported appearance.');
           value.theme = input.theme;
         }
+        if (input.zoomFactor !== undefined) {
+          if (!Number.isFinite(input.zoomFactor) || input.zoomFactor < 0.25 || input.zoomFactor > 5)
+            throw new Error('Choose a supported zoom level.');
+          value.zoomFactor = input.zoomFactor;
+        }
+        if (input.computerDirectory !== undefined) {
+          if (
+            input.computerDirectory !== null &&
+            (typeof input.computerDirectory !== 'string' ||
+              input.computerDirectory.length > 4096 ||
+              !isAbsolute(input.computerDirectory) ||
+              resolve(input.computerDirectory) !== input.computerDirectory)
+          )
+            throw new Error('Choose a valid private-computer storage folder.');
+          if (input.computerDirectory === null) delete value.computerDirectory;
+          else value.computerDirectory = input.computerDirectory;
+        }
         if (input.welcome !== undefined) {
           if (
-            previous.onboardingCompleted ||
+            previous.onboardingPreferenceStep === 'complete' ||
             previous.welcome?.continued ||
             !input.welcome ||
             typeof input.welcome !== 'object' ||
@@ -335,18 +382,11 @@ export function createSettingsStore(path, encryption, platform = process.platfor
           value[field] = input[field];
         }
         if (input.onboardingPreferenceStep !== undefined) {
-          if (previous.onboardingCompleted || input.onboardingPreferenceStep !== 'complete')
+          if (input.onboardingPreferenceStep !== 'complete')
             throw new Error('Choose your desktop preference before continuing.');
           value.onboardingPreferenceStep = input.onboardingPreferenceStep;
         }
-        if (
-          value.onboardingCompleted &&
-          !previous.onboardingCompleted &&
-          value.onboardingPreferenceStep !== 'complete' &&
-          !value.launchAtLogin
-        )
-          throw new Error('Finish the desktop preference step before continuing.');
-        if (value.onboardingCompleted) delete value.welcome;
+        if (value.onboardingPreferenceStep === 'complete') delete value.welcome;
         await write(value);
         return redacted(value);
       });

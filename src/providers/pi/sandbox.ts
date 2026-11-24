@@ -6,8 +6,6 @@ import { basename, posix } from 'node:path';
 import {
   createBashToolDefinition,
   createEditToolDefinition,
-  createFindToolDefinition,
-  createLsToolDefinition,
   createReadToolDefinition,
   createWriteToolDefinition,
   type ToolDefinition,
@@ -15,6 +13,7 @@ import {
 import type { WorkspaceSession } from '../../ports/computer.ts';
 
 const streamBytes = 1024 * 1024;
+const helperPath = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 const rawCommand =
   /[|&;<>\n\r`$\\]|^\s*\w+=\S*|(?:^|\s)["']?(?:--(?:json|porcelain|raw|format|pretty|output|outfile|output-file|null|zero)(?:[-=\s"']|$)|-[oO]|-(?:0|z|print0)(?:[\s"']|$))/;
 const invocationWrapper =
@@ -27,9 +26,6 @@ const imageTypes: Record<string, string> = {
   '.webp': 'image/webp',
   '.bmp': 'image/bmp',
 };
-
-const listProgram =
-  "import os,sys\nfor e in os.scandir(sys.argv[1]): sys.stdout.write(e.name+'\\0'+('d' if e.is_dir() else 'f')+'\\0')";
 
 function quote(value: string) {
   return `'${value.replaceAll("'", `'\\''`)}'`;
@@ -45,7 +41,7 @@ async function run(
   options: { input?: string; signal?: AbortSignal } = {},
 ) {
   const chunks: Buffer[] = [];
-  const { exitCode } = await workspace.exec(script, {
+  const { exitCode } = await workspace.exec(`export PATH=${quote(helperPath)}\n${script}`, {
     ...options,
     onData: (chunk) => chunks.push(chunk),
   });
@@ -141,7 +137,7 @@ async function moveHostOutputs(texts: string[], workspace: WorkspaceSession, sig
       });
       if (!bytes) continue;
       signal?.throwIfAborted();
-      if (!moved.size && (await workspace.exec(`mkdir -p -- '${directory}'`, { signal })).exitCode)
+      if (!moved.size && (await run(workspace, `mkdir -p -- '${directory}'`, { signal })).exitCode)
         throw new Error();
       const name = basename(path);
       const target = posix.join(
@@ -219,7 +215,6 @@ export function createSandbox(workspace: WorkspaceSession, timeZone?: string) {
   }
   const writeBytes = (path: string, bytes: Buffer) =>
     writeWorkspaceFile(workspace, workspacePath(path), bytes);
-  const directories = new Map<string, boolean>();
   async function bash(
     command: string,
     cwd: string,
@@ -230,6 +225,8 @@ export function createSandbox(workspace: WorkspaceSession, timeZone?: string) {
     const diagnostics = `${file}.timeout`;
     const marker = `\nnod-timeout-${randomUUID()}`;
     const script = [
+      'nod_path=${nod_workspace_path-$PATH}',
+      `export PATH=${quote(helperPath)}`,
       `cd -- ${quote(cwd)} || exit 1`,
       `mkdir -p ${quote(posix.dirname(file))}`,
       ...(timeZone ? [`export TZ=${quote(timeZone)}`] : []),
@@ -237,12 +234,12 @@ export function createSandbox(workspace: WorkspaceSession, timeZone?: string) {
       `nod_command=${quote(command)}`,
       ...(!rawCommand.test(command) && !/^\s*(?:git\s+log\s*$|find(?:\s|$))/.test(command)
         ? [
-            'nod_rewrite=$(timeout -k 1 2 rtk rewrite "$nod_command" 2>/dev/null)',
+            'nod_rewrite=$(timeout -k 1 2 /usr/local/bin/rtk rewrite "$nod_command" 2>/dev/null)',
             'nod_rewrite_code=$?',
-            `if { [ "$nod_rewrite_code" -eq 0 ] || [ "$nod_rewrite_code" -eq 3 ]; } && [ -n "$nod_rewrite" ]${invocationWrapper.test(command) ? ' && [ "$nod_rewrite" = "rtk $nod_command" ]' : ''}; then nod_command=$nod_rewrite; fi`,
+            `if { [ "$nod_rewrite_code" -eq 0 ] || [ "$nod_rewrite_code" -eq 3 ]; } && [ -n "$nod_rewrite" ]${invocationWrapper.test(command) ? ' && [ "$nod_rewrite" = "rtk $nod_command" ]' : ''}; then case "$nod_rewrite" in "rtk "*) nod_command="/usr/local/bin/$nod_rewrite";; esac; fi`,
           ]
         : []),
-      `timeout --verbose -k 5 ${seconds} bash -c ${quote('exec bash -c "$1" 2>&1')} bash "$nod_command" > ${quote(file)} 2> ${quote(diagnostics)} < /dev/null`,
+      `timeout --verbose -k 5 ${seconds} /bin/bash --noprofile --norc -p -c ${quote('PATH="$1"; export PATH; exec /bin/bash -c "$2" 2>&1')} bash "$nod_path" "$nod_command" > ${quote(file)} 2> ${quote(diagnostics)} < /dev/null`,
       'code=$?',
       'timed_out=0',
       `if { [ "$code" -eq 124 ] || [ "$code" -eq 137 ]; } && [ -s ${quote(diagnostics)} ]; then timed_out=1; fi`,
@@ -271,37 +268,6 @@ export function createSandbox(workspace: WorkspaceSession, timeZone?: string) {
     if (timedOut) throw new Error(`timeout:${seconds}`);
     return { exitCode };
   }
-  const glob = async (
-    pattern: string,
-    root: string,
-    options: { ignore: string[]; limit: number },
-  ) => {
-    root = workspacePath(root);
-    const program = [
-      'import os,sys,fnmatch,json',
-      'root,pattern,limit=sys.argv[1],sys.argv[2],int(sys.argv[3])',
-      "patterns=[pattern] if '/' in pattern else ['**/'+pattern]",
-      "patterns+=[p.replace('**/','') for p in patterns]",
-      'ignore=json.loads(sys.argv[4])',
-      "ignore+=[p.replace('**/','') for p in ignore]",
-      'at=lambda base,name: os.path.relpath(os.path.join(base,name),root)',
-      'skip=lambda path: any(fnmatch.fnmatchcase(path,p) for p in ignore)',
-      'found=0',
-      'for base,dirs,files in os.walk(root):',
-      " dirs[:]=[d for d in dirs if not skip(at(base,d)+'/')]",
-      ' for name in dirs+[f for f in files if not skip(at(base,f))]:',
-      '  rel=at(base,name)',
-      '  if any(fnmatch.fnmatchcase(rel,p) for p in patterns):',
-      "   sys.stdout.write(rel+('/' if name in dirs else '')+'\\0'); found+=1",
-      '   if found>=limit: sys.exit(0)',
-    ].join('\n');
-    const { exitCode, output } = await run(
-      workspace,
-      `python3 -c ${quote(program)} ${quote(root)} ${quote(pattern)} ${options.limit} ${quote(JSON.stringify(options.ignore))}`,
-    );
-    if (exitCode) throw new Error(`Could not search ${root}.`);
-    return output.toString('utf8').split('\0').filter(Boolean);
-  };
   const cwd = workspace.path;
   const tools = [
     createReadToolDefinition(cwd, {
@@ -333,41 +299,12 @@ export function createSandbox(workspace: WorkspaceSession, timeZone?: string) {
         },
       },
     }),
-    createFindToolDefinition(cwd, {
-      operations: { exists: (path) => check(`[ -e ${quote(workspacePath(path))} ]`), glob },
-    }),
-    createLsToolDefinition(cwd, {
-      operations: {
-        exists: (path) => check(`[ -e ${quote(workspacePath(path))} ]`),
-        stat: async (path) => {
-          path = workspacePath(path);
-          const directory = directories.get(path) ?? (await check(`[ -d ${quote(path)} ]`));
-          directories.delete(path);
-          return { isDirectory: () => directory };
-        },
-        readdir: async (path) => {
-          path = workspacePath(path);
-          const { exitCode, output } = await run(
-            workspace,
-            `python3 -c ${quote(listProgram)} ${quote(path)}`,
-          );
-          if (exitCode) throw new Error(`Cannot read directory: ${path}`);
-          const parts = output.toString('utf8').split('\0');
-          const names: string[] = [];
-          for (let index = 0; index + 1 < parts.length; index += 2) {
-            names.push(parts[index]);
-            directories.set(posix.join(path, parts[index]), parts[index + 1] === 'd');
-          }
-          return names;
-        },
-      },
-    }),
   ] as ToolDefinition[];
   return tools.map((definition): ToolDefinition => ({
     ...definition,
     ...(definition.name === 'bash'
       ? {
-          description: `${definition.description}\nSupported simple commands automatically use RTK for compact output. Prefer bash with rtk ls, rtk read and rtk grep for exploration; use native read for exact edit context. Use rtk test or rtk err around scripts to compact their output, and rtk proxy for unfiltered output. Shell data flows and explicit machine-output formats stay raw.`,
+          description: `${definition.description}\nSimple commands run through RTK for compact output; use rtk proxy <command> for raw output.`,
         }
       : {}),
     execute: async (id, params, signal, onUpdate, context) => {

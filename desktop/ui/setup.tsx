@@ -2,10 +2,11 @@ import { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { SetupProgress } from '../../src/web/components/setup-progress';
 import { PasswordInput } from '../../src/web/components/password-input';
-import { Welcome } from '../../src/web/pages/onboarding/steps/welcome';
+import { Welcome, WelcomeNote } from '../../src/web/pages/onboarding/steps/welcome';
 import { OnboardingFrame } from '../../src/web/pages/onboarding/frame';
 import { startupMessage, type StartupStage } from '../../src/shared/desktop-startup';
 import { initializeFocusVisibility } from '../../src/web/lib/focus';
+import { StartupFeedback, type StartupFeedbackDesktop } from './feedback';
 import '../../src/web/theme.css';
 import '../../src/web/components/motion.css';
 import '../../src/web/components/setup-progress.css';
@@ -24,6 +25,7 @@ type RuntimeStatus = {
   progress?: number;
   secondsLeft?: number;
   needsWsl?: boolean;
+  needsStorage?: boolean;
   needsRuntimeArchive?: boolean;
   needsServerConnection?: boolean;
 };
@@ -44,7 +46,7 @@ type Preferences = {
 
 type WelcomeChoice = { usageData: boolean; continued: boolean };
 
-type Desktop = {
+type Desktop = StartupFeedbackDesktop & {
   ready?(): Promise<void>;
   getSettings(): Promise<{ welcome?: WelcomeChoice }>;
   saveSettings(change: { welcome: WelcomeChoice }): Promise<{ welcome?: WelcomeChoice }>;
@@ -58,6 +60,7 @@ type Desktop = {
   prepare(options?: { retry: boolean }): Promise<Status>;
   warmup?(): Promise<void>;
   installWsl(): Promise<Status>;
+  chooseComputerDirectory(): Promise<Status>;
   showStartupLog(): Promise<void>;
   importRuntime(): Promise<Status | undefined>;
   onStatus(listener: (status: Status) => void): (() => void) | undefined;
@@ -285,6 +288,7 @@ function Startup() {
   );
   const [busy, setBusy] = useState(false);
   const [recovering, setRecovering] = useState(false);
+  const [reportError, setReportError] = useState('');
   const [settingsError, setSettingsError] = useState('');
   const [welcome, setWelcome] = useState<WelcomeChoice | null>(null);
   const currentWelcome = useRef<WelcomeChoice | null>(null);
@@ -339,7 +343,12 @@ function Startup() {
   }, []);
 
   useEffect(() => {
-    if (welcomeStep !== 'waiting' || !status.engineReady || !currentWelcome.current) return;
+    if (
+      welcomeStep !== 'waiting' ||
+      !status.engineReady ||
+      currentWelcome.current?.continued !== false
+    )
+      return;
     void saveWelcome({ ...currentWelcome.current, continued: true }).catch(() => {});
   }, [welcomeStep, status.engineReady]);
 
@@ -416,18 +425,22 @@ function Startup() {
         <OnboardingFrame
           step={welcomeStep}
           footer={
-            <button
-              className="server-entry"
-              type="button"
-              onClick={() => void desktop?.openConnectionSettings()}
-            >
-              Connect to a server
-            </button>
+            <>
+              <button
+                className="server-entry"
+                type="button"
+                onClick={() => void desktop?.openConnectionSettings()}
+              >
+                Connect to a server
+              </button>
+              <WelcomeNote />
+            </>
           }
         >
           <div className="ob-screen" inert={busy && !handingOff} aria-busy={busy || handingOff}>
             <Welcome
               local
+              note={false}
               usageShared={welcome.usageData}
               traces={{ enabled: false, onChange: () => Promise.resolve() }}
               arrived="forward"
@@ -492,6 +505,29 @@ function Startup() {
         : active.message ||
           (firstSetup ? 'Preparing your workspace and browser.' : 'Opening your saved workspace.');
 
+  const retry = () =>
+    run(async () => {
+      if (!desktop) return;
+      if (failure?.needsServerConnection) {
+        await desktop.openConnectionSettings();
+        return;
+      }
+      if (settingsError || (firstSetup && !welcome)) {
+        const [preferences, settings] = await Promise.all([
+          desktop.getPreferences(),
+          desktop.getSettings(),
+        ]);
+        applyPreferences(preferences);
+        if (firstSetup) {
+          localChoiceSaved.current = Boolean(settings.welcome);
+          acceptWelcome(settings.welcome ?? { usageData: true, continued: false });
+        }
+        setSettingsError('');
+      }
+      if (firstSetup && !localChoiceSaved.current) return;
+      return desktop.prepare({ retry: true });
+    });
+
   return (
     <>
       <div className="titlebar" aria-hidden="true" />
@@ -521,38 +557,31 @@ function Startup() {
       >
         {failure && desktop && (
           <div className="recovery-actions">
-            <button
-              type="button"
-              disabled={working}
-              onClick={() =>
-                void run(async () => {
-                  if (failure.needsServerConnection) {
-                    await desktop.openConnectionSettings();
-                    return;
-                  }
-                  if (settingsError || (firstSetup && !welcome)) {
-                    const [preferences, settings] = await Promise.all([
-                      desktop.getPreferences(),
-                      desktop.getSettings(),
-                    ]);
-                    applyPreferences(preferences);
-                    if (firstSetup) {
-                      localChoiceSaved.current = Boolean(settings.welcome);
-                      acceptWelcome(settings.welcome ?? { usageData: true, continued: false });
-                    }
-                    setSettingsError('');
-                  }
-                  if (firstSetup && !localChoiceSaved.current) return;
-                  return desktop.prepare({ retry: true });
-                })
-              }
-            >
+            <button type="button" disabled={working} onClick={() => void retry()}>
               {working
                 ? 'Trying again…'
                 : failure.needsServerConnection
                   ? 'Reconnect to server'
                   : 'Try again'}
             </button>
+            {!failure.needsServerConnection && (
+              <button
+                type="button"
+                disabled={working}
+                onClick={() => {
+                  setReportError('');
+                  void desktop
+                    .openStartupFeedback()
+                    .catch((cause) =>
+                      setReportError(
+                        cause instanceof Error ? cause.message : 'The report form could not open.',
+                      ),
+                    );
+                }}
+              >
+                Report bug
+              </button>
+            )}
             <button
               type="button"
               disabled={working}
@@ -567,6 +596,15 @@ function Startup() {
                 onClick={() => void run(() => desktop.installWsl())}
               >
                 Install WSL
+              </button>
+            )}
+            {(failure.needsStorage || runtime?.needsStorage) && (
+              <button
+                type="button"
+                disabled={working}
+                onClick={() => void run(() => desktop.chooseComputerDirectory())}
+              >
+                Choose folder
               </button>
             )}
             {(failure.needsRuntimeArchive || runtime?.needsRuntimeArchive) && (
@@ -585,21 +623,37 @@ function Startup() {
             )}
           </div>
         )}
+        {reportError && (
+          <p className="ob-native-error" role="alert">
+            {reportError}
+          </p>
+        )}
       </SetupProgress>
     </>
   );
 }
 
 function Setup() {
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
   useEffect(() => {
     void desktop?.ready?.();
+    return desktop?.onStartupFeedback?.(() => setFeedbackOpen(true));
   }, []);
-  return parameters.get('server') === 'true' ? (
-    <ConnectionSetup />
-  ) : parameters.get('onboarding') === 'true' ? (
-    <OnboardingSetup />
-  ) : (
-    <Startup />
+  const page =
+    parameters.get('server') === 'true' ? (
+      <ConnectionSetup />
+    ) : parameters.get('onboarding') === 'true' ? (
+      <OnboardingSetup />
+    ) : (
+      <Startup />
+    );
+  return (
+    <>
+      {page}
+      {feedbackOpen && desktop && (
+        <StartupFeedback desktop={desktop} onClose={() => setFeedbackOpen(false)} />
+      )}
+    </>
   );
 }
 

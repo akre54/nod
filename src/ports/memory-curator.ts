@@ -15,12 +15,16 @@ export interface MemoryCurator {
         | 'style'
         | 'skill'
         | 'plan'
+        | 'ideas'
         | 'brief'
         | 'vision'
         | 'classify'
-        | 'attention';
+        | 'activity'
+        | 'attention'
+        | 'check';
       instructions: string;
       input: object;
+      responseSchema?: Record<string, unknown>;
       images?: AgentImage[];
       automatic?: boolean;
     },

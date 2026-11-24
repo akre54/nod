@@ -4,6 +4,7 @@ import { createReadStream, createWriteStream } from 'node:fs';
 import {
   access,
   lstat,
+  mkdtemp,
   mkdir,
   readdir,
   readFile,
@@ -13,16 +14,22 @@ import {
   statfs,
   writeFile,
 } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { basename, isAbsolute, join, resolve } from 'node:path';
 import { Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { createGunzip } from 'node:zlib';
 import { assetHash, resumableDownload, timeLeft } from './assets.mjs';
 import { execute, finishRuntime } from './index.mjs';
+import { startupWslCode } from '../../src/shared/startup-feedback-facts.mjs';
 
 const holders = new Map();
 const distributionName = (root) =>
   `nod-${createHash('sha256').update(resolve(root).toLowerCase()).digest('hex').slice(0, 12)}`;
+const generatedComputerPath = (path, distribution) =>
+  typeof path === 'string' &&
+  isAbsolute(path) &&
+  resolve(path) === path &&
+  new RegExp(`^${distribution}-[a-zA-Z0-9]{6}$`).test(basename(path));
 export const windowsPublisher = Object.freeze({
   name: 'n8n GmbH',
   profile: '1.3.6.1.4.1.311.97.516399124.569093350.771684794.174905458',
@@ -62,12 +69,88 @@ export async function protectWindowsProfile(root, resourcesPath) {
   );
 }
 
-async function distributions(wsl, env) {
-  return (await execute(wsl, ['--list', '--quiet'], { env, encoding: 'utf16le' }))
-    .replaceAll('\uFEFF', '')
-    .split(/\r?\n/)
-    .map((value) => value.trim())
-    .filter(Boolean);
+async function readComputerState(path, distribution) {
+  let saved;
+  try {
+    saved = JSON.parse(await readFile(path, 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return;
+    throw Object.assign(
+      new Error('The Nod computer configuration needs recovery.', { cause: error }),
+      { code: 'NOD_COMPUTER_CONFIGURATION_INVALID' },
+    );
+  }
+  if (
+    !saved ||
+    saved.version !== 1 ||
+    saved.distribution !== distribution ||
+    (saved.initializing !== undefined && typeof saved.initializing !== 'boolean') ||
+    (saved.computerPath !== undefined &&
+      (typeof saved.computerPath !== 'string' || !isAbsolute(saved.computerPath))) ||
+    !/^[a-f0-9]{64}$/.test(saved.password)
+  )
+    throw Object.assign(new Error('The Nod computer configuration needs recovery.'), {
+      code: 'NOD_COMPUTER_CONFIGURATION_INVALID',
+    });
+  return saved;
+}
+
+const unrepairableWslCodes = new Set([
+  'ERROR_FILE_EXISTS',
+  'ERROR_ALREADY_EXISTS',
+  'E_ILLEGAL_STATE_CHANGE',
+  'E_ACCESSDENIED',
+  'ERROR_ACCESS_DENIED',
+  'ERROR_DISK_FULL',
+  'WSL_E_IMPORT_FAILED',
+  '0x80072747',
+  '0x800705b4',
+]);
+
+async function runWsl(wsl, args, options, source = 'host') {
+  try {
+    return await execute(wsl, args, options);
+  } catch (error) {
+    options.signal?.throwIfAborted();
+    const wslCode = startupWslCode(error.details?.match(/\bWsl\/(?:\w+\/)*(\w+)\b/)?.[1]);
+    if (wslCode) error.wslCode = wslCode;
+    if (
+      unrepairableWslCodes.has(wslCode) ||
+      (source === 'guest'
+        ? error.exitCode !== 4294967295
+        : source === 'host' && !Number.isInteger(error.exitCode))
+    )
+      throw error;
+    throw Object.assign(
+      new Error(
+        `Nod could not start WSL 2. Select Install WSL, then restart Windows and open Nod. ${error.message}`,
+      ),
+      {
+        code: 'NOD_WSL_REQUIRED',
+        exitCode: error.exitCode,
+        ...(wslCode && { wslCode }),
+        details: [error.code, error.stack || error.message, error.details]
+          .filter(Boolean)
+          .join('\n'),
+      },
+    );
+  }
+}
+
+async function distributions(wsl, env, signal) {
+  const list = async (...scope) =>
+    (await runWsl(wsl, ['--list', '--quiet', ...scope], { env, signal }))
+      .split(/\r?\n/)
+      .map((value) => value.trim())
+      .filter(Boolean);
+  const ready = await list();
+  const registered = await list('--all');
+  if (ready.some((name) => !registered.includes(name)))
+    throw Object.assign(
+      new Error('WSL returned conflicting computer states. The files were kept. Try again.'),
+      { code: 'NOD_COMPUTER_NOT_READY' },
+    );
+  return { ready, registered };
 }
 
 export async function installWsl({ signal } = {}) {
@@ -84,11 +167,38 @@ export async function installWsl({ signal } = {}) {
   );
 }
 
-async function download({ url, bytes, sha256 }, path, { signal, fetch, onProgress = () => {} }) {
+async function download(
+  { url, bytes, sha256 },
+  path,
+  { signal, fetch, onProgress = () => {}, stallTimeout = 5 * 60_000 },
+) {
+  signal?.throwIfAborted();
+  const saved = await lstat(path).catch((error) => {
+    if (error.code !== 'ENOENT') throw error;
+  });
+  if (saved?.isFile() && saved.size === bytes) {
+    if ((await assetHash(path, signal)) === sha256) {
+      onProgress(1);
+      return;
+    }
+    await rm(path, { force: true });
+  }
+  const stalled = new AbortController();
+  const downloadSignal = AbortSignal.any([...(signal ? [signal] : []), stalled.signal]);
+  let timer;
+  const alive = () => {
+    clearTimeout(timer);
+    timer = setTimeout(
+      () => stalled.abort(new Error('The Nod download stopped receiving data.')),
+      stallTimeout,
+    );
+    timer.unref?.();
+  };
   const { start, stream, interrupted } = await resumableDownload(url, path, {
     bytes,
     fetch,
-    signal,
+    signal: downloadSignal,
+    onData: alive,
   });
   const hash = createHash('sha256');
   const estimate = timeLeft();
@@ -106,12 +216,16 @@ async function download({ url, bytes, sha256 }, path, { signal, fetch, onProgres
     },
   });
   try {
-    await pipeline(stream, check, { signal });
+    alive();
+    await pipeline(stream, check, { signal: downloadSignal });
     if (received !== bytes || hash.digest('hex') !== sha256)
       throw new Error('The Nod download failed its integrity check. Try again.');
   } catch (error) {
     if (!interrupted()) await rm(path, { force: true });
+    if (stalled.signal.aborted) throw stalled.signal.reason;
     throw error;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -153,48 +267,66 @@ export async function stageWindowsUpdate(
     includeRuntime = true,
     onProgress = () => {},
     unsigned = unsignedWindowsFiles,
+    stallTimeout,
   },
 ) {
   if (
     !/^\d+\.\d+\.\d+$/.test(candidate?.version) ||
     candidate.installer?.file !== 'nod-Setup-x64.exe' ||
-    candidate.runtime?.file !== 'nod-Runtime-win32-x64.tar.gz'
+    candidate.runtime?.file !== 'nod-Runtime-win32-x64.tar.gz' ||
+    [candidate.installer, candidate.runtime].some(
+      (file) =>
+        !Number.isSafeInteger(file.bytes) ||
+        file.bytes < 1 ||
+        file.bytes > 8 * 1024 ** 3 ||
+        !/^[a-f0-9]{64}$/.test(file.sha256),
+    )
   )
     throw new Error('The Nod update is invalid.');
   const target = join(directory, candidate.version);
-  await rm(directory, { recursive: true, force: true });
   await mkdir(target, { recursive: true });
-  try {
-    const files = [candidate.installer];
-    if (includeRuntime) {
-      const installed = JSON.parse(
-        await readFile(join(resourcesPath, 'windows-runtime/manifest.json'), 'utf8').catch(
-          () => '{}',
-        ),
-      );
-      if (installed.guest?.sha256 !== candidate.runtime.sha256) files.unshift(candidate.runtime);
-    }
-    const total = files.reduce((sum, file) => sum + file.bytes, 0);
-    let done = 0;
-    for (const file of files) {
-      await download(file, join(target, file.file), {
-        signal,
-        fetch,
-        onProgress: (progress) => onProgress((done + progress * file.bytes) / total),
-      });
-      done += file.bytes;
-      onProgress(done / total);
-    }
-    if ((await unsigned([join(target, candidate.installer.file)], { signal })).length)
-      throw new Error(`The Nod update is not signed by ${windowsPublisher.name}.`);
-    return target;
-  } catch (error) {
-    await rm(directory, { recursive: true, force: true });
-    throw error;
+  for (const name of await readdir(directory))
+    if (/^\d+\.\d+\.\d+$/.test(name) && name !== candidate.version)
+      await rm(join(directory, name), { recursive: true, force: true });
+  const files = [candidate.installer];
+  if (includeRuntime) {
+    const installed = JSON.parse(
+      await readFile(join(resourcesPath, 'windows-runtime/manifest.json'), 'utf8').catch(
+        () => '{}',
+      ),
+    );
+    if (installed.guest?.sha256 !== candidate.runtime.sha256) files.unshift(candidate.runtime);
   }
+  if (files.length === 1) await rm(join(target, candidate.runtime.file), { force: true });
+  const total = files.reduce((sum, file) => sum + file.bytes, 0);
+  let done = 0;
+  for (const file of files) {
+    await download(file, join(target, file.file), {
+      signal,
+      fetch,
+      stallTimeout,
+      onProgress: (progress) => onProgress((done + progress * file.bytes) / total),
+    });
+    done += file.bytes;
+    onProgress(done / total);
+  }
+  if ((await unsigned([join(target, candidate.installer.file)], { signal })).length) {
+    await rm(join(target, candidate.installer.file), { force: true });
+    throw new Error(`The Nod update is not signed by ${windowsPublisher.name}.`);
+  }
+  return target;
 }
 
 export async function prepareWindowsRuntime(options, onComputerStart) {
+  const progress = { step: 'wsl' };
+  try {
+    return await prepareWindows(options, onComputerStart, progress);
+  } catch (error) {
+    throw Object.assign(error, { step: error.step ?? progress.step });
+  }
+}
+
+async function prepareWindows(options, onComputerStart, progress) {
   const dataRoot = resolve(options.dataRoot || options.root);
   const resourcesPath = resolve(options.resourcesPath || options.resources);
   const signal = options.signal;
@@ -202,23 +334,11 @@ export async function prepareWindowsRuntime(options, onComputerStart) {
   const status = (value) => onStatus({ stage: 'computer', ...value });
   const hostEnvironment = windowsEnvironment();
   const wsl = join(hostEnvironment.SYSTEMROOT, 'System32/wsl.exe');
-  try {
-    await execute(wsl, ['--status'], { env: hostEnvironment, signal, timeout: 15_000 });
-  } catch (error) {
-    signal?.throwIfAborted();
-    throw Object.assign(
-      new Error(
-        `Nod could not start WSL 2. Select Install WSL, then restart Windows and open Nod. ${error.message}`,
-      ),
-      {
-        code: 'NOD_WSL_REQUIRED',
-        details: [error.code, error.stack || error.message, error.details]
-          .filter(Boolean)
-          .join('\n'),
-      },
-    );
-  }
+  const host = (args, extra) => runWsl(wsl, args, { env: hostEnvironment, signal, ...extra });
+  await runWsl(wsl, ['--status'], { env: hostEnvironment, signal, timeout: 15_000 }, 'probe');
+  progress.step = 'profile';
   await protectWindowsProfile(dataRoot, resourcesPath);
+  progress.step = 'assets';
   const controlRoot = join(dataRoot, 'desktop-runtime');
   await mkdir(controlRoot, { recursive: true });
   const assets = join(resourcesPath, 'windows-runtime');
@@ -259,38 +379,56 @@ export async function prepareWindowsRuntime(options, onComputerStart) {
     throw new Error('The Windows transport failed its integrity check.');
   const distribution = distributionName(dataRoot);
   const configPath = join(controlRoot, 'state.json');
-  let saved;
-  try {
-    saved = JSON.parse(await readFile(configPath, 'utf8'));
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw new Error('The Nod computer configuration needs recovery.');
-  }
-  let existing = (await distributions(wsl, hostEnvironment)).includes(distribution);
-  if (existing && !saved) {
-    await execute(wsl, ['--unregister', distribution], {
-      env: hostEnvironment,
-      signal,
-      timeout: 300_000,
-    });
+  let saved = await readComputerState(configPath, distribution);
+  progress.step = 'wsl';
+  const { ready, registered } = await distributions(wsl, hostEnvironment, signal);
+  let existing = ready.includes(distribution);
+  if (!saved && registered.includes(distribution))
+    throw Object.assign(
+      new Error(
+        'Nod found an existing private computer without its saved configuration. Its files were kept. Restore the configuration, then try again.',
+      ),
+      { code: 'NOD_COMPUTER_CONFIGURATION_MISSING' },
+    );
+  if (saved && !existing && saved.initializing !== true)
+    throw Object.assign(
+      new Error(
+        'WSL did not report the saved Nod computer as ready. Its files were kept. Restart Windows, then try again.',
+      ),
+      {
+        code: registered.includes(distribution)
+          ? 'NOD_COMPUTER_NOT_READY'
+          : 'NOD_COMPUTER_REGISTRATION_MISSING',
+      },
+    );
+  if (registered.includes(distribution) && saved.initializing === true) {
+    await host(['--unregister', distribution], { timeout: 300_000 });
     existing = false;
   }
-  if (
-    saved &&
-    (saved.version !== 1 ||
-      saved.distribution !== distribution ||
-      !/^[a-f0-9]{64}$/.test(saved.password))
-  )
-    throw new Error('The Nod computer configuration needs recovery.');
+  if (saved?.initializing === true && generatedComputerPath(saved.computerPath, distribution))
+    await rm(saved.computerPath, { recursive: true, force: true });
+  progress.step = 'assets';
   saved ??= {
     version: 1,
     distribution,
     password: randomBytes(32).toString('hex'),
     guest: manifest.guest.sha256,
   };
+  saved.initializing = !existing;
+  const computerPath = existing
+    ? saved.computerPath
+    : options.computerDirectory
+      ? resolve(options.computerDirectory)
+      : controlRoot;
   const guestArgs = ['--distribution', distribution, '--user', 'root', '--exec'];
+  const guest = (command, extra) =>
+    runWsl(wsl, [...guestArgs, ...command], { env: hostEnvironment, signal, ...extra }, 'guest');
   const temporaryState = `${configPath}.${randomBytes(6).toString('hex')}.tmp`;
-  await writeFile(temporaryState, JSON.stringify(saved), { flag: 'wx' });
-  await rename(temporaryState, configPath);
+  const save = async () => {
+    await writeFile(temporaryState, JSON.stringify(saved), { flag: 'wx' });
+    await rename(temporaryState, configPath);
+  };
+  await save();
   onComputerStart();
   if (!existing || saved.guest !== manifest.guest.sha256) {
     status({ phase: 'installing', message: 'Installing your private computer…' });
@@ -308,18 +446,38 @@ export async function prepareWindowsRuntime(options, onComputerStart) {
         await rm(join(controlRoot, name), { force: true });
     const archive = present ? placed : join(controlRoot, archiveName);
     const partial = present ? 0 : ((await stat(archive).catch(() => undefined))?.size ?? 0);
-    const space = await statfs(controlRoot);
-    const required =
-      manifest.guest.expandedBytes * 2 +
-      manifest.images.reduce((bytes, image) => bytes + image.size, 0) +
+    const elsewhere = !existing && options.computerDirectory;
+    if (elsewhere) await mkdir(computerPath, { recursive: true });
+    const free = async (path) => {
+      const space = await (options.inspectDisk ?? statfs)(path);
+      return {
+        bytes: Number(space.bavail) * Number(space.bsize),
+        device: space.dev ?? (await stat(path)).dev,
+      };
+    };
+    const computer =
+      manifest.guest.expandedBytes +
+      manifest.images.reduce((bytes, image) => bytes + image.size, 0);
+    const staging =
+      manifest.guest.expandedBytes +
       (present ? 0 : Math.max(0, manifest.guest.bytes - partial)) +
       2 * 1024 ** 3;
-    if (space.bavail * space.bsize < required)
-      throw new Error(
-        'Nod needs more free disk space to prepare its private computer. Free space, then select Try again.',
+    const sourceSpace = await free(controlRoot);
+    const targetSpace = elsewhere ? await free(computerPath) : sourceSpace;
+    const separateDrive = sourceSpace.device !== targetSpace.device;
+    if (
+      sourceSpace.bytes < staging + (separateDrive ? 0 : computer) ||
+      (separateDrive && targetSpace.bytes < computer + 2 * 1024 ** 3)
+    )
+      throw Object.assign(
+        new Error(
+          existing
+            ? 'Nod needs more free disk space to prepare its private computer. Free space, then select Try again.'
+            : 'Nod needs more free disk space to prepare its private computer. Free space, or select Choose folder to keep the private computer on another drive.',
+        ),
+        existing ? {} : { code: 'NOD_COMPUTER_STORAGE_FULL' },
       );
-    const guest = join(controlRoot, 'guest.tar');
-    let downloaded = false;
+    const image = join(controlRoot, 'guest.tar');
     try {
       if (!present) {
         if (!options.resolveDownloadUrl)
@@ -327,6 +485,7 @@ export async function prepareWindowsRuntime(options, onComputerStart) {
             'Put nod-Runtime-win32-x64.tar.gz next to nod-Setup-x64.exe, then run the installer again.',
           );
         const message = 'Downloading your private computer…';
+        progress.step = 'download';
         status({ phase: 'downloading', message, progress: 0 });
         await download(
           { ...manifest.guest, url: await options.resolveDownloadUrl(manifest, signal) },
@@ -338,9 +497,9 @@ export async function prepareWindowsRuntime(options, onComputerStart) {
               status({ phase: 'downloading', message, progress, secondsLeft }),
           },
         );
-        downloaded = true;
         status({ phase: 'installing', message: 'Installing your private computer…' });
       }
+      progress.step = 'extract';
       let expanded = 0;
       const gunzip = createGunzip();
       gunzip.on('data', (bytes) => {
@@ -348,27 +507,26 @@ export async function prepareWindowsRuntime(options, onComputerStart) {
         if (expanded > manifest.guest.expandedBytes)
           gunzip.destroy(new Error('The Windows computer image is too large.'));
       });
-      await pipeline(createReadStream(archive), gunzip, createWriteStream(guest), { signal });
+      await pipeline(createReadStream(archive), gunzip, createWriteStream(image), { signal });
       if (expanded !== manifest.guest.expandedBytes)
         throw new Error('The Windows computer image has an unexpected size.');
       if (!existing) {
-        await mkdir(join(controlRoot, 'wsl'), { recursive: true });
-        await execute(
-          wsl,
-          ['--import', distribution, join(controlRoot, 'wsl'), guest, '--version', '2'],
-          { env: hostEnvironment, signal, timeout: 1_200_000 },
-        );
-      } else {
-        const identity = await execute(wsl, [...guestArgs, '/bin/cat', '/var/lib/nod/identity'], {
-          env: hostEnvironment,
-          signal,
+        progress.step = 'import';
+        await mkdir(computerPath, { recursive: true });
+        saved.initializing = true;
+        saved.computerPath = await mkdtemp(join(computerPath, `${distribution}-`));
+        if (elsewhere) await protectWindowsProfile(saved.computerPath, resourcesPath);
+        await save();
+        await host(['--import', distribution, saved.computerPath, image, '--version', '2'], {
+          timeout: 1_200_000,
         });
-        if (identity !== distribution.slice(4))
+        saved.initializing = false;
+      } else {
+        progress.step = 'update';
+        if ((await guest(['/bin/cat', '/var/lib/nod/identity'])) !== distribution.slice(4))
           throw new Error('The Nod computer identity changed.');
-        await execute(
-          wsl,
+        await guest(
           [
-            ...guestArgs,
             '/bin/tar',
             '-xf',
             '-',
@@ -377,31 +535,23 @@ export async function prepareWindowsRuntime(options, onComputerStart) {
             'opt/nod-assets',
             'usr/local/lib/nod/windows-guest.py',
           ],
-          { env: hostEnvironment, signal, timeout: 900_000, input: createReadStream(guest) },
+          { timeout: 900_000, input: createReadStream(image) },
         );
       }
       saved.guest = manifest.guest.sha256;
-      await writeFile(temporaryState, JSON.stringify(saved), { flag: 'wx' });
-      await rename(temporaryState, configPath);
+      await save();
     } finally {
-      await rm(guest, { force: true });
-      if (downloaded) await rm(archive, { force: true });
+      await rm(image, { force: true });
     }
-    await rm(placed, { force: true });
+    await rm(archive, { force: true });
   }
+  progress.step = 'start';
   status({ phase: 'starting', message: 'Starting your private computer…' });
-  const runGuest = (input) =>
-    execute(wsl, [...guestArgs, '/bin/bash', '-s'], { env: hostEnvironment, signal, input });
-  await execute(
-    wsl,
-    [...guestArgs, '/usr/bin/python3', '/usr/local/lib/nod/windows-guest.py', 'start'],
-    {
-      env: hostEnvironment,
-      signal,
-      input: JSON.stringify({ identity: distribution.slice(4) }),
-      timeout: 900_000,
-    },
-  );
+  const runGuest = (input) => guest(['/bin/bash', '-s'], { input });
+  await guest(['/usr/bin/python3', '/usr/local/lib/nod/windows-guest.py', 'start'], {
+    input: JSON.stringify({ identity: distribution.slice(4) }),
+    timeout: 900_000,
+  });
   if (!holders.has(distribution)) {
     const holder = spawn(wsl, [...guestArgs, '/usr/bin/sleep', 'infinity'], {
       env: hostEnvironment,
@@ -442,18 +592,15 @@ export async function prepareWindowsRuntime(options, onComputerStart) {
       execute(docker, args, { env: dockerEnvironment, signal, ...extra }),
     runGuest,
     signal,
-    status: (phase, message, stage) => status({ phase, message, stage }),
+    status: (phase, message, stage) => {
+      if (stage) progress.step = stage;
+      status({ phase, message, stage });
+    },
     prepareImage: async (name) => {
-      await execute(
-        wsl,
-        [...guestArgs, '/usr/bin/python3', '/usr/local/lib/nod/windows-guest.py', 'image'],
-        {
-          env: hostEnvironment,
-          signal,
-          input: JSON.stringify({ identity: distribution.slice(4), name }),
-          timeout: 600_000,
-        },
-      );
+      await guest(['/usr/bin/python3', '/usr/local/lib/nod/windows-guest.py', 'image'], {
+        input: JSON.stringify({ identity: distribution.slice(4), name }),
+        timeout: 600_000,
+      });
     },
     onStorageReady: options.onStorageReady,
   });
@@ -465,9 +612,12 @@ export async function stopWindowsRuntime(options) {
   const env = windowsEnvironment();
   const wsl = join(env.SYSTEMROOT, 'System32/wsl.exe');
   try {
-    const saved = JSON.parse(await readFile(join(dataRoot, 'desktop-runtime/state.json'), 'utf8'));
-    if (saved.version !== 1 || saved.distribution !== distribution) throw new Error();
-    if ((await distributions(wsl, env)).includes(distribution)) {
+    const saved = await readComputerState(
+      join(dataRoot, 'desktop-runtime/state.json'),
+      distribution,
+    );
+    if (!saved) return;
+    if ((await distributions(wsl, env)).ready.includes(distribution)) {
       await execute(
         wsl,
         [
@@ -495,6 +645,7 @@ export async function stopWindowsRuntime(options) {
     throw Object.assign(
       new Error(
         'Nod could not confirm that its private computer stopped. Try again before quitting.',
+        { cause: error },
       ),
       { code: 'NOD_RUNTIME_STOP_FAILED' },
     );
@@ -505,6 +656,15 @@ export async function removeWindowsComputer(dataRoot) {
   const distribution = distributionName(dataRoot);
   const env = windowsEnvironment();
   const wsl = join(env.SYSTEMROOT, 'System32/wsl.exe');
-  if ((await distributions(wsl, env).catch(() => [])).includes(distribution))
+  const saved = await readComputerState(join(dataRoot, 'desktop-runtime/state.json'), distribution);
+  const listed = await distributions(wsl, env);
+  if (listed.registered.includes(distribution))
     await execute(wsl, ['--unregister', distribution], { env, timeout: 300_000 });
+  if (
+    saved?.distribution === distribution &&
+    typeof saved.computerPath === 'string' &&
+    (basename(saved.computerPath) === distribution ||
+      generatedComputerPath(saved.computerPath, distribution))
+  )
+    await rm(saved.computerPath, { recursive: true, force: true });
 }

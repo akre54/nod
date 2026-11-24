@@ -16,17 +16,20 @@ Ask in chat. For example:
 - "Every weekday at 8:00, summarize my calendar and anything urgent in my inbox."
 - "Tomorrow at 15:00, remind me to call the landlord."
 
-A schedule runs **One time** or is **Recurring**. Nod tells you when it's saved and when it runs next. If you ask for a schedule that's already active with the same name or instruction, time and chat, Nod keeps the one you have instead of adding a copy. When you hand Nod work that needs follow-up, it can also plan its own check-in, such as "I'll look for a reply on Friday". Check-ins are schedules too.
+A schedule runs **One time** or is **Recurring**. Nod tells you when it's saved and when it runs next. If you ask for a schedule that's already active with the same name or instruction, time and chat, Nod keeps the one you have instead of adding a copy, and uses the model you named for it, if any. When you hand Nod work that needs follow-up, it can also plan its own check-in, such as "I'll look for a reply on Friday". Check-ins are schedules too.
 
 Nod uses your time zone, saved from your browser the first time you use Nod. Change it in **Settings → General**. If Nod doesn't know your time zone, it asks.
 
 ## Change, pause or delete a schedule
 
-Open **Scheduled**. Select **New schedule** to start a conversation with Nod, which asks one question at a time about what to do and when. Existing schedules show their timing and next run.
+Open **Scheduled**. Select **New schedule** to start a conversation with Nod, which asks one question at a time about what to do and when. Each schedule is one row with its timing, next run and model.
+
+Below your schedules, **Scheduled** always shows three ideas to start from, mostly about your day, your calendar and regular reminders. They follow the apps you've connected and change each time you open the page. When a common app such as Google Calendar isn't connected yet, one idea uses it and says so. Select an idea to ask Nod in chat to set it up, and to help you connect the app first when it needs one. Up to two ideas can come from [your own messages](#ideas-from-your-messages).
 
 - Use the switch to pause or resume it.
-- Select **Run now** to start one run and open its history.
-- Select **See details** to read the instruction, any saved baseline, and that schedule's runs.
+- Select its model to give this schedule a different one. See [Choose a model for a schedule](#choose-a-model-for-a-schedule).
+- Select its name to read the instruction, its expected cost, any saved baseline, and that schedule's runs. When you have only one schedule, or only one active schedule, it's already open when you open the page.
+- Select **Run now**, the play button on its row, to start one run. The row opens so you can follow it.
 - Select **Edit schedule** to change its name, instructions or timing.
 - Select **Ask Nod** to change it in your own words.
 - Select **Delete schedule**. Future runs stop, and past activity stays in [Usage](/use/spending/).
@@ -35,13 +38,25 @@ Pausing or deleting a schedule here removes any unanswered request to change or 
 
 In chat, "stop the morning summary" asks Nod to pause the schedule. If Nod asks for confirmation, it stays active until you approve. Once paused, you can resume it in **Scheduled**; use **Delete schedule** to remove it.
 
+### Ideas from your messages
+
+Up to two of the ideas on **Scheduled** can come from your own chat messages, such as a reminder for something you do every Friday. **Scheduled** shows the ideas Nod saved last time. When you open it, at most once a day and only when you've written since the last check, Nod reads up to 20 of your most recent messages, at most 12,000 characters, and asks the smaller model it uses for memory upkeep for up to three new ideas, in one request with a short reply and no retries. They replace the saved ones when ready.
+
+Nod reads the same messages memory learns from: your own words, at least 10 minutes old, without attachments, withdrawn requests or a task card you tapped. It never reads Nod's replies, app content or files, and leaves out messages with a password, code or card number. The model is asked to skip what your schedules already cover. Nod drops ideas for apps you haven't connected and ideas with the same title as one of your schedules, and hides an idea once you've sent it until the next check. Like memory, it leaves out ideas the model marks as about a [sensitive topic](/use/memory/#sensitive-topics), such as health, religion or politics, unless **Include sensitive details** is on.
+
+These checks are background work, like memory upkeep: they work from your first day, don't need **Automatic preparation** and don't use its allowance. They stop when you reach your monthly spending limit. When there's no new message, the limit is reached, or a check fails, Nod keeps the ideas it saved, or shows only the common ones. Turning off **Save new notes** in **Settings → Memory** stops the checks and hides saved ideas, and **Remove all data** deletes them. A request you withdraw after a check read it can still shape the saved ideas until the next check. The request is never sent with [conversation traces](/trust/conversation-traces/).
+
 ## Run a schedule now
 
-Open **Scheduled** and select **Run now** on a schedule. Nod opens its details so you can follow the run. The new result opens when it is available.
+Open **Scheduled** and select **Run now**, the play button on a schedule's row. The row opens so you can follow the run. The new result opens when it is available. A run that failed in chat offers **Run now** too. If you changed the schedule after that run failed, Nod refuses and asks you to review it first.
 
-The extra run uses the saved instruction and delivery channel. The usual approval checks still apply. It does not change the next scheduled time or resume a paused schedule. You can also run a completed one-time schedule again.
+The extra run uses the saved instruction and delivery channel and does its work now, even when the instruction names another day or time. The usual approval checks still apply, and the time named in the instruction never makes them ask. It does not change the next scheduled time or resume a paused schedule. You can also run a completed one-time schedule again.
 
-The button shows **Queued**, **Working**, or **Needs your input** while a run is active. You cannot start another run until that run ends. A recurring schedule skips timed runs that fall due during an active run. A one-time schedule waits for the active run to end.
+The button shows **Queued**, **Working**, or **Needs your input** while a run is active. You cannot start another run until that run ends. A recurring schedule skips timed runs that fall due while a run is queued or working; a run waiting for your answer gives way to the next timed run. A one-time schedule waits for the active run to end.
+
+Select **Stop this run** to stop only that run, including work waiting for your answer. Future runs stay enabled. A watch runs at its next scheduled time even when its accounts have no changes. The control does not pause the schedule. To stop future runs, use the schedule's pause switch. Actions that already reached an app may have completed. Check their result before you start another run.
+
+Select **Needs your input** to open the run's current question in Chat, where you can approve an action or complete sign-in. This opens the existing request without starting another run.
 
 **Run now** runs a watch even when its connected accounts have no changes. If the connection drops, **Try again** checks or starts the same run. It cannot start a second copy.
 
@@ -57,26 +72,30 @@ flowchart TD
 ```
 
 - **It runs next to your chat.** A schedule doesn't wait for the conversation, and the conversation doesn't wait for it.
+- **Follow a run in Scheduled.** The schedule shows what Nod is doing, such as reading files or using an app. Open the live line to see recent completed activity when it is available.
 - **What you asked to get arrives every time.** A summary, brief or reminder comes on every run. A watch or check-in messages you only when something needs you, such as a real price drop, a problem or a question. Routine checks stay quiet.
 - **A failed run tells you.** If a run stops on an error, Nod sends a short message that names the schedule and says what stopped it, so a missing summary never goes unnoticed.
 - **It replies where you asked.** A schedule you set up on Telegram sends its messages to Telegram.
-- **Approvals still apply.** Each action is checked against the instruction that created the schedule. If an action isn't covered, Nod asks you first, naming the schedule and what it's for. If the check itself can't decide, the action doesn't run and you aren't asked. See [Approvals](/trust/approvals/).
-- **One run at a time.** While a run is still queued, working or waiting for your answer, a recurring schedule skips its next runs. A one-time schedule waits for the active run to end. A run does its work itself and can't set up more schedules.
-- **Watches skip unchanged runs.** When a recurring check can only find something new after a change in your connected accounts, such as waiting for a reply, Nod saves which accounts it watches. Before each run, Nod checks those accounts for new mail, changed events or app activity without a model call, and skips the run when nothing changed since the last finished run. The first run, and the run after a failed one, always run. Reminders, digests, websites and checks tied to a time don't skip.
+- **Corrections keep the rest.** Nod keeps the owner request and later changes used to set up the schedule. “Every hour instead” changes timing. “Send it to Lena instead” changes the recipient. Other limits stay in effect, and a later “only summarize” removes an earlier send request. Timing changes keep their owner request even when the work instruction stays the same. There is no ten-change reset.
+- **Approvals still apply.** Each outside action passes the same [trust check](/trust/approvals/). The checker gets the saved owner inputs in order, the exact proposal a reply answered, and the run time. Earlier eligible owner messages can explain “it” or “that folder”; they cannot grant another action. Chat, tasks and schedules use the same source-selection rules. LLM and decision-model checks receive the same evidence. If your instructions do not cover an action, Nod asks first. If the check cannot decide, the action does not run and Nod does not ask.
+- **A complete instruction approval has a clear scope.** When you approve a new complete schedule instruction, Nod shows its future work, targets, timing and limits. That approval can cover the recurring work it describes. Approving a name or timing change changes only those fields. Approving one email never grants recurring sends.
+- **Saved instructions stay traceable.** Each run keeps its execution request, run time and owner inputs. Required messages that become withdrawn or unavailable cannot return as permission. Nod then refuses work that needs them. You can save a complete replacement in **Schedules**, or approve a complete replacement Nod proposes. A check that cannot process the complete request refuses it; it never drops older limits to fit. Existing schedules keep their known instruction without guessed earlier context. Some schedules changed through an older Nod version have incomplete permission history. To use them again, edit their complete instruction in **Schedules**, or approve a complete replacement that Nod proposes.
+- **One run at a time.** While a run is still queued or working, a recurring schedule skips its next runs. A run waiting for your answer doesn't hold up the schedule: the next timed run replaces it and asks again if it needs to, and editing or deleting the schedule ends it. A one-time schedule waits for the active run to end. A run does its work itself and can't set up more schedules.
+- **Watches skip unchanged runs.** When a recurring check can only find something new after a change in your connected accounts, such as waiting for a reply, Nod saves which accounts it watches. Before each run, Nod checks those accounts for new mail, changed events or app activity without a model call, and skips the run when nothing changed since the last finished run. The first run, and the run after a failed or stopped one, always run. Reminders, digests, websites and checks tied to a time don't skip.
 
-Open a schedule's **See details** to read its runs, newest first. Select **Load earlier runs** for older results. Completed one-time schedules remain under **Inactive**, with their runs available to review.
+Select a schedule's name in **Scheduled** to read its runs, newest first. Select **Load earlier runs** for older results. Completed one-time schedules remain under **Inactive**, with their runs available to review.
 
-Each run shows its status. When a saved web reply is available, select **See details** on the result to read it within the schedule. Runs with complete API pricing also show their recorded cost. Subscription usage and runs with unavailable pricing show no cost amount. Review recorded app actions and activity from deleted schedules in [Usage](/use/spending/).
+Each run is one line with its time, status, the start of its result and its cost. Select a run to read its full result beside the list, or below it on a narrow screen; the latest run is selected first. When a run shares files, select **Show files in chat** to open them. Runs with complete API pricing also show their recorded cost. Subscription usage and runs with unavailable pricing show no cost amount. Review recorded app actions and activity from deleted schedules in [Usage](/use/spending/).
 
 ## Work Nod starts on its own
 
-Nod reads every app you connect on its own, prepares useful work privately and messages you only when it's worth it. See [Nudges](/use/nudges/). There's nothing to turn on. At any time, you can say what's worth interrupting you for, such as "tell me when a client emails", and Nod uses it to choose what to flag.
+Nod watches Gmail and Google Calendar on its own, prepares useful work privately and messages you only when it's worth it. See [Nudges](/use/nudges/). Turn on **Automatic preparation** in **Settings → Notifications**. New profiles start with it off. At any time, you can say what's worth interrupting you for, such as "tell me when a client emails", and Nod uses it to choose what to flag.
 
 How Nod checks:
 
-- **Gmail.** Nod checks for new inbox mail every 15 minutes. Each new message starts a quiet private run that decides whether there's useful work, such as preparing a reply.
+- **Gmail.** Nod checks for new inbox mail every 15 minutes. If a check is temporarily unavailable, it keeps the messages already found and schedules another check one to five minutes later. Each new message starts a quiet private run that decides whether there's useful work, such as preparing a reply.
 - **Google Calendar.** Nod checks for changed events every 30 minutes without a model call.
-- **Other connected apps.** Every 30 minutes, one quiet private run reads them through their own read tools.
+- **Other connected apps.** No periodic check. An app event starts preparation. You can still ask Nod to read them in chat or in a schedule.
 
 Work Nod starts on its own reads and drafts. It sends, deletes or changes something only when you've told it to do that on its own, such as "whenever Ana sends an invoice, forward it to accounting@acme.com". Anything else waits for your yes. [Your rules](/trust/approvals/#your-rules) can change both: a rule to go ahead lets an action run without asking, and a rule to ask first makes Nod ask even when your standing instruction covers the action. See [Standing instructions](/trust/approvals/#standing-instructions). To change or stop it, tell Nod, for example "stop flagging Slack messages".
 
@@ -86,9 +105,13 @@ The first time Nod messages you about something on its own, such as a calendar c
 
 ## Edit schedule details
 
-Select **Edit schedule** to review its name, instructions and timing together. Timing changes preview the next run without changing the saved schedule. **Save changes** applies only the fields you changed, so renaming a schedule keeps its next run. **Cancel** closes the editor without saving.
+Select **Edit schedule** to review its name, instructions and timing together. Timing changes preview the next run without changing the saved schedule. **Save changes** applies only the fields you changed, so renaming a schedule keeps its next run. Editing the complete work instruction supplies a new complete instruction. A name or timing edit keeps the existing work and its permission limits. **Cancel** closes the editor without saving.
 
 **Undo** restores the previous values only if no newer change has replaced them. The Undo notice stays available while you hover over it, focus it, or switch away from Nod. If the schedule changes while you edit, your draft stays open so you can review it.
+
+### Choose a model for a schedule
+
+A schedule uses the model for schedules from **Settings > Models**. To give one schedule its own model, select the model on its row in **Scheduled**. When the schedule has priced usage in the last 30 days, the list shows what that work would have cost on each model; otherwise it shows each model's token prices. Choose **Same as schedules** to follow **Settings > Models** again. The schedule's details show its expected cost a month on its model and what it cost in the last 30 days. The change applies from the next turn, so a run that waits for your answer continues on the new model. When a recurring schedule shows a projected monthly cost, it prices the schedule's recent runs on that model. See [Models for each kind of work](/connect/models/#models-for-each-kind-of-work).
 
 ## Quiet hours
 
@@ -105,6 +128,8 @@ A local desktop assistant runs schedules and background work only while Nod is o
 For a local assistant, closing the window keeps Nod running in the menu bar or tray. **Quit Nod** stops it. **Open at login** is on after setup; keep it on in **Settings → General** if you rely on schedules. It starts Nod when you sign in to your computer, not when the computer turns on, so after a restart or power cut nothing runs until you sign in. On a Mac with FileVault turned on, automatic login is off, so someone has to enter your password after every restart.
 
 If a run comes due while the assistant is stopped, it runs once when Nod is running again. If a run starts more than 10 minutes late, its instructions include the due time and start time. If later runs of a recurring schedule were skipped, the instructions also include that count. Counts of 100 or more are shown as "100 or more".
+
+You see the same in chat. The first message of a late run, or of a run after skipped ones, starts with a run track: when the run was due, the runs Nod skipped while it wasn't running, and when it ran. A recurring schedule also skips its timed runs while automatic requests to its model are paused after failed requests; those show on the track of its next run, with that reason. A run that fails at the model shows the track with why it failed, a **Run now** button and, when the model request found no network, the error code. In the desktop app's local assistant, that failure also links to [running Nod on a server](/deploy/self-host/) so schedules keep running while the computer sleeps. The track is written by Nod, not by the model.
 
 ## Related resources
 

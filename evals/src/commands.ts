@@ -22,6 +22,7 @@ import { defaultJudge, defaultModel, runSuite, slug, type RunOptions } from './r
 import { scenarios } from './scenarios/index.ts';
 import { loadEnvironment, parseModel } from './stack.ts';
 import { listRuns, loadRun, resultsRoot, saveRun } from './store.ts';
+import { capabilityMatrix, capabilityTable } from './model-capabilities.ts';
 import type { RunSummary } from './results.ts';
 
 const help = `Nod capability evals
@@ -31,7 +32,7 @@ const help = `Nod capability evals
     run [--tier pr|full|release|live]  run the suite and print the pass rate, trust profile and what went wrong
     list                       show every scenario
     decisions --model <provider/name>  compare trust checks with main using live models and synthetic inputs
-                               (--baseline main, --repeat 3, --scenario a,b, --arms main-llm,branch-llm,gpt-decisions,jev-openrouter, --decision-model provider/model, --label name, --out directory)
+                               (--baseline main, --repeat 3, --scenario a,b, --arms main-llm,selected-llm,branch-llm,gpt-decisions,jev-openrouter, --decision-model provider/model, --label name, --out directory)
     longmemeval --data <file>  run the LongMemEval-S memory benchmark on the real Nod, graded by the official judge
                                (--setups memory,chat, --sample 30, --chat-sample 10, --questions a,b,
                                 --concurrency 6, --budget 50, --label name, --resume)
@@ -51,6 +52,8 @@ const help = `Nod capability evals
     promote <label>...         give calibrated scenarios that passed all of at least 5 attempts a place in the
                                gate, and remove the ones that did not (writes evals/gate.json)
     runs                       list saved runs
+    capabilities [--json]      the model capability matrix: what each model's catalog entry declares, and the
+                               newest saved computer use, tool selection and coding scores for that model
     charts <label>... | --prefix <p> [--desktop]   render the comparison as sleek PNG images
     slack <label>... | --prefix <p>                 draft the Slack summary with the leaderboard
 
@@ -67,6 +70,7 @@ const help = `Nod capability evals
 
   Common options for run, models and refs
     --model <provider/name>    agent model (default from LLM_PROVIDER, LLM_MODEL or the keys you have)
+    --background-model <name>  model for work Nod starts on its own: light, or a model on the --model provider
     --judge <provider/name>    judge model (default ${defaultJudge}, kept fixed so runs stay comparable)
     --tier pr|full|release|live  default full: all controlled cases except the release suite, including
                                pending cases; pr is the small suite; release adds the release suite;
@@ -95,6 +99,7 @@ function runOptions(args: Args): RunOptions {
   return {
     root: resultsRoot(text(args, 'out')),
     model: text(args, 'model'),
+    backgroundModel: text(args, 'background-model'),
     ...(text(args, 'effort')
       ? {
           effort: choice(
@@ -415,6 +420,11 @@ export async function main(args: Args) {
     case 'runs':
       console.log(runsTable(await listRuns(root)));
       return;
+    case 'capabilities': {
+      const rows = await capabilityMatrix(await listRuns(root));
+      console.log(has(args, 'json') ? JSON.stringify(rows, null, 2) : capabilityTable(rows));
+      return;
+    }
     case 'proactivity-report': {
       if (!first) throw new Error('Give a saved run label.');
       const run = await loadRun(root, first);

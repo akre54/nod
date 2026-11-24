@@ -10,7 +10,8 @@ export interface TrustOutside {
 export type TrustBecause =
   | { kind: 'message'; text: string; whole?: true }
   | { kind: 'schedule' | 'standing' | 'rule'; text: string }
-  | { kind: 'approved' };
+  | { kind: 'approved' }
+  | { kind: 'scheduleApproval' };
 
 export interface TrustAction {
   label: string;
@@ -39,6 +40,7 @@ export function actionText(action: Pick<TrustAction, 'label' | 'target'>) {
 
 export function becauseText(reason: TrustBecause) {
   if (reason.kind === 'approved') return 'You approved it';
+  if (reason.kind === 'scheduleApproval') return 'You approved this schedule';
   if (reason.kind === 'message' && reason.whole) return 'You asked for it';
   const quote = `“${reason.text}”`;
   if (reason.kind === 'message') return `You said ${quote}`;

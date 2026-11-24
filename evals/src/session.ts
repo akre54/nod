@@ -21,7 +21,12 @@ export interface Session {
   interruptWhen(first: string, ready: () => Promise<boolean>): Promise<void>;
   sayDuringWithAttachments(first: string, interjection: string, attach: string[]): Promise<void>;
   upload(name: string, bytes: Buffer, mimeType?: string): Promise<string>;
-  api(method: string, path: string, body?: unknown): Promise<{ status: number; body: any }>;
+  api(
+    method: string,
+    path: string,
+    body?: unknown,
+    redirect?: RequestRedirect,
+  ): Promise<{ status: number; body: any }>;
   proactivity: Stack['proactivity'];
   fireSchedules(): Promise<number>;
   event(summary: string, sources?: string[]): Promise<string>;
@@ -153,7 +158,7 @@ export function createSession(options: {
   async function pendingFor(turn: { id: string; waiting_reason: string }, text: string) {
     const approval = (
       await pool.query(
-        `SELECT id,action,args,confirmation_message_id FROM approvals WHERE turn_id=$1 AND status='pending' ORDER BY ${await approvalOrder(pool)} DESC LIMIT 1`,
+        `SELECT id,action,args,details - 'reason' AS shown,confirmation_message_id FROM approvals WHERE turn_id=$1 AND status='pending' ORDER BY ${await approvalOrder(pool)} DESC LIMIT 1`,
         [turn.id],
       )
     ).rows[0];
@@ -221,8 +226,10 @@ export function createSession(options: {
     };
   }
 
-  function approves(action: string, args: unknown) {
-    return typeof user.approve === 'function' ? user.approve(action, args) : (user.approve ?? true);
+  function approves(action: string, args: unknown, shown?: unknown) {
+    return typeof user.approve === 'function'
+      ? user.approve(action, args, shown)
+      : (user.approve ?? true);
   }
 
   async function respond(scheduled = false): Promise<boolean> {
@@ -233,7 +240,7 @@ export function createSession(options: {
     if (pending.kind === 'approval') {
       const reply = user.approvalReplies
         ? user.approvalReplies[approvalIndex++]
-        : approves(pending.approval.action, pending.approval.args)
+        : approves(pending.approval.action, pending.approval.args, pending.approval.shown)
           ? 'Yes'
           : 'No';
       if (reply === undefined) {
@@ -407,11 +414,12 @@ export function createSession(options: {
       return (await response.json()).id as string;
     },
     proactivity: stack.proactivity,
-    async api(method, path, body) {
+    async api(method, path, body, redirect) {
       if (new URL(path, stack.origin).origin !== stack.origin)
         throw new Error('Scenario API calls must stay on the Nod server.');
       const response = await stack.request(path, {
         method,
+        redirect,
         headers: { 'content-type': 'application/json', origin: stack.origin },
         body: body === undefined ? undefined : JSON.stringify(body),
       });

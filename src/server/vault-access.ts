@@ -257,7 +257,7 @@ export async function createVaultAccess(
   ) {
     const { rows } = await pool.query<Omit<Row, 'cursor'>>(
       `SELECT id,at,action,origin,item_id,item_kind,amount_minor,currency,task,reason,basis,
-       EXISTS(SELECT 1 FROM messages m WHERE a.basis->>'kind'='message'
+       EXISTS(SELECT 1 FROM messages m WHERE a.basis->>'kind' IN ('message','schedule')
          AND m.owner_id=$1 AND m.id=(a.basis->>'messageId')::uuid) AS said
        FROM vault_activity a
        WHERE owner_id=$1 AND ($2::timestamptz IS NULL OR at>=$2) AND ($3::timestamptz IS NULL OR at<$3)
@@ -279,7 +279,7 @@ export async function createVaultAccess(
     const { rows } = await pool.query<Row>(
       `SELECT id,at,to_char(at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor,
        action,origin,item_id,item_kind,amount_minor,currency,task,reason,basis,
-       EXISTS(SELECT 1 FROM messages m WHERE a.basis->>'kind'='message'
+       EXISTS(SELECT 1 FROM messages m WHERE a.basis->>'kind' IN ('message','schedule')
          AND m.owner_id=$1 AND m.id=(a.basis->>'messageId')::uuid) AS said
        FROM vault_activity a
        WHERE owner_id=$1 AND ($2::timestamptz IS NULL OR at>=$2) AND ($3::timestamptz IS NULL OR at<$3)
@@ -304,7 +304,7 @@ export async function createVaultAccess(
     const { rows } = await pool.query<Row>(
       `SELECT id,at,to_char(at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor,
        action,origin,item_id,item_kind,amount_minor,currency,task,reason,basis,
-       EXISTS(SELECT 1 FROM messages m WHERE a.basis->>'kind'='message'
+       EXISTS(SELECT 1 FROM messages m WHERE a.basis->>'kind' IN ('message','schedule')
          AND m.owner_id=$1 AND m.id=(a.basis->>'messageId')::uuid) AS said
        FROM vault_activity a
        WHERE owner_id=$1 AND ($2::text IS NULL OR origin=$2) AND ($5::uuid IS NULL OR item_id=$5)

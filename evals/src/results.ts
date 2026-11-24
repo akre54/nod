@@ -44,6 +44,7 @@ export interface AttemptResult {
   modelCalls: number;
   tokens: number;
   costUsd: number | null;
+  budgetCostUsd?: number;
   toolErrors: number;
   firstReplySeconds: number | null;
   judgeCostUsd: number | null;
@@ -85,6 +86,7 @@ export interface RunManifest {
   dirty: boolean;
   ref?: string;
   model: string;
+  backgroundModel?: string;
   effort?: import('../../src/shared/models.ts').ModelEffort;
   judge: string;
   repeat: number;

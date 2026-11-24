@@ -1,12 +1,15 @@
 import type { ObservationProvider } from '../../src/ports/proactivity.ts';
 import type { AppsWorld } from './world/apps.ts';
 import type { Site } from './world/sites.ts';
+import type { FakeDesktop } from './world/desktop.ts';
 import type { Run } from './trace.ts';
 import type { Session } from './session.ts';
 
 export type Capability =
   | 'apps'
   | 'browser'
+  | 'computer-use'
+  | 'desktop'
   | 'vault'
   | 'files'
   | 'research'
@@ -33,6 +36,8 @@ export interface World {
   notificationRule?: string;
   rules?: string;
   apps?: AppsWorld;
+  localFiles?: Record<string, string | Buffer>;
+  desktop?: FakeDesktop;
   sites?: Record<string, Site>;
   logins?: Array<{
     label: string;
@@ -58,7 +63,7 @@ export interface Answer {
 
 export interface UserScript {
   answers?: Answer[];
-  approve?: boolean | ((action: string, args: unknown) => boolean);
+  approve?: boolean | ((action: string, args: unknown, shown?: unknown) => boolean);
   approvalReplies?: string[];
   secrets?:
     | string[]

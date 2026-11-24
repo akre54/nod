@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { execFile, execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { constants, existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import {
   copyFile,
   access,
@@ -11,10 +11,12 @@ import {
   mkdtemp,
   mkdir,
   readFile,
+  readlink,
   readdir,
   realpath,
   rename,
   rm,
+  rmdir,
   stat,
   symlink,
   utimes,
@@ -2163,7 +2165,7 @@ test('bundle copy includes explicit release assets under .local while excluding 
   ]);
 });
 
-test('engine source includes its own documentation without site dependencies or media', async (t) => {
+test('engine source includes startup reporting and documentation without site dependencies or media', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'nod-engine-docs-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const source = join(root, 'source');
@@ -2171,6 +2173,9 @@ test('engine source includes its own documentation without site dependencies or 
   const page = 'docs/src/content/docs/trust/privacy.md';
   for (const path of [
     'src/server/index.ts',
+    'src/shared/environment-secrets.mjs',
+    'src/shared/literal-masks.mjs',
+    'src/shared/startup-feedback-facts.mjs',
     page,
     'docs/package.json',
     'docs/src/assets/fixture.png',
@@ -2178,6 +2183,8 @@ test('engine source includes its own documentation without site dependencies or 
     'LICENSE',
     'NOTICE',
     'desktop/main/engine.mjs',
+    'desktop/main/feedback.mjs',
+    'desktop/main/system-certificates.mjs',
     'desktop/main/onepassword.mjs',
     'desktop/runtime/index.mjs',
     'desktop/runtime/assets.mjs',
@@ -2192,6 +2199,17 @@ test('engine source includes its own documentation without site dependencies or 
   );
   await copyEngineSource({ root: source, target });
   assert.equal(await readFile(join(target, page), 'utf8'), 'Synthetic engine fixture');
+  assert.equal(
+    await readFile(join(target, 'desktop/main/system-certificates.mjs'), 'utf8'),
+    'Synthetic engine fixture',
+  );
+  for (const path of [
+    'desktop/main/feedback.mjs',
+    'src/shared/environment-secrets.mjs',
+    'src/shared/literal-masks.mjs',
+    'src/shared/startup-feedback-facts.mjs',
+  ])
+    assert.equal(await readFile(join(target, path), 'utf8'), 'Synthetic engine fixture');
   await assert.rejects(access(join(target, 'docs/package.json')));
   await assert.rejects(access(join(target, 'docs/src/assets/fixture.png')));
 });
@@ -2203,6 +2221,8 @@ test('engine source imports only production dependencies outside the development
   const allowed = new Set([...Object.keys(manifest.dependencies), ...builtinModules]);
   const files = [
     join(repository, 'desktop/main/engine.mjs'),
+    join(repository, 'desktop/main/feedback.mjs'),
+    join(repository, 'desktop/main/system-certificates.mjs'),
     join(repository, 'desktop/main/onepassword.mjs'),
   ];
   const walk = async (directory) => {
@@ -2621,7 +2641,7 @@ test('runtime download keeps a slow connection going and resumes its saved bytes
     return new Response(
       new ReadableStream({
         async pull(controller) {
-          await new Promise((resolve) => setTimeout(resolve, 120));
+          await new Promise((resolve) => setTimeout(resolve, 40));
           if (sent >= bytes.length) return controller.close();
           controller.enqueue(bytes.subarray(sent, sent + size));
           sent += size;
@@ -2639,54 +2659,56 @@ test('runtime download keeps a slow connection going and resumes its saved bytes
     fetch: async () => slowly(bytes),
   });
   assert.equal(await slow.done, slow.root);
-  for (const server of ['resumes', 'ignores', 'refuses']) {
-    const stalled = await fixture(t);
-    const archive = await readFile(stalled.archivePath);
-    const half = Math.floor(archive.length / 2);
-    const downloadUrl = 'https://runtime.example.invalid/fixture.tar.gz';
-    const stuck = await openRuntimeAssets({
-      ...stalled,
-      stallTimeout: 300,
-      downloadUrl,
-      fetch: async (url, { signal }) =>
-        new Response(
-          new ReadableStream({
-            start(controller) {
-              controller.enqueue(archive.subarray(0, half));
-              signal.addEventListener('abort', () => controller.error(signal.reason));
-            },
-          }),
-        ),
-    });
-    await assert.rejects(stuck.done, /stopped receiving data/);
-    const partial = `${stalled.release.id}.${stalled.release.archive.sha256.slice(0, 12)}.download`;
-    const saved = await readdir(stalled.cacheRoot);
-    assert.ok(saved.includes(partial));
-    assert.ok(saved.every((name) => [partial, stalled.release.id].includes(name)));
-    assert.equal(await findRuntimeAssets(stalled), undefined);
-    const ranges = [];
-    const resumed = await openRuntimeAssets({
-      ...stalled,
-      stallTimeout: 300,
-      downloadUrl,
-      fetch: async (url, { headers }) => {
-        ranges.push(headers.range);
-        if (server === 'resumes')
-          return slowly(archive.subarray(half), {
-            status: 206,
-            headers: { 'content-range': `bytes ${half}-${archive.length - 1}/${archive.length}` },
-          });
-        if (server === 'refuses' && headers.range) return new Response(null, { status: 416 });
-        return slowly(archive);
-      },
-    });
-    assert.equal(await resumed.done, resumed.root);
-    assert.deepEqual(
-      ranges,
-      server === 'refuses' ? [`bytes=${half}-`, undefined] : [`bytes=${half}-`],
-    );
-    assert.deepEqual(await readdir(stalled.cacheRoot), [stalled.release.id]);
-  }
+  await Promise.all(
+    ['resumes', 'ignores', 'refuses'].map(async (server) => {
+      const stalled = await fixture(t);
+      const archive = await readFile(stalled.archivePath);
+      const half = Math.floor(archive.length / 2);
+      const downloadUrl = 'https://runtime.example.invalid/fixture.tar.gz';
+      const stuck = await openRuntimeAssets({
+        ...stalled,
+        stallTimeout: 300,
+        downloadUrl,
+        fetch: async (url, { signal }) =>
+          new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.enqueue(archive.subarray(0, half));
+                signal.addEventListener('abort', () => controller.error(signal.reason));
+              },
+            }),
+          ),
+      });
+      await assert.rejects(stuck.done, /stopped receiving data/);
+      const partial = `${stalled.release.id}.${stalled.release.archive.sha256.slice(0, 12)}.download`;
+      const saved = await readdir(stalled.cacheRoot);
+      assert.ok(saved.includes(partial));
+      assert.ok(saved.every((name) => [partial, stalled.release.id].includes(name)));
+      assert.equal(await findRuntimeAssets(stalled), undefined);
+      const ranges = [];
+      const resumed = await openRuntimeAssets({
+        ...stalled,
+        stallTimeout: 300,
+        downloadUrl,
+        fetch: async (url, { headers }) => {
+          ranges.push(headers.range);
+          if (server === 'resumes')
+            return slowly(archive.subarray(half), {
+              status: 206,
+              headers: { 'content-range': `bytes ${half}-${archive.length - 1}/${archive.length}` },
+            });
+          if (server === 'refuses' && headers.range) return new Response(null, { status: 416 });
+          return slowly(archive);
+        },
+      });
+      assert.equal(await resumed.done, resumed.root);
+      assert.deepEqual(
+        ranges,
+        server === 'refuses' ? [`bytes=${half}-`, undefined] : [`bytes=${half}-`],
+      );
+      assert.deepEqual(await readdir(stalled.cacheRoot), [stalled.release.id]);
+    }),
+  );
 });
 
 test('a complete saved runtime installs offline after a late connection failure or cancellation', async (t) => {
@@ -3222,23 +3244,34 @@ finally:
 );
 
 async function macRuntimePrepare(home, assets, overrides = {}) {
-  const { availablePort, execute, retainStopExecutable, waitFor } =
-    await import('../runtime/index.mjs');
+  const {
+    availablePort,
+    execute,
+    retainStopExecutable,
+    waitFor,
+    stageGuestImage,
+    guestDiskIsEmpty,
+  } = await import('../runtime/index.mjs');
   const { guestConfiguration, protectGuest } = await import('../runtime/guest-config.mjs');
   const source = await readFile(new URL('../runtime/index.mjs', import.meta.url), 'utf8');
   return runInNewContext(
     `${source.slice(source.indexOf('async function prepare('), source.indexOf('export async function preloadRuntimeImages('))}; prepare`,
     {
       process: { platform: 'darwin', arch: process.arch },
+      constants,
       resolve,
       join,
       delimiter,
       createHash,
       randomBytes,
       mkdir,
+      rm,
+      rmdir,
       chmod,
       readFile,
+      readdir,
       access,
+      lstat,
       writeFile,
       rename,
       homedir: () => home,
@@ -3248,6 +3281,8 @@ async function macRuntimePrepare(home, assets, overrides = {}) {
       protectGuest,
       availablePort,
       retainStopExecutable,
+      stageGuestImage,
+      guestDiskIsEmpty,
       fileHash: assetHash,
       execute,
       waitFor,
@@ -3261,6 +3296,206 @@ async function macRuntimePrepare(home, assets, overrides = {}) {
     },
   );
 }
+
+test('guest images publish only verified complete bytes and keep the previous image after a failed or cancelled copy', async (t) => {
+  const { stageGuestImage } = await import('../runtime/index.mjs');
+  const root = await mkdtemp(join(tmpdir(), 'nod-stage-guest-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, 'guest.img');
+  const target = join(root, 'image');
+  const bytes = Buffer.alloc(2 * 1024 * 1024, 7);
+  const hash = createHash('sha256').update(bytes).digest('hex');
+  await writeFile(source, bytes);
+  await writeFile(target, 'Synthetic previous image');
+  await assert.rejects(
+    stageGuestImage(source, target, '0'.repeat(64)),
+    /does not match its manifest/,
+  );
+  assert.equal(await readFile(target, 'utf8'), 'Synthetic previous image');
+  const fs = await import('node:fs');
+  const createWriteStream = fs.default.createWriteStream;
+  const controller = new AbortController();
+  const writer = t.mock.method(fs.default, 'createWriteStream', (...args) => {
+    const stream = createWriteStream(...args);
+    stream.once('open', () => controller.abort(new Error('Synthetic copy stop')));
+    return stream;
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(stageGuestImage(source, target, hash, controller.signal), {
+      name: 'AbortError',
+    });
+  } finally {
+    writer.mock.restore();
+    syncBuiltinESMExports();
+  }
+  assert.equal(await readFile(target, 'utf8'), 'Synthetic previous image');
+  assert.deepEqual((await readdir(root)).sort(), ['guest.img', 'image']);
+  await stageGuestImage(source, target, hash);
+  assert.deepEqual(await readFile(target), bytes);
+});
+
+test('empty guest disk recovery checks all bytes and refuses links, absent disks and cancelled checks', async (t) => {
+  const { guestDiskIsEmpty } = await import('../runtime/index.mjs');
+  const root = await mkdtemp(join(tmpdir(), 'nod-empty-disk-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const disk = join(root, 'disk');
+  const bytes = Buffer.alloc(2 * 1024 * 1024 + 17);
+  await writeFile(disk, bytes);
+  assert.equal(await guestDiskIsEmpty(disk), true);
+  bytes[bytes.length - 1] = 1;
+  await writeFile(disk, bytes);
+  assert.equal(await guestDiskIsEmpty(disk), false);
+  const link = join(root, 'link');
+  await symlink(disk, link);
+  assert.equal(await guestDiskIsEmpty(link), false);
+  assert.equal(await guestDiskIsEmpty(join(root, 'missing')), false);
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(guestDiskIsEmpty(disk, controller.signal), { name: 'AbortError' });
+});
+
+test('Linux first starts use verified stream copies, repair old empty disks and keep established or unknown owner data', async (t) => {
+  const { guestConfiguration } = await import('../runtime/guest-config.mjs');
+  for (const scenario of [
+    { name: 'new computer' },
+    { name: 'old incomplete image', existing: true, partial: true },
+    { name: 'old empty disk', existing: true, empty: true },
+    { name: 'old empty running disk', existing: true, empty: true, running: true },
+    { name: 'old owner data', existing: true, owner: true },
+    { name: 'completed setup', existing: true, empty: true, initializing: false },
+    { name: 'linked owner disk', existing: true, linked: true },
+    { name: 'missing local state', existing: true, owner: true, missingState: true },
+    { name: 'missing Lima configuration', owner: true, missingConfig: true },
+    { name: 'failed guest protection', protectionFails: true },
+  ]) {
+    await t.test(scenario.name, async (t) => {
+      const root = await mkdtemp(join(tmpdir(), 'nod-linux-first-start-'));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      const assets = join(root, 'assets');
+      const dataRoot = join(root, 'profile');
+      const identity = createHash('sha256').update(dataRoot).digest('hex').slice(0, 12);
+      const limaHome = join(root, '.nod-desktop', identity);
+      const instance = join(limaHome, 'nod');
+      const configPath = join(instance, 'lima.yaml');
+      const statePath = join(dataRoot, 'desktop-runtime/state.json');
+      const guest = Buffer.from('Synthetic verified guest image');
+      const sha256 = createHash('sha256').update(guest).digest('hex');
+      await mkdir(join(assets, 'lima/bin'), { recursive: true });
+      await mkdir(join(dataRoot, 'desktop-runtime'), { recursive: true });
+      await writeFile(join(assets, 'lima/bin/limactl'), 'Synthetic Lima executable');
+      await writeFile(join(assets, 'guest.img'), guest);
+      await writeFile(
+        join(assets, 'manifest.json'),
+        JSON.stringify({
+          version: 1,
+          platform: `linux-${process.arch}`,
+          guest: { file: 'guest.img', sha256 },
+          dockerGuest: { file: 'docker-guest.tar.gz', sha256: '2'.repeat(64) },
+          images: [],
+        }),
+      );
+      if (!scenario.missingState)
+        await writeFile(
+          statePath,
+          JSON.stringify({
+            version: 1,
+            limaHome,
+            port: 54329,
+            password: '3'.repeat(64),
+            initializing: scenario.initializing,
+          }),
+        );
+      if (scenario.existing || scenario.missingConfig) await mkdir(instance, { recursive: true });
+      if (scenario.existing)
+        await writeFile(
+          configPath,
+          JSON.stringify({
+            mounts: [{ location: assets, mountPoint: '/opt/nod-assets', writable: false }],
+          }),
+        );
+      const disk = join(instance, 'disk');
+      if (scenario.partial) await writeFile(join(instance, 'image'), Buffer.alloc(1024));
+      if (scenario.empty) await writeFile(disk, Buffer.alloc(1024));
+      if (scenario.owner) await writeFile(disk, 'Synthetic owner data');
+      const outside = join(root, 'outside-disk');
+      if (scenario.linked) {
+        await writeFile(outside, Buffer.alloc(1024));
+        await symlink(outside, disk);
+      }
+      const calls = [];
+      let running = scenario.running;
+      let protectionFails = scenario.protectionFails;
+      const prepare = await macRuntimePrepare(root, assets, {
+        process: { platform: 'linux', arch: process.arch, env: {} },
+        access: (path, ...args) =>
+          path === '/dev/kvm' ? Promise.resolve() : access(path, ...args),
+        guestConfiguration: (options) => guestConfiguration({ ...options, platform: 'linux' }),
+        execute: async (command, args) => {
+          calls.push(args[0]);
+          if (args[0] === 'list') return running ? 'Running' : 'Stopped';
+          if (args[0] === 'stop') running = false;
+          if (args[0] === 'delete') {
+            assert.equal(JSON.parse(await readFile(statePath, 'utf8')).initializing, true);
+            await rm(instance, { recursive: true });
+          }
+          if (args[0] === 'create') {
+            assert.equal(JSON.parse(await readFile(statePath, 'utf8')).initializing, true);
+            await mkdir(instance, { recursive: true });
+            await copyFile(args.at(-1), configPath);
+          }
+          if (
+            args[0] === 'start' &&
+            !(await access(disk).then(
+              () => true,
+              () => false,
+            ))
+          ) {
+            assert.deepEqual(await readFile(join(instance, 'image')), guest);
+            await rename(join(instance, 'image'), disk);
+          }
+          if (args[0] === 'shell' && protectionFails) {
+            protectionFails = false;
+            throw new Error('Synthetic protection failure');
+          }
+          return '';
+        },
+        finishRuntime: async () => {
+          assert.equal(JSON.parse(await readFile(statePath, 'utf8')).initializing, false);
+          return 'ready';
+        },
+      });
+      const attempt = () =>
+        prepare({ dataRoot, resourcesPath: root, preserveRuntimeCache: true }, () => {});
+      if (scenario.missingState || scenario.missingConfig) {
+        await assert.rejects(
+          attempt(),
+          scenario.missingState ? /configuration is missing/ : /files but no Lima configuration/,
+        );
+        assert.deepEqual(calls, []);
+        assert.equal(await readFile(disk, 'utf8'), 'Synthetic owner data');
+        return;
+      }
+      if (scenario.protectionFails) {
+        await assert.rejects(attempt(), { code: 'NOD_COMPUTER_PROTECTION_FAILED' });
+        assert.equal(JSON.parse(await readFile(statePath, 'utf8')).initializing, true);
+      }
+      assert.equal(await attempt(), 'ready');
+      assert.equal(
+        calls.includes('delete'),
+        Boolean(
+          (scenario.empty && scenario.initializing === undefined) || scenario.protectionFails,
+        ),
+      );
+      if (scenario.running) assert(calls.indexOf('stop') < calls.indexOf('delete'));
+      if (scenario.owner) assert.equal(await readFile(disk, 'utf8'), 'Synthetic owner data');
+      if (scenario.linked) {
+        assert.equal(await readlink(disk), outside);
+        assert.deepEqual(await readFile(outside), Buffer.alloc(1024));
+      }
+    });
+  }
+});
 
 test('Linux guests run under QEMU for the host architecture with only the read-only asset mount', async () => {
   const { guestConfiguration } = await import('../runtime/guest-config.mjs');
@@ -3368,6 +3603,120 @@ test('Mac startup repairs existing guests before Docker and refuses failed or st
         );
         assert.deepEqual(calls, ['starting', 'start', 'shell']);
       }
+    });
+  }
+});
+
+test('first-start recovery survives failed starts, cancellation, interrupted creation and failed cleanup without replacing owner data', async (t) => {
+  for (const scenario of [
+    { name: 'failed first start' },
+    { name: 'cancelled first start', aborted: true },
+    { name: 'interrupted creation', createFails: true },
+    { name: 'creation stopped before its configuration exists', createFails: true, noConfig: true },
+    { name: 'failed cleanup', removalFails: true },
+    { name: 'existing owner data', existing: true },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const root = await mkdtemp(join(tmpdir(), 'nod-guest-first-start-'));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      const assets = join(root, 'assets');
+      const dataRoot = join(root, 'profile');
+      const identity = createHash('sha256').update(dataRoot).digest('hex').slice(0, 12);
+      const limaHome = join(root, '.nod-desktop', identity);
+      await mkdir(join(limaHome, 'nod'), { recursive: true });
+      await mkdir(join(assets, 'lima/bin'), { recursive: true });
+      await mkdir(join(dataRoot, 'desktop-runtime'), { recursive: true });
+      await writeFile(join(assets, 'lima/bin/limactl'), 'Synthetic Lima executable');
+      await writeFile(
+        join(assets, 'manifest.json'),
+        JSON.stringify({
+          version: 1,
+          platform: `darwin-${process.arch}`,
+          guest: { file: 'guest.img', sha256: '1'.repeat(64) },
+          dockerGuest: { file: 'docker-guest.tar.gz', sha256: '2'.repeat(64) },
+          images: [],
+        }),
+      );
+      await writeFile(
+        join(dataRoot, 'desktop-runtime/state.json'),
+        JSON.stringify({ version: 1, limaHome, port: 54329, password: '3'.repeat(64) }),
+      );
+      const configPath = join(limaHome, 'nod/lima.yaml');
+      const disk = join(limaHome, 'nod/disk');
+      if (scenario.existing) {
+        await writeFile(
+          configPath,
+          JSON.stringify({
+            mounts: [{ location: assets, mountPoint: '/opt/nod-assets', writable: false }],
+          }),
+        );
+        await writeFile(disk, 'Synthetic owner data');
+      }
+      let controller = new AbortController();
+      const calls = [];
+      let first = true;
+      let refuseRemoval = scenario.removalFails;
+      const prepare = await macRuntimePrepare(root, assets, {
+        execute: async (command, args) => {
+          calls.push(Array.from(args).slice(0, 3).join(' '));
+          if (args[0] === 'create') {
+            await mkdir(join(limaHome, 'nod'), { recursive: true });
+            if (!(first && scenario.noConfig)) await copyFile(args.at(-1), configPath);
+            if (first && scenario.createFails) {
+              first = false;
+              throw new Error('Synthetic create failure');
+            }
+          }
+          if (args[0] === 'start' && first) {
+            first = false;
+            if (!scenario.existing) await writeFile(disk, 'Synthetic incomplete disk');
+            if (scenario.aborted) {
+              controller.abort(new Error('Synthetic stop'));
+              throw controller.signal.reason;
+            }
+            throw new Error('Synthetic start failure');
+          }
+          if (args[0] === 'delete') {
+            if (refuseRemoval) {
+              refuseRemoval = false;
+              throw new Error('Synthetic removal failure');
+            }
+            await rm(join(limaHome, 'nod'), { recursive: true });
+          }
+          return '';
+        },
+        finishRuntime: async () => 'ready',
+      });
+      const attempt = () =>
+        prepare(
+          { dataRoot, resourcesPath: root, preserveRuntimeCache: true, signal: controller.signal },
+          () => {},
+        );
+      await assert.rejects(
+        attempt(),
+        scenario.createFails
+          ? /Synthetic create failure/
+          : scenario.aborted
+            ? /Synthetic stop/
+            : /Synthetic start failure/,
+      );
+      const saved = () =>
+        readFile(join(dataRoot, 'desktop-runtime/state.json'), 'utf8').then(JSON.parse);
+      assert.equal((await saved()).initializing, scenario.existing ? undefined : true);
+      controller = new AbortController();
+      if (scenario.removalFails) {
+        await assert.rejects(attempt(), /Synthetic removal failure/);
+        assert.equal((await saved()).initializing, true);
+        assert.equal(calls.filter((call) => call === 'start --tty=false nod').length, 1);
+      }
+      assert.equal(await attempt(), 'ready');
+      assert.equal(calls.includes('delete --force nod'), !scenario.existing && !scenario.noConfig);
+      assert.equal(
+        calls.filter((call) => call === 'create --name nod').length,
+        scenario.existing ? 0 : 2,
+      );
+      if (scenario.existing) assert.equal(await readFile(disk, 'utf8'), 'Synthetic owner data');
+      else assert.equal((await saved()).initializing, false);
     });
   }
 });
@@ -3841,6 +4190,128 @@ test('a failed runtime command names its cause from the end of its output, inclu
   );
 });
 
+test('runtime command results keep stderr diagnostics out of parsed stdout', async () => {
+  const { execute } = await import('../runtime/index.mjs');
+  const networks = [{ Driver: 'bridge', Name: 'nod-control-fixture' }];
+  const warning = [
+    ...Buffer.from(
+      'wsl: Конфигурация прокси-сервера localhost обнаружена, но не отражена в WSL.\r\n',
+      'utf16le',
+    ),
+  ];
+  for (const noisy of [
+    `process.stderr.write(Buffer.from(${JSON.stringify(warning)}));`,
+    `console.error('wsl: A localhost proxy configuration was detected but not mirrored to WSL.');`,
+  ]) {
+    const output = await execute(process.execPath, [
+      '-e',
+      `${noisy} process.stdout.write(${JSON.stringify(JSON.stringify(networks))})`,
+    ]);
+    assert.deepEqual(JSON.parse(output), networks);
+  }
+  const output = await execute(process.execPath, [
+    '-e',
+    `for (let index = 0; index < 50; index++) { process.stderr.write('noise-' + index + '\\n'); process.stdout.write('part' + index + ';'); }`,
+  ]);
+  assert.equal(output, `${Array.from({ length: 50 }, (_, index) => `part${index}`).join(';')};`);
+  assert.equal(await execute(process.execPath, ['-e', "console.error('only noise')"]), '');
+  await assert.rejects(
+    execute(process.execPath, [
+      '-e',
+      'console.log(JSON.stringify({ ok: true })); console.error("Synthetic docker failure"); process.exit(1)',
+    ]),
+    (error) =>
+      error.message.includes('Nod runtime command failed (1)') &&
+      error.details.includes('Synthetic docker failure') &&
+      error.details.includes('{"ok":true}'),
+  );
+});
+
+test('runtime command results are bounded by an explicit limit instead of truncation', async () => {
+  const { execute } = await import('../runtime/index.mjs');
+  const output = await execute(process.execPath, [
+    '-e',
+    "process.stdout.write(JSON.stringify({ entries: Array.from({ length: 20000 }, () => 'synthetic-entry') }))",
+  ]);
+  assert.ok(output.length > 128 * 1024);
+  assert.equal(JSON.parse(output).entries.length, 20000);
+  for (const [character, count, encoding] of [
+    ['x', 9 * 1024 * 1024, 'utf8'],
+    ['€', 3 * 1024 * 1024, 'utf8'],
+    ['x', 5 * 1024 * 1024, 'utf16le'],
+  ]) {
+    await assert.rejects(
+      execute(
+        process.execPath,
+        [
+          '-e',
+          `process.stdout.write(Buffer.from(${JSON.stringify(character)}.repeat(${count}), '${encoding}'))`,
+        ],
+        { encoding },
+      ),
+      { message: 'Nod runtime command produced too much output.' },
+    );
+  }
+});
+
+test('stopping a runtime command reports cancellation and timeouts', async () => {
+  const { execute } = await import('../runtime/index.mjs');
+  const { startupErrorFacts } = await import('../../src/shared/startup-feedback-facts.mjs');
+  await assert.rejects(
+    execute(process.execPath, ['-e', 'setTimeout(() => {}, 60_000)'], {
+      signal: AbortSignal.timeout(200),
+    }),
+    { message: 'Nod setup was cancelled.' },
+  );
+  await assert.rejects(
+    execute(process.execPath, ['-e', 'setTimeout(() => {}, 60_000)'], { timeout: 200 }),
+    (error) => {
+      assert.equal(error.message, 'Nod runtime setup took too long. Please retry.');
+      assert.equal(startupErrorFacts(error).class, 'TimeoutError');
+      return true;
+    },
+  );
+  await assert.rejects(execute(join(tmpdir(), 'nod-synthetic-missing-program'), []), (error) => {
+    assert.equal(error.code, undefined);
+    assert.equal(startupErrorFacts(error).errno, 'ENOENT');
+    return true;
+  });
+});
+
+test('runtime networks parse docker output that arrives with WSL diagnostics', async (t) => {
+  const { execute, ensureNetwork } = await import('../runtime/index.mjs');
+  const directory = await mkdtemp(join(tmpdir(), 'nod-docker-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const network = {
+    Driver: 'bridge',
+    Scope: 'local',
+    EnableIPv6: false,
+    Internal: false,
+    IPAM: { Config: [{ Subnet: '172.30.1.0/24' }] },
+    Options: {
+      'com.docker.network.bridge.name': 'nod-control',
+      'com.docker.network.bridge.enable_icc': 'false',
+    },
+  };
+  const warning = [
+    ...Buffer.from(
+      'wsl: A localhost proxy configuration was detected but not mirrored to WSL.\r\n',
+      'utf16le',
+    ),
+  ];
+  const docker = join(directory, 'docker.mjs');
+  await writeFile(
+    docker,
+    `process.stderr.write(Buffer.from(${JSON.stringify(warning)}));\nprocess.stdout.write(${JSON.stringify(JSON.stringify([network]))});`,
+  );
+  const runDocker = (args, extra = {}) => execute(process.execPath, [docker, ...args], extra);
+  await ensureNetwork(runDocker, {
+    name: 'nod-control-fixture',
+    subnet: '172.30.1.0/24',
+    bridge: 'nod-control',
+  });
+});
+
 test('runtime networks reject isolation drift before any workload can start', async () => {
   const { ensureNetwork } = await import('../runtime/index.mjs');
   const expected = {
@@ -4141,9 +4612,10 @@ test('native runtime wrapper preserves handed-off storage through failed prepara
       resolve,
       preparing: new Map(),
       storageReady: new Map(),
-      prepare: async (options, started) => {
+      prepare: async (options, started, progress) => {
         started();
         attempts++;
+        progress.step = 'start';
         if (terminal === 'cleanup-failed') throw startupError;
         if (retired) throw new Error('Synthetic new attempt before storage');
         if (attempts === 2) throw new Error('Synthetic retry before storage handshake');
@@ -4177,6 +4649,7 @@ test('native runtime wrapper preserves handed-off storage through failed prepara
     if (terminal === 'cleanup-failed') {
       await assert.rejects(lifecycle.start(), (error) => {
         assert.equal(error.code, cleanupError.code);
+        assert.equal(error.step, 'start');
         assert.equal(error.errors[0], startupError);
         assert.equal(error.errors[1], cleanupError);
         assert.equal(error.cause, cleanupError);
@@ -4408,6 +4881,338 @@ test('Windows storage starts on a free port, and a readiness failure names its c
   }
 });
 
+test(
+  'Windows setup replaces a half-installed computer, names a WSL failure in the owner’s language, keeps its download for the retry and installs in a chosen folder',
+  { skip: process.platform === 'win32' },
+  async (t) => {
+    const { gzipSync } = await import('node:zlib');
+    const { prepareWindowsRuntime, removeWindowsComputer, stopWindowsRuntime } =
+      await import('../runtime/windows.mjs');
+    const { startupErrorFacts } = await import('../../src/shared/startup-feedback-facts.mjs');
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'nod-windows-setup-')));
+    const system = join(root, 'Windows');
+    const resources = join(root, 'engine');
+    const profile = join(root, 'profile');
+    const statePath = join(system, 'System32', 'wsl-state.json');
+    const previous = process.env.SYSTEMROOT;
+    process.env.SYSTEMROOT = system;
+    t.after(async () => {
+      if (previous === undefined) delete process.env.SYSTEMROOT;
+      else process.env.SYSTEMROOT = previous;
+      await rm(root, { recursive: true, force: true });
+    });
+    await mkdir(join(system, 'System32', 'WindowsPowerShell', 'v1.0'), { recursive: true });
+    await mkdir(join(resources, 'windows-runtime', 'bin'), { recursive: true });
+    await writeFile(
+      join(system, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+      '#!/bin/sh\nexit 0\n',
+      { mode: 0o755 },
+    );
+    await writeFile(
+      join(system, 'System32', 'wsl.exe'),
+      `#!${process.execPath}
+const { readFileSync, writeFileSync } = require('node:fs');
+const { join } = require('node:path');
+const path = ${JSON.stringify(statePath)};
+const state = JSON.parse(readFileSync(path, 'utf8'));
+const args = process.argv.slice(2);
+state.calls.push(args.slice(0, 2).join(' '));
+let code = 0;
+if (args[0] === '--list' && state.offline) {
+  process.stderr.write('Synthetic WSL service failure.');
+  code = 1;
+}
+else if (args[0] === '--list')
+  process.stdout.write(Buffer.from('\\uFEFF' + (args.includes('--all') ? state.registered : state.ready).join('\\r\\n') + '\\r\\n', 'utf16le'));
+if (args[0] === '--unregister') state.registered = state.ready = [];
+if (args[0] === '--import') {
+  if (state.broken) {
+    writeFileSync(join(args[2], 'ext4.vhdx'), 'synthetic incomplete disk');
+    const reason = state.broken === true
+      ? "La machine virtuelle n’a pas pu être démarrée car une fonctionnalité requise n’est pas installée.\\r\\nCode d’erreur : Wsl/Service/RegisterDistro/CreateVm/HCS/HCS_E_SERVICE_NOT_AVAILABLE\\r\\n"
+      : 'Synthetic WSL failure.\\r\\nError code: Wsl/Service/RegisterDistro/' + state.broken + '\\r\\n';
+    process.stdout.write(Buffer.from(reason, 'utf16le'));
+    code = 1;
+  } else {
+    state.registered = state.ready = [args[1]];
+    state.imported = args[2];
+    writeFileSync(join(args[2], 'ext4.vhdx'), 'synthetic computer disk');
+  }
+}
+if (args[0] === '--distribution') {
+  process.stderr.write('synthetic guest stop');
+  code = 7;
+}
+writeFileSync(path, JSON.stringify(state));
+process.exit(code);
+`,
+      { mode: 0o755 },
+    );
+    const transport = Buffer.from('synthetic transport');
+    await writeFile(join(resources, 'windows-runtime', 'bin', 'docker.exe'), transport);
+    const expanded = Buffer.alloc(8192, 'synthetic computer image ');
+    const archive = gzipSync(expanded);
+    const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
+    await writeFile(
+      join(resources, 'windows-runtime', 'manifest.json'),
+      JSON.stringify({
+        version: 1,
+        platform: 'win32-x64',
+        guest: {
+          file: 'guest.tar.gz',
+          sha256: sha256(archive),
+          bytes: archive.length,
+          expandedBytes: expanded.length,
+        },
+        images: ['workspace', 'browser', 'postgres'].map((name) => ({
+          name,
+          id: `sha256:${sha256(name)}`,
+          size: 1,
+        })),
+        transport: { file: 'bin/docker.exe', sha256: sha256(transport) },
+      }),
+    );
+    const distribution = `nod-${sha256(profile.toLowerCase()).slice(0, 12)}`;
+    const wsl = async (change) => {
+      const state = JSON.parse(await readFile(statePath, 'utf8').catch(() => '{"calls":[]}'));
+      if (change) await writeFile(statePath, JSON.stringify({ ...state, ...change, calls: [] }));
+      return state.calls;
+    };
+    let downloads = 0;
+    const prepare = (computerDirectory, inspectDisk) =>
+      prepareWindowsRuntime(
+        {
+          dataRoot: profile,
+          resourcesPath: resources,
+          computerDirectory,
+          inspectDisk,
+          resolveDownloadUrl: async () => 'https://runtime.example.invalid/guest.tar.gz',
+          fetch: async () => {
+            downloads++;
+            return new Response(archive);
+          },
+        },
+        () => {},
+      );
+    const configPath = join(profile, 'desktop-runtime', 'state.json');
+    const saved = async () => JSON.parse(await readFile(configPath, 'utf8'));
+    const kept = join(profile, 'desktop-runtime', `guest-${sha256(archive).slice(0, 12)}.tar.gz`);
+
+    await mkdir(dirname(configPath), { recursive: true });
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        version: 1,
+        distribution,
+        password: '1'.repeat(64),
+        guest: sha256(archive),
+        initializing: true,
+      }),
+    );
+    await wsl({ ready: [], registered: [distribution], broken: true });
+    await assert.rejects(prepare(), (error) => {
+      assert.equal(error.code, 'NOD_WSL_REQUIRED');
+      assert.equal(error.step, 'import');
+      assert.equal(error.exitCode, 1);
+      assert.equal(error.wslCode, 'HCS_E_SERVICE_NOT_AVAILABLE');
+      assert.match(error.message, /HCS_E_SERVICE_NOT_AVAILABLE/);
+      assert.match(error.message, /une fonctionnalité requise n’est pas installée/);
+      assert.equal(error.message.includes('\0'), false);
+      return true;
+    });
+    assert.deepEqual(await wsl(), [
+      '--status',
+      '--list --quiet',
+      '--list --quiet',
+      `--unregister ${distribution}`,
+      `--import ${distribution}`,
+    ]);
+    assert.equal((await saved()).initializing, true);
+    const failedComputer = (await saved()).computerPath;
+    assert.equal(
+      await readFile(join(failedComputer, 'ext4.vhdx'), 'utf8'),
+      'synthetic incomplete disk',
+    );
+    assert.equal(sha256(await readFile(kept)), sha256(archive));
+
+    const elsewhere = join(root, 'another drive');
+    const occupied = join(elsewhere, distribution);
+    await mkdir(occupied, { recursive: true });
+    await writeFile(join(occupied, 'ext4.vhdx'), 'synthetic existing computer');
+    await wsl({ ready: [], registered: [], broken: false });
+    const space = 2 * 1024 ** 3 + expanded.length + 4;
+    await assert.rejects(
+      prepare(elsewhere, async () => ({ bavail: space, bsize: 1, dev: 1 })),
+      { code: 'NOD_COMPUTER_STORAGE_FULL', step: 'assets' },
+    );
+    assert.equal(downloads, 1);
+    assert.ok(!(await wsl()).some((call) => call.startsWith('--import')));
+    assert.equal(sha256(await readFile(kept)), sha256(archive));
+    await wsl({ ready: [distribution], registered: [distribution], broken: false });
+    await assert.rejects(
+      prepare(elsewhere, async (path) => ({
+        bavail: space,
+        bsize: 1,
+        dev: path === dirname(configPath) ? 1 : 2,
+      })),
+      (error) => {
+        assert.equal(error.code, undefined);
+        assert.equal(error.step, 'start');
+        assert.equal(error.exitCode, 7);
+        assert.match(error.message, /synthetic guest stop/);
+        return true;
+      },
+    );
+    assert.deepEqual(await wsl(), [
+      '--status',
+      '--list --quiet',
+      '--list --quiet',
+      `--unregister ${distribution}`,
+      `--import ${distribution}`,
+      `--distribution ${distribution}`,
+    ]);
+    assert.equal(downloads, 1);
+    assert.equal((await saved()).initializing, false);
+    await assert.rejects(stat(failedComputer), { code: 'ENOENT' });
+    await assert.rejects(stat(kept), { code: 'ENOENT' });
+    const computer = JSON.parse(await readFile(statePath, 'utf8')).imported;
+    assert.notEqual(computer, occupied);
+    assert.equal(dirname(computer), elsewhere);
+    assert.equal(
+      await readFile(join(occupied, 'ext4.vhdx'), 'utf8'),
+      'synthetic existing computer',
+    );
+    assert.equal((await saved()).computerPath, computer);
+    await wsl({});
+    await assert.rejects(prepare(join(root, 'unused folder')), { step: 'start', exitCode: 7 });
+    assert.deepEqual(await wsl(), [
+      '--status',
+      '--list --quiet',
+      '--list --quiet',
+      `--distribution ${distribution}`,
+    ]);
+    assert.equal((await saved()).computerPath, computer);
+    assert.equal(await readFile(join(computer, 'ext4.vhdx'), 'utf8'), 'synthetic computer disk');
+    const original = await readFile(configPath, 'utf8');
+    const { initializing, ...legacy } = JSON.parse(original);
+    for (const scenario of [
+      { name: 'missing configuration', code: 'NOD_COMPUTER_CONFIGURATION_MISSING' },
+      { name: 'null configuration', value: null, code: 'NOD_COMPUTER_CONFIGURATION_INVALID' },
+      {
+        name: 'relative computer path',
+        value: { ...JSON.parse(original), computerPath: 'relative', initializing: true },
+        code: 'NOD_COMPUTER_CONFIGURATION_INVALID',
+      },
+      {
+        name: 'invalid version',
+        code: 'NOD_COMPUTER_CONFIGURATION_INVALID',
+        value: { ...JSON.parse(original), version: 2, initializing: true },
+      },
+      {
+        name: 'invalid password',
+        code: 'NOD_COMPUTER_CONFIGURATION_INVALID',
+        value: { ...JSON.parse(original), password: 'invalid', initializing: true },
+      },
+      {
+        name: 'invalid marker',
+        value: { ...JSON.parse(original), initializing: 'false' },
+        code: 'NOD_COMPUTER_CONFIGURATION_INVALID',
+      },
+      {
+        name: 'completed computer is not ready',
+        value: JSON.parse(original),
+        hidden: true,
+        code: 'NOD_COMPUTER_NOT_READY',
+      },
+      {
+        name: 'completed computer is not registered',
+        code: 'NOD_COMPUTER_REGISTRATION_MISSING',
+        value: JSON.parse(original),
+        hidden: true,
+        absent: true,
+      },
+      {
+        name: 'conflicting WSL status reads',
+        code: 'NOD_COMPUTER_NOT_READY',
+        value: { ...JSON.parse(original), initializing: true },
+        absent: true,
+      },
+      {
+        name: 'older computer is not ready',
+        value: legacy,
+        hidden: true,
+        code: 'NOD_COMPUTER_NOT_READY',
+      },
+    ]) {
+      const bytes = scenario.value === undefined ? undefined : JSON.stringify(scenario.value);
+      if (bytes === undefined) await rm(configPath);
+      else await writeFile(configPath, bytes);
+      await wsl({
+        ready: scenario.hidden ? [] : [distribution],
+        registered: scenario.absent ? [] : [distribution],
+      });
+      await assert.rejects(prepare(), (error) => {
+        assert.equal(error.code, scenario.code, scenario.name);
+        assert.equal(startupErrorFacts(error).code, scenario.code, scenario.name);
+        return true;
+      });
+      if (scenario.code === 'NOD_COMPUTER_CONFIGURATION_INVALID')
+        await assert.rejects(removeWindowsComputer(profile));
+      assert.ok(
+        (await wsl()).every((call) => !/^--(?:unregister|import) /.test(call)),
+        scenario.name,
+      );
+      assert.equal(
+        await readFile(configPath, 'utf8').catch((error) => {
+          if (error.code !== 'ENOENT') throw error;
+        }),
+        bytes,
+        scenario.name,
+      );
+      assert.equal(await readFile(join(computer, 'ext4.vhdx'), 'utf8'), 'synthetic computer disk');
+    }
+    await writeFile(configPath, original);
+    await wsl({ ready: [distribution], registered: [distribution] });
+    await writeFile(join(elsewhere, 'keep.txt'), 'synthetic owner file');
+    await wsl({ offline: true });
+    await assert.rejects(stopWindowsRuntime({ dataRoot: profile }), (error) => {
+      assert.equal(error.code, 'NOD_RUNTIME_STOP_FAILED');
+      assert.equal(error.cause.exitCode, 1);
+      assert.match(error.cause.details, /Synthetic WSL service failure/);
+      return true;
+    });
+    await assert.rejects(removeWindowsComputer(profile));
+    assert.deepEqual(
+      (await readdir(elsewhere)).sort(),
+      [distribution, relative(elsewhere, computer), 'keep.txt'].sort(),
+    );
+    await wsl({ offline: false });
+    await removeWindowsComputer(profile);
+    assert.deepEqual((await readdir(elsewhere)).sort(), [distribution, 'keep.txt'].sort());
+    assert.deepEqual(await readdir(occupied), ['ext4.vhdx']);
+    assert.equal(
+      await readFile(join(occupied, 'ext4.vhdx'), 'utf8'),
+      'synthetic existing computer',
+    );
+    await rm(configPath);
+    let failedPath;
+    for (const code of ['ERROR_FILE_EXISTS', 'E_ACCESSDENIED', '0x80072747', '0x800705b4']) {
+      await wsl({ ready: [], registered: [], broken: code });
+      await assert.rejects(prepare(elsewhere), (error) => {
+        assert.equal(error.code, undefined);
+        assert.equal(error.wslCode, code);
+        assert.equal(startupErrorFacts(error).wslCode, code);
+        assert.equal(error.step, 'import');
+        assert.equal(error.exitCode, 1);
+        assert.match(error.message, new RegExp(code));
+        return true;
+      });
+      if (failedPath) await assert.rejects(stat(failedPath), { code: 'ENOENT' });
+      failedPath = (await saved()).computerPath;
+    }
+  },
+);
+
 async function windowsImageFixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'nod-windows-image-order-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -4441,13 +5246,17 @@ state = json.load(original_open(state_path))
 manifest = json.load(original_open(os.path.join(root, 'manifest.json')))
 def mapped(path):
     path = os.fspath(path)
-    for prefix in ['/opt/nod-assets/', '/var/lib/nod/']:
+    for prefix in ['/opt/nod-assets/', '/var/lib/nod/', '/var/log/']:
         if path.startswith(prefix): return os.path.join(root, path[len(prefix):])
     if path == '/var/lib/nod': return root
     raise RuntimeError('Unexpected fixture path')
 def run(args, **kwargs):
     state['commands'].append(args[1:])
-    if args[1:] == ['info']: return subprocess.CompletedProcess(args, 0)
+    if args[1:] == ['info']:
+        if state.get('stuck'):
+            state['stuck'] = False
+            raise subprocess.TimeoutExpired(args, kwargs['timeout'])
+        return subprocess.CompletedProcess(args, 0)
     if args[1:3] == ['image', 'inspect']:
         value = state['images'].get(args[-1])
         result = subprocess.CompletedProcess(args, 0 if value else 1, stdout=value or '')
@@ -4464,6 +5273,7 @@ def makedirs(path, **kwargs):
     assert mapped(path) == root
 os.makedirs = makedirs
 subprocess.run = run
+subprocess.Popen = lambda *args, **kwargs: state['commands'].append(['dockerd'])
 sys.argv = [source, command]
 try:
     exec(compile(source_code, source, 'exec'), {'__name__': '__main__'})
@@ -4479,6 +5289,10 @@ finally:
     async wrong(name) {
       const state = JSON.parse(await readFile(join(root, 'state.json'), 'utf8'));
       await writeFile(join(root, 'state.json'), JSON.stringify({ ...state, wrong: name }));
+    },
+    async stuck() {
+      const state = JSON.parse(await readFile(join(root, 'state.json'), 'utf8'));
+      await writeFile(join(root, 'state.json'), JSON.stringify({ ...state, stuck: true }));
     },
     run(command, name) {
       return execFileSync(
@@ -4497,6 +5311,13 @@ finally:
     },
   };
 }
+
+test('the Windows guest starts Docker and keeps waiting when a readiness check hangs', async (t) => {
+  const windows = await windowsImageFixture(t);
+  await windows.stuck();
+  windows.run('start');
+  assert.deepEqual((await windows.read()).commands, [['info'], ['dockerd'], ['info']]);
+});
 
 test('runtime hands off verified storage before browser readiness and fences failed or aborted handoffs', async (t) => {
   const { finishRuntime } = await import('../runtime/index.mjs');

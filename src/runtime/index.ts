@@ -1,5 +1,7 @@
+import type { FlightSearch } from '../ports/flights.ts';
 import { presentationInputSchema, type Presentation } from '../shared/presentation.ts';
 import { proactiveUpdateSchema, sourceReadSchema } from '../shared/proactivity.ts';
+import { appPages } from '../shared/app-links.ts';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
@@ -11,6 +13,7 @@ import type {
   AgentEvent,
   AgentImage,
   AgentSession,
+  AgentSessionOptions,
   AgentTool,
   AgentToolOutcome,
   AgentToolResult,
@@ -20,14 +23,20 @@ import type {
   RuntimeResult,
   SkillLibrary,
 } from '../ports/agent.ts';
-import { appConfirmation, ModelRequestError } from '../ports/agent.ts';
+import {
+  appConfirmation,
+  ContextLimitError,
+  ModelRequestError,
+  OutputLimitError,
+  ToolFailureError,
+} from '../ports/agent.ts';
 import type { Computer, Workspace } from '../ports/computer.ts';
 import { BrowserActionError } from '../ports/computer.ts';
 import { threadIdentity } from '../ports/thread-identity.ts';
 import {
   compactHistory,
+  compactMemory,
   compactOwnerContext,
-  compactSystemPrompt,
   firstInstruction,
   observerInstruction,
   scheduledInstruction,
@@ -58,7 +67,7 @@ function toolProgress() {
       for (const result of results) {
         if (result.error === undefined) failures.delete(result.name);
         else if (
-          /^(?:Validation failed for tool |Invalid (?:arguments for tool |[\w ]+ (?:input[.:]|arguments(?: at|[.:])))|Tool \S+ not found|This source (?:failed during this check|check has reached its read limit)|Nod could not confirm it was still on the page and control it checked|(?:This connected|The selected) account changed\.|The trust check couldn|The action review model is unavailable|Nod could not write an accurate confirmation)/.test(
+          /^(?:Validation failed for tool |Invalid (?:arguments for tool |[\w ]+ (?:input[.:]|arguments(?: at|[.:])))|Tool \S+ not found|This source (?:failed during this check|check has reached its read limit)|Nod could not confirm it was still on the page and control it checked|(?:This connected|The selected) account changed\.|The trust check couldn|The action review model is unavailable|Nod could not write an accurate confirmation|The workspace command did not run)/.test(
             result.error,
           )
         ) {
@@ -76,6 +85,7 @@ const inlineChars = 40_000;
 const imageBudget = 16 * 1024 * 1024;
 const imageTypes = new Set(['image/png', 'image/jpeg', 'image/webp']);
 const parentTools = new Set([
+  'computer',
   'sign_in',
   'pay',
   'browser_session',
@@ -86,26 +96,29 @@ const parentTools = new Set([
   'task',
 ]);
 const parallelTools = new Set([
-  'nod_docs',
+  'nod',
+  'flights',
   'delegate',
   'share_file',
   'create_audio',
   'skills',
   'apps',
-  'manage_personal_context',
+  'memory',
   'react_to_message',
 ]);
 const orderedTools = new Set([
   'apps',
   'files',
-  'manage_personal_context',
+  'computer',
+  'memory',
+  'nod',
   'skills',
   'read_source',
   'proactive_issue',
 ]);
 const admissions = new AsyncLocalStorage<{
   asked: boolean;
-  admit(asks: boolean): Promise<void>;
+  admit(asks: boolean, read?: boolean): Promise<void>;
 }>();
 const browserTools = new Set(['browser', 'browser_session', 'sign_in', 'pay']);
 const confirmationNotice = 'The confirmation question is in chat. Wait for the reply.';
@@ -114,11 +127,11 @@ const reportingTaskActions = new Set(['finish', 'list', 'stop', 'update']);
 const limitActions = new Set(['usage_get', 'limits_update']);
 const dollars = (value: number) => `$${Number.isInteger(value) ? value : value.toFixed(2)}`;
 const delimitedTools = new Set([
-  'nod_docs',
   'read_source',
   'proactive_issue',
   'apps',
   'files',
+  'computer',
   'delegate',
   'browser',
   'browser_session',
@@ -128,7 +141,31 @@ const delimitedTools = new Set([
   'get_search_content',
   'source_check',
   'codemode',
+  'flights',
 ]);
+export function webTarget(name: string, params: unknown, redact: (text: string) => string) {
+  const input = (params ?? {}) as Record<string, unknown>;
+  const first = (one: unknown, many: unknown) =>
+    [one, ...(Array.isArray(many) ? many : [])].find(
+      (value): value is string => typeof value === 'string' && value.trim() !== '',
+    );
+  if (name === 'web_search') {
+    const query = first(input.query, input.queries);
+    if (!query) return {};
+    const text = redact(query)
+      .replace(/(^|\s)-?(?:[a-z]+:|site\.)\S+/gi, ' ')
+      .replace(/["“”]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!text) return {};
+    return { detail: text.length > 40 ? `${text.slice(0, 39).trimEnd()}…` : text };
+  }
+  if (name !== 'fetch_content') return {};
+  const url = first(input.url, input.urls);
+  if (!url || !URL.canParse(url)) return {};
+  return { site: new URL(url).hostname.replace(/^www\./, '') };
+}
+
 function textResult(value: unknown): AgentToolResult {
   return {
     content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }],
@@ -178,6 +215,7 @@ export function createAgentRuntime(dependencies: {
   workspace: Workspace;
   skills?: SkillLibrary;
   documentation?: Documentation;
+  flights?: FlightSearch;
   redactError?(text: string): string;
   redactCommand?(text: string): string;
   observe?(turnId: string, event: RuntimeObservation): void;
@@ -234,11 +272,13 @@ export function createAgentRuntime(dependencies: {
     const sites = new Map<string, string>();
     let stopped = false;
     let modelError: string | undefined;
+    let contextExhausted = false;
     let modelIncomplete: 'output' | 'context' | undefined;
     const progress = toolProgress();
     let completed = false;
     let lastReply = '';
     let lastPresentation = '';
+    let fallbackNoted: string | undefined;
     let checkInSpent = context.checkIn?.spentUsd ?? 0;
     let checkInPlan = context.checkIn?.planUsd ?? 0;
     let checkInBlocked = false;
@@ -400,9 +440,37 @@ export function createAgentRuntime(dependencies: {
         server.name,
       ]),
     );
+    const computerApps = new Map<string, string>();
+    const refSnapshot = (ref: unknown) => /^@?([^:\s]+):/.exec(String(ref ?? ''))?.[1];
+    const learnComputerApps = (params: unknown, output: unknown) => {
+      const { action, pid } = (params ?? {}) as { action?: unknown; pid?: unknown };
+      const found = (output ?? {}) as {
+        apps?: { pid?: unknown; bundle?: unknown; name?: unknown }[];
+        pid?: unknown;
+        bundle?: unknown;
+        name?: unknown;
+      };
+      for (const app of action === 'apps' ? (found.apps ?? []) : action === 'open' ? [found] : [])
+        if (typeof app.name === 'string') {
+          computerApps.set(`pid:${app.pid}`, app.name);
+          computerApps.set(`bundle:${app.bundle}`, app.name);
+        }
+      const app = computerApps.get(`pid:${pid}`);
+      if (app && (action === 'snapshot' || action === 'find'))
+        for (const [, snapshot] of JSON.stringify(output ?? '').matchAll(/@([a-z0-9]+):e\d/gi))
+          computerApps.set(`ref:${snapshot}`, app);
+    };
     const appName = (name: string, params: unknown) => {
       if (name.startsWith('mcp__')) return servers.get(name.split('__')[1]);
       if (name === 'files') return 'local files';
+      if (name === 'computer') {
+        const { pid, bundle, ref } = (params ?? {}) as Record<string, unknown>;
+        return (
+          computerApps.get(`ref:${refSnapshot(ref)}`) ??
+          computerApps.get(`pid:${pid}`) ??
+          computerApps.get(`bundle:${bundle}`)
+        );
+      }
       if (name !== 'apps') return undefined;
       const { action, args } = (params ?? {}) as {
         action?: unknown;
@@ -431,7 +499,7 @@ export function createAgentRuntime(dependencies: {
             name === 'proactive_issue' ||
             name === 'task' ||
             (name === 'ask_user' && overBudget()) ||
-            (name === 'manage_personal_context' &&
+            (name === 'memory' &&
               [
                 'memory_read',
                 'memory_find',
@@ -446,10 +514,7 @@ export function createAgentRuntime(dependencies: {
         if (
           context.spendingLimitReached &&
           !reportingTools.has(name) &&
-          !(
-            name === 'manage_personal_context' &&
-            limitActions.has(String((params as { action?: unknown })?.action))
-          )
+          !(name === 'nod' && limitActions.has(String((params as { action?: unknown })?.action)))
         )
           throw new Error(
             `The owner's ${dollars(context.spendingLimitReached.monthlyUsd)} monthly spending limit is reached, so only changing spending limits and replying work now.`,
@@ -464,14 +529,14 @@ export function createAgentRuntime(dependencies: {
         ) {
           if (source === execution) checkInBlocked = true;
           throw new Error(
-            `This work has used ${checkInUsed()} since the owner's last message, past the ${dollars(context.checkIn!.budgetUsd)} check-in.${checkInPlan >= 0.005 ? ' Plan usage costs the owner nothing extra.' : ''} Do no more work now. Call ask_user to state the cost and what continuing would do, then ask whether to keep going. Follow the shared reporting rules for any result you include.`,
+            `This work has passed the ${dollars(context.checkIn!.budgetUsd)} check-in since the owner's last message.${checkInPlan >= 0.005 ? ' Some of it is ChatGPT plan usage counted at API prices, which costs the owner nothing extra; write {plan} where you state that part.' : ''} Do no more work now. Call ask_user to state the cost and what continuing would do, then ask whether to keep going. Write {spent} exactly where the question states what this work has used; Nod puts in the current amount when it asks. Follow the shared reporting rules for any result you include.`,
           );
         }
         const id = randomUUID();
         const started = performance.now();
-        const app = appName(name, params);
         const eventLabel =
-          name === 'browser' && typeof (params as { action?: unknown })?.action === 'string'
+          (name === 'browser' || name === 'computer') &&
+          typeof (params as { action?: unknown })?.action === 'string'
             ? `${label} ${(params as { action: string }).action}`
             : label;
         const redactCommand = name === 'bash' ? dependencies.redactCommand : undefined;
@@ -480,16 +545,20 @@ export function createAgentRuntime(dependencies: {
           redactCommand && typeof commandLine === 'string'
             ? redactCommand(commandLine).slice(0, 4000)
             : undefined;
-        const event = (record?: WorkspaceCommandRecord) => ({
-          execution: source,
-          callId: id,
-          ...(browserTools.has(name) && sites.has(source.browserId)
-            ? { site: sites.get(source.browserId) }
-            : app
-              ? { site: app }
-              : {}),
-          ...(record && command !== undefined ? { command: record } : {}),
-        });
+        const event = (record?: WorkspaceCommandRecord) => {
+          const web = webTarget(name, params, dependencies.redactError ?? String);
+          const site =
+            browserTools.has(name) && sites.has(source.browserId)
+              ? sites.get(source.browserId)
+              : (appName(name, params) ?? web.site);
+          return {
+            execution: source,
+            callId: id,
+            ...(site ? { site } : {}),
+            ...(web.detail ? { detail: web.detail } : {}),
+            ...(record && command !== undefined ? { command: record } : {}),
+          };
+        };
         const end = (fields: {
           status: 'succeeded' | 'failed' | 'cancelled';
           output?: unknown;
@@ -523,6 +592,7 @@ export function createAgentRuntime(dependencies: {
           assertActive();
           const output = await untilAborted(execute(), signal);
           signal.throwIfAborted();
+          if (name === 'computer') learnComputerApps(params, output);
           if (
             name === 'send_message' &&
             (params as { intent?: unknown } | null)?.intent === 'final'
@@ -572,6 +642,7 @@ export function createAgentRuntime(dependencies: {
               name,
               result,
               name === 'apps' ||
+                name === 'computer' ||
                 name === 'read_source' ||
                 name === 'proactive_issue' ||
                 name === 'codemode' ||
@@ -709,38 +780,58 @@ export function createAgentRuntime(dependencies: {
         decided = Promise.all([earlier, own]).then(([before, asks]) => before || asks);
         const gate = {
           asked: false,
-          admit: async (asks: boolean) => {
+          admit: async (asks: boolean, read = false) => {
             if (!asks) decide(false);
-            if (await earlier)
-              throw new Error("This turn is waiting for the owner's answer. Ask again after it.");
+            if (!read && (await earlier))
+              throw new Error(
+                "Not run, and no question was asked for it: an earlier call in this step is waiting for the owner's answer. Call it again after they answer.",
+              );
           },
         };
         return { gate, settle: () => decide(gate.asked) };
       };
+      const sandboxTool =
+        (source: ExecutionScope, cwd: string): AgentSessionOptions['runTool'] =>
+        (name, params, run, options) => {
+          const admitted = name === 'bash' ? admission() : undefined;
+          const pending = guard(
+            name,
+            params,
+            async () => {
+              if (!admitted) return run();
+              await admitted.gate.admit(false);
+              assertActive();
+              const input = params as { command?: unknown; timeout?: unknown };
+              if (
+                typeof input?.command !== 'string' ||
+                (input.timeout !== undefined &&
+                  (typeof input.timeout !== 'number' || !Number.isFinite(input.timeout)))
+              )
+                throw new Error('The workspace command or timeout is invalid.');
+              return untilAborted(run(signal), signal);
+            },
+            { ...options, execution: source },
+          );
+          return admitted ? pending.finally(admitted.settle) : pending;
+        };
       const bind = (turn: Turn, take: () => Promise<unknown>): AgentTool[] =>
         [
-          ...nodTools(turn, skills, dependencies.documentation),
+          ...nodTools(turn, skills, dependencies.documentation, dependencies.flights),
           ...(context.proactivity ? [] : connectedTools(turn)),
         ]
           .filter(
             (tool) =>
               !context.proactivity ||
-              [
-                'read_source',
-                'proactive_issue',
-                'manage_personal_context',
-                'task',
-                'ask_user',
-              ].includes(tool.name),
+              ['read_source', 'proactive_issue', 'memory', 'task', 'ask_user'].includes(tool.name),
           )
           .map((tool): AgentTool => {
             const { name, execute } = tool;
             const description =
-              context.proactivity && name === 'manage_personal_context'
+              context.proactivity && name === 'memory'
                 ? 'Read owner context. memory_read {path}, memory_find {query,area?}, history_search {query?,from?,to?,before?,around?}, and notification_preferences_get {} are the only available actions. Memory is context, not source evidence or permission.'
                 : tool.description;
             const parameters =
-              context.proactivity && name === 'manage_personal_context'
+              context.proactivity && name === 'memory'
                 ? Type.Object(
                     {
                       action: Type.Union(
@@ -762,7 +853,7 @@ export function createAgentRuntime(dependencies: {
               description,
               parameters,
               ...(tool.eager ? { eager: true } : {}),
-              ...(tool.companions?.length ? { companions: tool.companions } : {}),
+              ...(tool.companions ? { companions: tool.companions } : {}),
               ...(deferred ? { deferred } : {}),
               parallel: Boolean(deferred) || parallelTools.has(name),
               execute: async (params, options) => {
@@ -810,9 +901,15 @@ export function createAgentRuntime(dependencies: {
         context.proactivity?.instructions ??
         systemPrompt(workspace, dependencies.skills, context.taskContext, context.background);
       const compactInstructions = {
-        systemPrompt: context.proactivity
-          ? system
-          : compactSystemPrompt(workspace, skills, context.taskContext, context.background),
+        systemPrompt:
+          context.proactivity?.instructions ??
+          systemPrompt(
+            workspace,
+            dependencies.skills,
+            context.taskContext,
+            context.background,
+            true,
+          ),
         ownerContext: compactOwnerContext(context),
       };
       const shared = {
@@ -822,7 +919,7 @@ export function createAgentRuntime(dependencies: {
             action: string,
             args: Record<string, unknown>,
             callSignal?: AbortSignal,
-            admit?: (asks: boolean) => Promise<void>,
+            admit?: (asks: boolean, read?: boolean) => Promise<void>,
           ) => {
             const gate = admissions.getStore()?.admit;
             return context.integration(
@@ -830,9 +927,9 @@ export function createAgentRuntime(dependencies: {
               args,
               callSignal,
               admit
-                ? async (asks: boolean) => {
-                    await admit(asks);
-                    await gate?.(asks);
+                ? async (asks: boolean, read?: boolean) => {
+                    await admit(asks, read);
+                    await gate?.(asks, read);
                   }
                 : gate,
             );
@@ -856,6 +953,13 @@ export function createAgentRuntime(dependencies: {
           return reply(text, id, replyToMessageId, presentation, handoff);
         },
         pause,
+        checkInCost: () =>
+          overBudget()
+            ? {
+                spent: dollars(checkInSpent),
+                plan: dollars(Math.min(checkInPlan, checkInSpent)),
+              }
+            : undefined,
         confirm,
         visited: (browserId: string, url: string) => {
           const host = URL.parse(url)?.host;
@@ -887,7 +991,8 @@ export function createAgentRuntime(dependencies: {
         try {
           child = await agent.open({
             ...source,
-            automatic: !context.currentMessageId,
+            ...(context.model ? { model: context.model } : {}),
+            automatic: Boolean(context.automatic),
             ephemeral: true,
             systemPrompt: system,
             ownerContext: ownerContext(context),
@@ -897,8 +1002,7 @@ export function createAgentRuntime(dependencies: {
             }).filter((tool) => !parentTools.has(tool.name)),
             workspace: { ...workspace, path: childPath },
             timeZone: context.timeZone,
-            runTool: (name, params, run, options) =>
-              guard(name, params, run, { ...options, execution: source }),
+            runTool: sandboxTool(source, childPath),
             shouldStop: (results) => stopped || overBudget() || childProgress.stopped(results),
             onEvent: (event) => {
               countUsage(event);
@@ -921,7 +1025,7 @@ export function createAgentRuntime(dependencies: {
             [],
           );
           if (childProgress.error)
-            throw new Error((dependencies.redactError ?? String)(childProgress.error));
+            throw new ToolFailureError((dependencies.redactError ?? String)(childProgress.error));
           if (failure) throw new Error(`The subagent model request failed: ${failure}`);
           if (incomplete) throw new Error('The subagent response was incomplete.');
           assertActive();
@@ -948,19 +1052,6 @@ export function createAgentRuntime(dependencies: {
           ...shared,
           execution,
           delegate,
-          ...(speaks
-            ? {
-                setStatus: async (text: string) => {
-                  const summary = (dependencies.redactError ?? String)(text.trim()).replace(
-                    /\s+/g,
-                    ' ',
-                  );
-                  if (!summary) throw new Error('Write a short activity description.');
-                  await context.emit('step', summary, { execution });
-                  return 'Status updated.';
-                },
-              }
-            : {}),
         },
         async () => {
           if (!browsed) await computer.hold(browserId, false).catch(() => {});
@@ -1056,8 +1147,11 @@ export function createAgentRuntime(dependencies: {
       await context.emit('agent_start', 'Main agent', { execution });
       const opening = agent.open({
         ...execution,
-        automatic: !context.currentMessageId,
-        ...(context.proactivity ? { restricted: true, restartable: !context.resumed } : {}),
+        ...(context.model ? { model: context.model } : {}),
+        automatic: Boolean(context.automatic),
+        contextRestart: context.contextRestart,
+        ...(context.proactivity ? { restricted: true } : {}),
+        newRequest: !context.resumed,
         ...(context.scheduleCache ? { scheduleCache: context.scheduleCache } : {}),
         ...(sessionId === threadId && !context.proactivity && dependencies.keepWarm
           ? { keepWarm: () => dependencies.keepWarm!(threadId) }
@@ -1069,7 +1163,7 @@ export function createAgentRuntime(dependencies: {
         workspace,
         ...(context.readAudio ? { readAudio: context.readAudio } : {}),
         timeZone: context.timeZone,
-        runTool: guard,
+        runTool: sandboxTool(execution, workspace.path),
         shouldStop: (results) => {
           if (stopped || finalDelivered) return true;
           if (progress.stopped(results)) return true;
@@ -1141,10 +1235,19 @@ export function createAgentRuntime(dependencies: {
             );
             void pendingReplies.catch(() => {});
           }
+          if (event.type === 'fallback' && event.to !== fallbackNoted) {
+            fallbackNoted = event.to;
+            const note = `${event.from} failed, so this used ${event.to}.`;
+            pendingReplies = pendingReplies.then(() =>
+              context.emit('retry', note, { execution }).catch(() => {}),
+            );
+            void pendingReplies.catch(() => {});
+          }
           if (event.type === 'message_start') {
             completeStream();
             streamId = randomUUID();
             modelError = undefined;
+            contextExhausted = false;
           }
           if (event.type === 'message_end') {
             if (event.status === 'succeeded') {
@@ -1179,7 +1282,10 @@ export function createAgentRuntime(dependencies: {
             speakNext = false;
             completeStream();
           }
-          if (event.type === 'error') modelError = event.message;
+          if (event.type === 'error') {
+            modelError = event.message;
+            contextExhausted = event.contextExhausted === true;
+          }
           if (event.type === 'final') {
             modelError = undefined;
             modelIncomplete = undefined;
@@ -1211,7 +1317,7 @@ export function createAgentRuntime(dependencies: {
       session = await opening;
       signal.throwIfAborted();
       const resumed = session.resumed;
-      const compact = Boolean(session.contextWindow && session.contextWindow < 65_536);
+      const compact = session.compactContext === true;
       const { images, omitted, analysis } = await inline(context.attachments, context.prompt);
       const requestContext = compact
         ? {
@@ -1219,6 +1325,7 @@ export function createAgentRuntime(dependencies: {
             history: compactHistory(context.history),
             relatedConversation: undefined,
             tasks: [],
+            memoryBrief: context.memoryBrief && compactMemory(context.memoryBrief),
           }
         : context;
       const observer = context.proactivity
@@ -1260,18 +1367,21 @@ export function createAgentRuntime(dependencies: {
       );
       await pendingReplies;
       signal.throwIfAborted();
-      if (progress.error) throw new Error((dependencies.redactError ?? String)(progress.error));
+      if (progress.error)
+        throw new ToolFailureError((dependencies.redactError ?? String)(progress.error));
       const paused = () =>
         `Paused at the ${dollars(context.checkIn!.budgetUsd)} check-in. Reply to keep going.`;
       if (modelError)
-        throw new ModelRequestError(
+        throw new (contextExhausted ? ContextLimitError : ModelRequestError)(
           `The model request failed: ${(dependencies.redactError ?? String)(modelError)}`,
         );
+      if (modelIncomplete === 'context' && status === 'succeeded')
+        throw new ContextLimitError(
+          `The model response was cut off because its context is full. Choose a model with a larger context in ${appPages['/settings/models']}.`,
+        );
       if (modelIncomplete && status === 'succeeded')
-        throw new Error(
-          modelIncomplete === 'context'
-            ? 'The model response was cut off because its context is full. Start a new conversation or choose a model with a larger context.'
-            : 'The model response was incomplete. Say continue to try again.',
+        throw new OutputLimitError(
+          `The model response was cut off at its output limit. Say continue to pick up where it stopped, or choose a model with a larger output limit in ${appPages['/settings/models']}.`,
         );
       if (stopped && status === 'succeeded') throw new Error('The turn was stopped.');
       if (status === 'succeeded' && (context.proactivity ? overBudget() : checkInStopped)) {
