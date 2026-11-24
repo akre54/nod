@@ -1388,7 +1388,7 @@ export function createAgentBrowserComputer(options: {
     state: BrowserState,
     submitSelector: string | undefined,
     operation: (devtools: Awaited<ReturnType<typeof openDevtools>>, document: string) => Promise<T>,
-    submitOrigins: string[] = [],
+    submitOrigins: string[] | undefined,
     signal?: AbortSignal,
   ): Promise<T> {
     if (state.injecting) throw new BrowserLockedError();
@@ -1442,13 +1442,15 @@ export function createAgentBrowserComputer(options: {
                   throw new BrowserActionError('browser_card_disabled');
                 await delay(100, undefined, { signal });
               }
-              const field = await focusField(state, devtools, control);
-              const origin = new URL(await currentUrl(state)).origin;
-              if (
-                (field.origin !== origin && !submitOrigins.includes(field.origin)) ||
-                (await devtools.document()) !== document
-              )
-                throw new Error('The submit control is not on this page.');
+              if (submitOrigins) {
+                const field = await focusField(state, devtools, control);
+                const origin = new URL(await currentUrl(state)).origin;
+                if (
+                  (field.origin !== origin && !submitOrigins.includes(field.origin)) ||
+                  (await devtools.document()) !== document
+                )
+                  throw new Error('The submit control is not on this page.');
+              }
               assertOpen();
               await command(
                 state,
@@ -1517,7 +1519,7 @@ export function createAgentBrowserComputer(options: {
         await saveState(state);
         return { status: 'submitted' as const };
       },
-      [],
+      undefined,
       signal,
     );
   }
@@ -1978,6 +1980,8 @@ export function createAgentBrowserComputer(options: {
               `Choice ${index + 1} of ${methods.length}.`,
               guard,
             );
+          if (observed && observed.role !== 'button' && observed.role !== 'link')
+            throw refused('choice_ineligible');
           const control = await (async () =>
             devtools.signInControl(ref ? await pointOf(state, ref) : { selector: target }))().catch(
             (error: unknown) => {

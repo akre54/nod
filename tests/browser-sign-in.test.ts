@@ -472,6 +472,58 @@ test(
 );
 
 test(
+  'private sign-in submits with a button that cannot take focus',
+  { timeout: 60_000 },
+  async () => {
+    let username = '';
+    const server = createHttpServer((request, response) => {
+      response.setHeader('content-type', 'text/html');
+      if (request.method !== 'POST') {
+        response.end(
+          '<form method="post" action="/session"><input id="account" name="account"><input id="secret" name="secret" type="password"><div id="go" role="button" onclick="this.parentElement.submit()">Sign in</div></form>',
+        );
+        return;
+      }
+      let body = '';
+      request.on('data', (chunk) => (body += chunk));
+      request.on('end', () => {
+        username = new URLSearchParams(body).get('account') ?? '';
+        response.end('<title>Done</title><p>Signed in</p>');
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const directory = await mkdtemp(join(tmpdir(), 'nod-sign-in-button-'));
+    const computer = createAgentBrowserComputer({
+      dataRoot: directory,
+      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+      privateNetwork: true,
+      headless: true,
+    });
+    try {
+      await computer.act('login', { action: 'open', url: origin });
+      await computer.injectCredentials({
+        threadId: 'login',
+        origin,
+        kind: 'password',
+        username: 'synthetic@example.com',
+        password: 'fixture-secret',
+        usernameSelector: '#account',
+        passwordSelector: '#secret',
+        submitSelector: '#go',
+      });
+      await computer.act('login', { action: 'wait', text: 'Signed in' });
+      assert.equal(username, 'synthetic@example.com');
+    } finally {
+      await computer.dispose();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   'private frame input refuses a control center outside the root viewport before dispatch',
   { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 30_000 },
   async (t) => {
@@ -1241,7 +1293,7 @@ test(
       }
       if (request.url === '/scrolled' || request.url === '/scrolled-xy') {
         response.end(
-          `<form action="/selected" method="post" style="margin:1800px 0 0 ${request.url === '/scrolled-xy' ? 1600 : 0}px"><button id="primary">Continue with Example</button></form><button id="change" onclick="const cover=document.createElement('div');cover.style.cssText='position:fixed;inset:0;z-index:1000';document.body.append(cover)">Cover control</button>`,
+          `<form action="/selected" method="post" style="margin:1800px 0 0 ${request.url === '/scrolled-xy' ? 1600 : 0}px"><button id="primary">Continue with Example</button></form><button id="change" onclick="const cover=document.createElement('div');cover.style.cssText='position:fixed;inset:0;z-index:1000';document.body.append(cover)">Cover control</button><button id="veil" onclick="const veil=document.createElement('div');veil.style.cssText='position:fixed;inset:0;z-index:1000;pointer-events:none';document.body.append(veil)">Veil control</button>`,
         );
         return;
       }
@@ -1451,6 +1503,27 @@ test(
       await assert.rejects(
         client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: '@' + covered }]),
       );
+      await act({ action: 'open', url: origin + '/scrolled' });
+      const veiled = [
+        {
+          label: 'Ignored',
+          selector:
+            '@' +
+            /button "Continue with Example"[^\n]*ref=(e\d+)/.exec(
+              (await act({ action: 'click', selector: '#veil' })).text,
+            )?.[1],
+        },
+      ];
+      assert.equal(
+        (await client.signInMethods!('fixture', origin, veiled)).methods[0]!.label,
+        'Continue with Example',
+      );
+      await act({ action: 'click', selector: '#change' });
+      await assert.rejects(client.signInMethods!('fixture', origin, veiled), (error: unknown) => {
+        assert.equal(Object(error).code, 'browser_click_intercepted');
+        assert.equal(Object(error).signInGuard, 'control_covered');
+        return true;
+      });
       await assert.rejects(
         client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: 'button' }]),
         (error: unknown) => {

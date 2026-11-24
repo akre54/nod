@@ -4,6 +4,7 @@ import { createReadStream, createWriteStream } from 'node:fs';
 import {
   access,
   lstat,
+  mkdtemp,
   mkdir,
   readdir,
   readFile,
@@ -13,16 +14,22 @@ import {
   statfs,
   writeFile,
 } from 'node:fs/promises';
-import { basename, join, resolve } from 'node:path';
+import { basename, isAbsolute, join, resolve } from 'node:path';
 import { Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { createGunzip } from 'node:zlib';
 import { assetHash, resumableDownload, timeLeft } from './assets.mjs';
 import { execute, finishRuntime } from './index.mjs';
+import { startupWslCode } from '../../src/shared/startup-feedback-facts.mjs';
 
 const holders = new Map();
 const distributionName = (root) =>
   `nod-${createHash('sha256').update(resolve(root).toLowerCase()).digest('hex').slice(0, 12)}`;
+const generatedComputerPath = (path, distribution) =>
+  typeof path === 'string' &&
+  isAbsolute(path) &&
+  resolve(path) === path &&
+  new RegExp(`^${distribution}-[a-zA-Z0-9]{6}$`).test(basename(path));
 export const windowsPublisher = Object.freeze({
   name: 'n8n GmbH',
   profile: '1.3.6.1.4.1.311.97.516399124.569093350.771684794.174905458',
@@ -62,15 +69,50 @@ export async function protectWindowsProfile(root, resourcesPath) {
   );
 }
 
+async function readComputerState(path, distribution) {
+  let saved;
+  try {
+    saved = JSON.parse(await readFile(path, 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return;
+    throw Object.assign(
+      new Error('The Nod computer configuration needs recovery.', { cause: error }),
+      { code: 'NOD_COMPUTER_CONFIGURATION_INVALID' },
+    );
+  }
+  if (
+    !saved ||
+    saved.version !== 1 ||
+    saved.distribution !== distribution ||
+    (saved.initializing !== undefined && typeof saved.initializing !== 'boolean') ||
+    (saved.computerPath !== undefined &&
+      (typeof saved.computerPath !== 'string' || !isAbsolute(saved.computerPath))) ||
+    !/^[a-f0-9]{64}$/.test(saved.password)
+  )
+    throw Object.assign(new Error('The Nod computer configuration needs recovery.'), {
+      code: 'NOD_COMPUTER_CONFIGURATION_INVALID',
+    });
+  return saved;
+}
+
 async function runWsl(wsl, args, options, source = 'host') {
   try {
     return await execute(wsl, args, options);
   } catch (error) {
     options.signal?.throwIfAborted();
+    const wslCode = startupWslCode(error.details?.match(/\bWsl\/(?:\w+\/)*(\w+)\b/)?.[1]);
+    if (wslCode) error.wslCode = wslCode;
+    const repair =
+      wslCode === 'HCS_E_SERVICE_NOT_AVAILABLE' ||
+      wslCode === 'HCS_E_HYPERV_NOT_INSTALLED' ||
+      wslCode === 'WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED' ||
+      wslCode === 'ERROR_SERVICE_DISABLED' ||
+      wslCode === 'ERROR_SERVICE_DOES_NOT_EXIST';
     if (
-      source === 'guest'
+      (wslCode && !repair) ||
+      (source === 'guest'
         ? error.exitCode !== 4294967295
-        : source === 'host' && !Number.isInteger(error.exitCode)
+        : source === 'host' && !Number.isInteger(error.exitCode))
     )
       throw error;
     throw Object.assign(
@@ -80,6 +122,7 @@ async function runWsl(wsl, args, options, source = 'host') {
       {
         code: 'NOD_WSL_REQUIRED',
         exitCode: error.exitCode,
+        ...(wslCode && { wslCode }),
         details: [error.code, error.stack || error.message, error.details]
           .filter(Boolean)
           .join('\n'),
@@ -94,7 +137,14 @@ async function distributions(wsl, env, signal) {
       .split(/\r?\n/)
       .map((value) => value.trim())
       .filter(Boolean);
-  return { ready: await list(), registered: await list('--all') };
+  const ready = await list();
+  const registered = await list('--all');
+  if (ready.some((name) => !registered.includes(name)))
+    throw Object.assign(
+      new Error('WSL returned conflicting computer states. The files were kept. Try again.'),
+      { code: 'NOD_COMPUTER_NOT_READY' },
+    );
+  return { ready, registered };
 }
 
 export async function installWsl({ signal } = {}) {
@@ -323,39 +373,47 @@ async function prepareWindows(options, onComputerStart, progress) {
     throw new Error('The Windows transport failed its integrity check.');
   const distribution = distributionName(dataRoot);
   const configPath = join(controlRoot, 'state.json');
-  let saved;
-  try {
-    saved = JSON.parse(await readFile(configPath, 'utf8'));
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw new Error('The Nod computer configuration needs recovery.');
-  }
+  let saved = await readComputerState(configPath, distribution);
   progress.step = 'wsl';
   const { ready, registered } = await distributions(wsl, hostEnvironment, signal);
   let existing = ready.includes(distribution);
-  if (registered.includes(distribution) && (!existing || !saved || saved.initializing)) {
+  if (!saved && registered.includes(distribution))
+    throw Object.assign(
+      new Error(
+        'Nod found an existing private computer without its saved configuration. Its files were kept. Restore the configuration, then try again.',
+      ),
+      { code: 'NOD_COMPUTER_CONFIGURATION_MISSING' },
+    );
+  if (saved && !existing && saved.initializing !== true)
+    throw Object.assign(
+      new Error(
+        'WSL did not report the saved Nod computer as ready. Its files were kept. Restart Windows, then try again.',
+      ),
+      {
+        code: registered.includes(distribution)
+          ? 'NOD_COMPUTER_NOT_READY'
+          : 'NOD_COMPUTER_REGISTRATION_MISSING',
+      },
+    );
+  if (registered.includes(distribution) && saved.initializing === true) {
     await host(['--unregister', distribution], { timeout: 300_000 });
     existing = false;
   }
+  if (saved?.initializing === true && generatedComputerPath(saved.computerPath, distribution))
+    await rm(saved.computerPath, { recursive: true, force: true });
   progress.step = 'assets';
-  if (
-    saved &&
-    (saved.version !== 1 ||
-      saved.distribution !== distribution ||
-      !/^[a-f0-9]{64}$/.test(saved.password))
-  )
-    throw new Error('The Nod computer configuration needs recovery.');
   saved ??= {
     version: 1,
     distribution,
     password: randomBytes(32).toString('hex'),
     guest: manifest.guest.sha256,
   };
-  delete saved.initializing;
+  saved.initializing = !existing;
   const computerPath = existing
     ? saved.computerPath
     : options.computerDirectory
-      ? join(resolve(options.computerDirectory), distribution)
-      : join(controlRoot, 'wsl');
+      ? resolve(options.computerDirectory)
+      : controlRoot;
   const guestArgs = ['--distribution', distribution, '--user', 'root', '--exec'];
   const guest = (command, extra) =>
     runWsl(wsl, [...guestArgs, ...command], { env: hostEnvironment, signal, ...extra }, 'guest');
@@ -383,13 +441,13 @@ async function prepareWindows(options, onComputerStart, progress) {
     const archive = present ? placed : join(controlRoot, archiveName);
     const partial = present ? 0 : ((await stat(archive).catch(() => undefined))?.size ?? 0);
     const elsewhere = !existing && options.computerDirectory;
-    if (elsewhere) {
-      await mkdir(computerPath, { recursive: true });
-      await protectWindowsProfile(computerPath, resourcesPath);
-    }
+    if (elsewhere) await mkdir(computerPath, { recursive: true });
     const free = async (path) => {
-      const space = await statfs(path);
-      return space.bavail * space.bsize;
+      const space = await (options.inspectDisk ?? statfs)(path);
+      return {
+        bytes: Number(space.bavail) * Number(space.bsize),
+        device: space.dev ?? (await stat(path)).dev,
+      };
     };
     const computer =
       manifest.guest.expandedBytes +
@@ -398,9 +456,12 @@ async function prepareWindows(options, onComputerStart, progress) {
       manifest.guest.expandedBytes +
       (present ? 0 : Math.max(0, manifest.guest.bytes - partial)) +
       2 * 1024 ** 3;
+    const sourceSpace = await free(controlRoot);
+    const targetSpace = elsewhere ? await free(computerPath) : sourceSpace;
+    const separateDrive = sourceSpace.device !== targetSpace.device;
     if (
-      (await free(controlRoot)) < staging + (elsewhere ? 0 : computer) ||
-      (elsewhere && (await free(computerPath)) < computer + 2 * 1024 ** 3)
+      sourceSpace.bytes < staging + (separateDrive ? 0 : computer) ||
+      (separateDrive && targetSpace.bytes < computer + 2 * 1024 ** 3)
     )
       throw Object.assign(
         new Error(
@@ -445,14 +506,15 @@ async function prepareWindows(options, onComputerStart, progress) {
         throw new Error('The Windows computer image has an unexpected size.');
       if (!existing) {
         progress.step = 'import';
-        saved.initializing = true;
-        saved.computerPath = computerPath;
-        await save();
         await mkdir(computerPath, { recursive: true });
-        await host(['--import', distribution, computerPath, image, '--version', '2'], {
+        saved.initializing = true;
+        saved.computerPath = await mkdtemp(join(computerPath, `${distribution}-`));
+        if (elsewhere) await protectWindowsProfile(saved.computerPath, resourcesPath);
+        await save();
+        await host(['--import', distribution, saved.computerPath, image, '--version', '2'], {
           timeout: 1_200_000,
         });
-        delete saved.initializing;
+        saved.initializing = false;
       } else {
         progress.step = 'update';
         if ((await guest(['/bin/cat', '/var/lib/nod/identity'])) !== distribution.slice(4))
@@ -544,8 +606,11 @@ export async function stopWindowsRuntime(options) {
   const env = windowsEnvironment();
   const wsl = join(env.SYSTEMROOT, 'System32/wsl.exe');
   try {
-    const saved = JSON.parse(await readFile(join(dataRoot, 'desktop-runtime/state.json'), 'utf8'));
-    if (saved.version !== 1 || saved.distribution !== distribution) throw new Error();
+    const saved = await readComputerState(
+      join(dataRoot, 'desktop-runtime/state.json'),
+      distribution,
+    );
+    if (!saved) return;
     if ((await distributions(wsl, env)).ready.includes(distribution)) {
       await execute(
         wsl,
@@ -574,6 +639,7 @@ export async function stopWindowsRuntime(options) {
     throw Object.assign(
       new Error(
         'Nod could not confirm that its private computer stopped. Try again before quitting.',
+        { cause: error },
       ),
       { code: 'NOD_RUNTIME_STOP_FAILED' },
     );
@@ -584,17 +650,15 @@ export async function removeWindowsComputer(dataRoot) {
   const distribution = distributionName(dataRoot);
   const env = windowsEnvironment();
   const wsl = join(env.SYSTEMROOT, 'System32/wsl.exe');
-  const listed = await distributions(wsl, env).catch(() => undefined);
-  if (listed?.registered.includes(distribution))
+  const saved = await readComputerState(join(dataRoot, 'desktop-runtime/state.json'), distribution);
+  const listed = await distributions(wsl, env);
+  if (listed.registered.includes(distribution))
     await execute(wsl, ['--unregister', distribution], { env, timeout: 300_000 });
-  const saved = await readFile(join(dataRoot, 'desktop-runtime/state.json'), 'utf8')
-    .then((value) => JSON.parse(value))
-    .catch(() => undefined);
   if (
-    listed &&
     saved?.distribution === distribution &&
     typeof saved.computerPath === 'string' &&
-    basename(saved.computerPath) === distribution
+    (basename(saved.computerPath) === distribution ||
+      generatedComputerPath(saved.computerPath, distribution))
   )
     await rm(saved.computerPath, { recursive: true, force: true });
 }

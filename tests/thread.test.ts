@@ -4435,6 +4435,74 @@ test(
       );
 
       await t.test(
+        'cancelling a private verification interrupts a blocked reservation without submitting the code',
+        async () => {
+          await waitFor(settledThread);
+          const waiting = await thread.submitUserMessage('ask-credentials');
+          await waitFor(settled(waiting.turnId));
+          const requestId = (
+            await db.pool.query('SELECT id FROM credential_requests WHERE turn_id=$1', [
+              waiting.turnId,
+            ])
+          ).rows[0].id;
+          const held = await db.pool.connect();
+          await held.query('BEGIN');
+          await held.query('LOCK TABLE chat_verification_submissions IN ACCESS EXCLUSIVE MODE');
+          const blocker = (await held.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+          const controller = new AbortController();
+          const before = privateAudioCodes.length;
+          const messageId = randomUUID();
+          let finished = false;
+          const pending = assert
+            .rejects(
+              verification.accept('582614', {
+                threadId,
+                clientMessageId: messageId,
+                verificationRequestId: requestId,
+                signal: controller.signal,
+              }),
+            )
+            .then(() => {
+              finished = true;
+            });
+          try {
+            await waitFor(async () =>
+              Boolean(
+                (
+                  await db.pool.query(
+                    'SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid))',
+                    [blocker],
+                  )
+                ).rowCount,
+              ),
+            );
+            controller.abort(new Error('Synthetic cancelled verification.'));
+            await Promise.race([pending, delay(1000)]);
+            assert.equal(finished, true);
+            assert.equal(privateAudioCodes.length, before);
+            assert.equal(
+              (
+                await held.query(
+                  'SELECT 1 FROM chat_verification_submissions WHERE message_id=$1',
+                  [messageId],
+                )
+              ).rowCount,
+              0,
+            );
+          } finally {
+            controller.abort();
+            await held.query('ROLLBACK');
+            held.release();
+            await pending;
+            await db.pool.query(
+              "UPDATE credential_requests SET status='superseded' WHERE turn_id=$1",
+              [waiting.turnId],
+            );
+          }
+        },
+      );
+
+      await t.test(
         'spoken replies follow the owner preference once and preserve text on failure or stop',
         async () => {
           await waitFor(settledThread);
@@ -11462,6 +11530,24 @@ test(
               code: /HTTP 402.*weight_exceeds_budget/,
             },
             {
+              prompt: 'model-backups-failed-fixture',
+              error:
+                prefix +
+                ['Primary', 'Backup']
+                  .map((name) =>
+                    JSON.stringify({
+                      error: {
+                        code: 402,
+                        message: `${name} credits used up.`,
+                        detail: 'synthetic-private-provider-detail',
+                      },
+                    }),
+                  )
+                  .join('; then compatible / fixture-backup: '),
+              reason: /Primary credits used up\..*Backup credits used up\./,
+              code: /fixture-backup: HTTP 402; Backup credits used up\./,
+            },
+            {
               prompt: 'model-plain-quota-fixture',
               error: prefix + 'quota_exceeded',
               reason: /quota_exceeded/,
@@ -13377,6 +13463,12 @@ test(
       secrets: ['synthetic-password/123'],
       profile: async () => ({ names: ['Marta Vidal'], region: 'PT' }),
     };
+    const poolBefore = {
+      max: f.pool.options.max,
+      total: f.pool.totalCount,
+      idle: f.pool.idleCount,
+      waiting: f.pool.waitingCount,
+    };
     const encoded = await buildFeedbackReport(options);
     for (const omitted of [
       ...privateValues,
@@ -13521,6 +13613,7 @@ test(
     assert.equal(report.system.osVersion, '15.1.0');
     assert.equal(report.system.electron, null);
     assert.ok(report.system.memoryMb > 0);
+    assert.deepEqual(report.system.databasePool, poolBefore);
     assert.deepEqual(report.client, { stream: 'closed', savedMessages: 4, renderedMessages: 3 });
     assert.deepEqual(report.modelSettings, [
       {
@@ -14104,6 +14197,106 @@ test(
       await pool.end();
     }
     assert.equal(ran, false);
+  },
+);
+
+test(
+  'a silent database connection times out without replaying work, including a lost commit reply',
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 15_000 },
+  async (t) => {
+    const { createConnection, createServer } = await import('node:net');
+    const { setImmediate: nextTick } = await import('node:timers/promises');
+    const { createPool, pool: applicationPool } = await import('../src/server/db.ts');
+    const { afterCommit, afterRollback, transaction } =
+      await import('../src/server/transaction.ts');
+    const schema = `test_silent_database_${randomUUID().replaceAll('-', '')}`;
+    const database = new URL(process.env.TEST_DATABASE_URL!);
+    const admin = new pg.Pool({ connectionString: database.href });
+    await admin.query(`CREATE SCHEMA ${schema}; CREATE TABLE ${schema}.saved(value integer)`);
+    const sockets = new Set<import('node:net').Socket>();
+    let blocked = false;
+    let observed = () => {};
+    let queries = 0;
+    const proxy = createServer((client) => {
+      const upstream = createConnection({
+        host: database.hostname,
+        port: Number(database.port || 5432),
+      });
+      for (const socket of [client, upstream]) {
+        sockets.add(socket);
+        socket.on('error', () => {});
+        socket.on('close', () => {
+          sockets.delete(socket);
+          client.destroy();
+          upstream.destroy();
+        });
+      }
+      client.on('data', (bytes) => {
+        if (bytes[0] === 81) queries++;
+      });
+      client.pipe(upstream);
+      upstream.on('data', (bytes) => {
+        if (blocked) observed();
+        else client.write(bytes);
+      });
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const endpoint = new URL(database);
+    endpoint.hostname = '127.0.0.1';
+    endpoint.port = String((proxy.address() as import('node:net').AddressInfo).port);
+    endpoint.searchParams.set('options', `-c search_path=${schema}`);
+    const pool = createPool({ connectionString: endpoint.href, max: 1 });
+    t.after(async () => {
+      for (const socket of sockets) socket.destroy();
+      await pool.end();
+      t.mock.timers.reset();
+      await new Promise<void>((resolve) => proxy.close(() => resolve()));
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+      if (!applicationPool.ending) await applicationPool.end();
+    });
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    for (const kind of ['query', 'transaction', 'commit']) {
+      await pool.query('SELECT 1');
+      const before = queries;
+      const received = new Promise<void>((resolve) => {
+        observed = resolve;
+      });
+      let commits = 0;
+      let rollbacks = 0;
+      const pending =
+        kind !== 'query'
+          ? transaction(async (client) => {
+              afterCommit(client, () => commits++);
+              afterRollback(client, () => rollbacks++);
+              blocked = kind === 'transaction';
+              await client.query('INSERT INTO saved VALUES(1)');
+              blocked = true;
+            }, pool)
+          : (() => {
+              blocked = true;
+              return pool.query('SELECT 1');
+            })();
+      let failure: unknown;
+      const failed = pending.catch((error: unknown) => {
+        failure = error;
+      });
+      await received;
+      t.mock.timers.tick(30_000);
+      await nextTick();
+      assert.ok(failure instanceof Error, kind);
+      assert.match(failure.message, /Query read timeout/);
+      assert.equal(pool.totalCount, 0, kind);
+      assert.equal(queries - before, kind === 'commit' ? 3 : kind === 'transaction' ? 2 : 1, kind);
+      assert.equal(commits, 0, kind);
+      assert.equal(rollbacks, kind === 'transaction' ? 1 : 0, kind);
+      await failed;
+      blocked = false;
+      assert.equal(
+        (await pool.query('SELECT count(*)::int AS count FROM saved')).rows[0].count,
+        kind === 'commit' ? 1 : 0,
+      );
+    }
   },
 );
 

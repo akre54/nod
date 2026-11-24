@@ -197,6 +197,7 @@ import { createPersonalService } from './personal.ts';
 import { createOnboardingSuggestions } from './onboarding-suggestions.ts';
 import { createOnboardingProfile } from './onboarding-profile.ts';
 import { createMemoryLearning, initializeMemoryLearning } from './memory-learning.ts';
+import { createScheduleIdeas } from './schedule-ideas.ts';
 import { createMemoryService, importMemoryFile } from './memory.ts';
 import { createMemoryRecall } from './memory-recall.ts';
 import { createLearnedSkills } from './learned-skills.ts';
@@ -259,6 +260,7 @@ export interface ApplicationAdapters {
   keepAwake?: KeepAwake;
   localFilesHome?: string;
   memoryCurator?: MemoryCurator;
+  recallCurator?: MemoryCurator;
   classificationCurator?: MemoryCurator;
   imageCurator?: MemoryCurator;
   onboardingCurator?: MemoryCurator;
@@ -509,7 +511,7 @@ export function createDefaultAdapters(
     },
     models,
     agent: createPiAgent({
-      resolve: (choice) => models.resolve(false, choice),
+      resolve: (choice) => models.candidates(choice),
       provider,
       model,
       sessionRoot: join(dataRoot, 'sessions'),
@@ -616,6 +618,14 @@ export function createDefaultAdapters(
     integrationBrowser,
     keyStore,
     memoryCurator: modelCurator,
+    recallCurator: createPiMemoryCurator({
+      get provider() {
+        return models.current.provider;
+      },
+      resolve: () => models.candidates(undefined, true),
+      configured: () => models.configured,
+      traces,
+    }),
     trustCurator: createPiMemoryCurator({
       get provider() {
         return models.current.provider;
@@ -1071,7 +1081,12 @@ async function initializeApplication(
           }
         : undefined,
   });
-  const memoryRecall = createMemoryRecall({ pool, ownerId, memory, curator });
+  const memoryRecall = createMemoryRecall({
+    pool,
+    ownerId,
+    memory,
+    curator: adapters.recallCurator ? ledger.curator(adapters.recallCurator) : curator,
+  });
   const writingStyle = createWritingStyleLearning({ memory, curator });
   let channels: Awaited<ReturnType<typeof createChannels>> | undefined;
   const communication = createCommunication({
@@ -1375,6 +1390,16 @@ async function initializeApplication(
     browserConnections: (client) => browserConnections.list(client),
     icon,
   });
+  const scheduleIdeas = createScheduleIdeas({
+    pool,
+    ownerId,
+    curator,
+    memory: () => memory.load(),
+    limitReached: async () => Boolean(await ledger.reachedLimit()),
+    apps: async () => (await integrations.connectedApps()).map((app) => app.slug),
+    run: (work) => analytics.withSystemWork(ownerId, 'schedule_ideas', work),
+  });
+  await scheduleIdeas.initialize();
   vault = await createVault(pool, {
     signal: closing.signal,
     analytics: captureAnalytics,
@@ -3401,6 +3426,7 @@ async function initializeApplication(
   localFiles.registerRoutes(app);
   computerUse.registerRoutes(app);
   personal.registerRoutes(app);
+  scheduleIdeas.registerRoutes(app);
   onboardingSuggestions.registerRoutes(app);
   onboardingProfile.registerRoutes(app);
   tasks.registerRoutes(app);

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { copyFile, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
@@ -184,6 +184,7 @@ if (process.env.WORKSPACE_CONTAINER) {
           console.log(error.message);
           assert.equal(error.code, 'NOD_WSL_REQUIRED');
           assert.equal(error.step, 'wsl');
+          assert.equal(error.wslCode, 'ERROR_SERVICE_DISABLED');
           assert.equal(error.message.includes('\0'), false);
           assert.match(error.message, /Wsl\//);
           return true;
@@ -201,8 +202,35 @@ if (process.env.WORKSPACE_CONTAINER) {
     receipt.wslFailure = true;
     console.log('Checking that setup replaces a half-installed computer.');
     const distribution = `nod-${createHash('sha256').update(resolve(profile).toLowerCase()).digest('hex').slice(0, 12)}`;
+    const elsewhere = join(installation, 'synthetic-other-drive');
+    const occupied = join(elsewhere, distribution);
+    const otherDistribution = `synthetic-${randomUUID()}`;
+    const otherRegistration = `HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{${randomUUID()}}`;
+    await mkdir(occupied, { recursive: true });
+    await writeFile(join(occupied, 'ext4.vhdx'), 'synthetic existing computer');
+    const configPath = join(profile, 'desktop-runtime', 'state.json');
+    await mkdir(dirname(configPath), { recursive: true });
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        version: 1,
+        distribution,
+        password: randomBytes(32).toString('hex'),
+        initializing: true,
+      }),
+    );
     let prepared;
     try {
+      await run(
+        system('WindowsPowerShell/v1.0/powershell.exe'),
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          `$ErrorActionPreference = 'Stop'; $key = '${otherRegistration}'; New-Item -Path $key -Force | Out-Null; Set-ItemProperty -Path $key -Name DistributionName -Value '${otherDistribution}'; Set-ItemProperty -Path $key -Name BasePath -Value $env:NOD_OCCUPIED_LOCATION; Set-ItemProperty -Path $key -Name State -Value 1 -Type DWord; Set-ItemProperty -Path $key -Name Version -Value 2 -Type DWord; Set-ItemProperty -Path $key -Name DefaultUid -Value 0 -Type DWord; Set-ItemProperty -Path $key -Name Flags -Value 15 -Type DWord`,
+        ],
+        { env: { ...process.env, NOD_OCCUPIED_LOCATION: occupied } },
+      );
       await run(
         system('WindowsPowerShell/v1.0/powershell.exe'),
         [
@@ -223,7 +251,7 @@ if (process.env.WORKSPACE_CONTAINER) {
         {
           dataRoot: profile,
           resourcesPath: engine,
-          computerDirectory: join(installation, 'synthetic-other-drive'),
+          computerDirectory: elsewhere,
           onStatus: (value) => value.phase === 'downloading' || console.log(value.message),
           resolveDownloadUrl: async () =>
             'https://runtime.example.invalid/nod-Runtime-win32-x64.tar.gz',
@@ -243,9 +271,20 @@ if (process.env.WORKSPACE_CONTAINER) {
         new RegExp(`${distribution}\\s+Running`),
       );
       receipt.halfInstalled = true;
-      assert.ok(
-        (await stat(join(installation, 'synthetic-other-drive', distribution, 'ext4.vhdx'))).size,
+      const saved = JSON.parse(await readFile(join(profile, 'desktop-runtime/state.json'), 'utf8'));
+      assert.equal(dirname(saved.computerPath), elsewhere);
+      assert.ok((await stat(join(saved.computerPath, 'ext4.vhdx'))).size);
+      assert.equal(
+        await readFile(join(occupied, 'ext4.vhdx'), 'utf8'),
+        'synthetic existing computer',
       );
+      assert.match(
+        await run(wsl, ['--list', '--quiet', '--all'], {
+          env: { ...process.env, WSL_UTF8: '1' },
+        }),
+        new RegExp(otherDistribution),
+      );
+      receipt.occupiedLocation = true;
       await assert.rejects(stat(join(profile, 'desktop-runtime/wsl')), { code: 'ENOENT' });
       receipt.chosenFolder = true;
       await run(
@@ -276,6 +315,40 @@ if (process.env.WORKSPACE_CONTAINER) {
       receipt.browser = true;
       receipt.workspaceFiles = true;
       console.log('Windows application, browser and workspace verified.');
+      console.log('Checking that missing or invalid configuration keeps the saved computer.');
+      const originalState = await readFile(configPath, 'utf8');
+      for (const content of [
+        undefined,
+        JSON.stringify({ ...JSON.parse(originalState), version: 2, initializing: true }),
+      ]) {
+        try {
+          if (content === undefined) await rm(configPath);
+          else await writeFile(configPath, content);
+          let changed = false;
+          await assert.rejects(
+            runtime.prepareWindowsRuntime({ dataRoot: profile, resourcesPath: engine }, () => {
+              changed = true;
+            }),
+            {
+              code:
+                content === undefined
+                  ? 'NOD_COMPUTER_CONFIGURATION_MISSING'
+                  : 'NOD_COMPUTER_CONFIGURATION_INVALID',
+            },
+          );
+          assert.equal(changed, false, 'An uncertain computer must stay unchanged.');
+          assert.match(
+            await run(wsl, ['--list', '--quiet', '--all'], {
+              env: { ...process.env, WSL_UTF8: '1' },
+            }),
+            new RegExp(distribution),
+          );
+          assert.ok((await stat(join(saved.computerPath, 'ext4.vhdx'))).size);
+        } finally {
+          await writeFile(configPath, originalState);
+        }
+      }
+      receipt.savedComputer = true;
       console.log('Checking a relaunch without admin rights after the PC went off.');
       await run(wsl, ['--terminate', prepared.env.NOD_WSL_DISTRIBUTION]);
       await run(join(process.env.SYSTEMROOT, 'System32/WindowsPowerShell/v1.0/powershell.exe'), [
@@ -306,6 +379,12 @@ if (process.env.WORKSPACE_CONTAINER) {
       );
       receipt.reopened = true;
     } finally {
+      await run(system('WindowsPowerShell/v1.0/powershell.exe'), [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `Remove-Item -LiteralPath '${otherRegistration}' -Recurse -Force -ErrorAction SilentlyContinue`,
+      ]);
       console.log('Stopping the test computer.');
       await runtime.stopWindowsRuntime({ dataRoot: profile });
       const saved = await readFile(join(profile, 'desktop-runtime/state.json'), 'utf8')

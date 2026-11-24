@@ -37,6 +37,7 @@ import { captureAnalytics } from '../lib/analytics';
 import { formatDateTime, useDateFormat } from '../lib/date-format';
 import { post, errorMessage } from '../lib/api';
 import { ScheduleRow } from './schedule';
+import { ScheduleIdeas } from '../components/schedule-ideas';
 import { LiveLine } from '../components/live-line';
 import { BrowserWatch } from '../components/browser-watch';
 import { WorkModel } from '../components/model-choices';
@@ -499,13 +500,14 @@ export function Scheduled({
       ) : (
         <>
           {upcoming.length ? (
-            <div className="saved-plan-list">
+            <div className="schedule-list">
               {upcoming.map((schedule) => (
                 <ScheduleRow
                   key={schedule.id}
                   schedule={schedule}
                   activity={activity}
                   onAsk={onAsk}
+                  defaultOpen={upcoming.length === 1}
                 />
               ))}
             </div>
@@ -531,18 +533,20 @@ export function Scheduled({
                 Inactive <span>{inactive.length}</span>
                 <ChevronDown size={16} aria-hidden="true" />
               </summary>
-              <div className="saved-plan-list">
+              <div className="schedule-list">
                 {inactive.map((schedule) => (
                   <ScheduleRow
                     key={schedule.id}
                     schedule={schedule}
                     activity={activity}
                     onAsk={onAsk}
+                    defaultOpen={!upcoming.length && inactive.length === 1}
                   />
                 ))}
               </div>
             </details>
           )}
+          <ScheduleIdeas first={empty} onAsk={onAsk} />
         </>
       )}
     </div>

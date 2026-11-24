@@ -111,17 +111,29 @@ An interrupted Mac setup from an older version can lack that record. If retry st
 
 The background service reports each startup step, and the startup log records each step with the time since the service started. Loading its code can take up to ten minutes on a slow or busy computer. Each later step can take two minutes. If a step takes longer, Nod stops waiting, and the log records the elapsed wait, the last health check failure, the last startup step and whether the service reported its port. An unexpected service exit has a separate log entry.
 
-On Windows, an interrupted first setup can leave the private computer half installed. The next attempt removes that unfinished computer and installs it again. A failed setup keeps its verified download, so **Try again** does not download it again.
+On Windows, Nod replaces only a recorded, unfinished import. The next attempt removes that unfinished registration and imports the computer into a new, empty disk folder. This avoids a location conflict with an older disk or another WSL registration. A failed setup keeps its verified download, so **Try again** does not download it again.
+
+Before another import, Nod removes a partial disk only from a generated folder named in its valid unfinished-import record. Older and unknown folders are kept.
+
+If the saved configuration is missing or invalid, setup stops and keeps the existing computer. Restore a missing configuration from your backup. If there is no backup or the configuration is invalid, keep the files and report the failure with the startup log.
+
+If a completed computer loses its registration or WSL does not report it as ready, restart Windows, then try again. Conflicting WSL status reads also stop startup without changing files. If the problem continues, keep the files and report the failure. An older unfinished import can need recovery because it has no setup record.
+
+If setup needs more disk space, select a folder on another drive or free space. A different folder on the same drive still needs space for both the setup files and the private computer. Nod keeps a verified download for the next attempt.
 
 On a Mac, setup keeps runtime files that passed their checks, even if a later download fails. **Try again** checks and reuses those files. It does not remove a verified image while the private computer loads it.
 
 On Windows, database errors show whether PostgreSQL stopped, reached a memory limit, or failed its TCP check inside WSL. If PostgreSQL answers inside WSL, the error names the Windows connection that failed. Open **Technical details** to read the original error, its code, its stack, and available native command output. These details also appear in the startup log. Saved secrets are removed.
+
+During use, Nod waits up to 30 seconds for each query reply after it gets a database connection. The wait for a connection has a separate timeout. If the connection stops returning data, Nod closes it and reports the failure. Nod does not repeat the failed work. After the connection is restored, a new request can use a new connection. Check the result of an action before you ask Nod to do it again.
 
 On a Mac, **Technical details** and the startup log also show the cause of a runtime download failure. This includes a connection error inside `fetch failed` or a damaged archive error. Select **Try again** after you restore the connection. If Nod can keep the saved part, an interrupted download resumes. Otherwise it starts again.
 
 Quit Nod and open it again. If the error continues, restart Windows. Keep your app data. WSL setup errors also include the original Windows error.
 
 To start over, select **Remove all data…** in the **Nod** menu. Nod deletes your profile and private computer, then restarts and opens setup. See [Remove Nod](/get-started/install-desktop/#remove-nod) for what it keeps.
+
+On Windows, removal stops if WSL cannot list or remove the private computer. Nod keeps the profile so you can restore WSL and retry.
 
 ### Windows setup says Nod needs more free disk space
 
@@ -136,6 +148,8 @@ Nod versions before 0.7.0 on Windows can't install their own updates. Quit Nod f
 Nod says it could not start WSL 2 when WSL is missing, when Windows has not turned on its virtual machine feature, or when WSL needs an update. The message ends with the error from Windows, in your language.
 
 Select **Install WSL** in Nod, approve the administrator request, restart the PC and open Nod again. This installs or updates WSL and turns on the features it needs. A device policy can block WSL installation. If the Windows error says virtualization is turned off, turn it on in your PC's firmware settings first.
+
+A recognized WSL location conflict, access error, or import error keeps its specific cause. These errors do not offer **Install WSL**.
 
 ### PostgreSQL fails after a Mac VM kernel update
 
@@ -230,7 +244,7 @@ If the workspace crashes, use **Report bug** on the error screen before **Reload
 
 In the desktop app, if Nod's background service or its window stops, Nod shows its error screen. Select **Report bug** there. A separate report form opens without restarting the failed service. The menu bar **Report bug…** entry opens the same form while startup has failed.
 
-Describe the failure, then select **Review**. The startup report contains only fixed startup states, error classes and codes, versions, counts and event ages. Nod omits startup prose, log text, paths, URLs, account details and message content. It keeps up to 100 technical events and 48 KB in memory. It does not read a log file or earlier disk history for the report. Unknown fields are omitted. Error codes come from structured error fields, never from a message. Your description stays exactly as you wrote it. Review the exact attachment, then select **Send report**. You can untick **Include startup report** to send only your description. Keep the form open until you send it; the startup form does not save an unsent draft.
+Describe the failure, then select **Review**. The startup report contains only fixed startup states, error classes and codes, versions, counts and event ages. Nod omits startup prose, log text, paths, URLs, account details and message content. It keeps up to 100 technical events and 48 KB in memory. It does not read a log file or earlier disk history for the report. Unknown fields are omitted. The report reads error codes only from structured fields. The Windows runtime puts recognized WSL error codes in a separate field. The report keeps only codes from a fixed list. Your description stays exactly as you wrote it. Review the exact attachment, then select **Send report**. You can untick **Include startup report** to send only your description. Keep the form open until you send it; the startup form does not save an unsent draft.
 
 If the send result is unknown, select **Check status** while the startup form is open. An unknown or rejected result shows the collector's HTTP status when it is available. The code alone does not confirm delivery. If Nod restarts into the startup error screen, reopen **Report bug** to check the saved submission instead of sending it again. **Show startup log** still opens the local log when you need it.
 
@@ -250,22 +264,22 @@ To report a bug, use the [bug report form](https://github.com/n8n-io/nod/issues/
 
 The `nod-feedback-report-v3` JSON attachment connects the steps before a failure with the affected chat, agent work, app usage, and connections. It helps with support, debugging, and product improvement. It combines technical metadata with recent content after best-effort redaction.
 
-| Section                 | What it shows                                                                                                                                                                                          |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Runtime                 | App version, release, platform, known model provider, model family, selected model ID, reasoning effort, model routes, and the trust check mode.                                                       |
-| System                  | The time the report was prepared, time zone, operating system and its version, CPU count, memory, Node.js, Electron and database versions, runtime uptime, and whether Nod runs in a container.        |
-| Settings                | Locale, time zone, quiet hours, whether automatic preparation, local files, a notification rule or rules are set, spending limits, and each chat app's mode and link state. Rule text isn't included.  |
-| Chat                    | Recent user and assistant message text, roles, character and attachment counts, and reply metadata.                                                                                                    |
-| Turns and agent work    | Request source, channel, outcome, waiting state, queue and run duration, tool category, parent-child relationships, and whether a background check stopped at screening (its outcome shows the rest).  |
-| Model usage             | Request outcomes, duration, token counts, recorded cost and estimates, model IDs, known model categories and operations, and a 24-hour summary by model and operation.                                 |
-| Tasks and schedules     | State, progress counts, enabled state, overdue work, and recent run and failure counts.                                                                                                                |
-| Connections             | Managed app, browser, direct connection, and model connection state, plus reconnect and event-delivery health.                                                                                         |
-| Channels                | Receiving and delivery states, with a permitted failure reason.                                                                                                                                        |
-| Runtime logs            | Recent tool inputs and results, and connection activity.                                                                                                                                               |
-| Failures                | Application and background failures with error class, message, stack with source file names, status, exit code and process output. A repeated failure appears once with a count.                       |
-| Startup log             | Desktop startup, runtime preparation and update steps: versions, update check, download, install and restart results, and exit codes.                                                                  |
-| App activity and errors | Recent screen categories, API failure categories and status codes, UI errors, failed requests with the server's reason, live update disconnects, and captured app error messages and stacks.           |
-| App window              | Whether the window was online and visible, the live update connection state, the age of the last update, saved and displayed message counts, window size, locale, and clock difference to the runtime. |
+| Section                 | What it shows                                                                                                                                                                                            |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Runtime                 | App version, release, platform, known model provider, model family, selected model ID, reasoning effort, model routes, and the trust check mode.                                                         |
+| System                  | The report time, time zone, operating system, CPU count, memory, Node.js, Electron and database versions, runtime uptime, container state, and database connection counts (limit, total, idle, waiting). |
+| Settings                | Locale, time zone, quiet hours, whether automatic preparation, local files, a notification rule or rules are set, spending limits, and each chat app's mode and link state. Rule text isn't included.    |
+| Chat                    | Recent user and assistant message text, roles, character and attachment counts, and reply metadata.                                                                                                      |
+| Turns and agent work    | Request source, channel, outcome, waiting state, queue and run duration, tool category, parent-child relationships, and whether a background check stopped at screening (its outcome shows the rest).    |
+| Model usage             | Request outcomes, duration, token counts, recorded cost and estimates, model IDs, known model categories and operations, and a 24-hour summary by model and operation.                                   |
+| Tasks and schedules     | State, progress counts, enabled state, overdue work, and recent run and failure counts.                                                                                                                  |
+| Connections             | Managed app, browser, direct connection, and model connection state, plus reconnect and event-delivery health.                                                                                           |
+| Channels                | Receiving and delivery states, with a permitted failure reason.                                                                                                                                          |
+| Runtime logs            | Recent tool inputs and results, and connection activity.                                                                                                                                                 |
+| Failures                | Application and background failures with error class, message, stack with source file names, status, exit code and process output. A repeated failure appears once with a count.                         |
+| Startup log             | Desktop startup, runtime preparation and update steps: versions, update check, download, install and restart results, and exit codes.                                                                    |
+| App activity and errors | Recent screen categories, API failure categories and status codes, UI errors, failed requests with the server's reason, live update disconnects, and captured app error messages and stacks.             |
+| App window              | Whether the window was online and visible, the live update connection state, the age of the last update, saved and displayed message counts, window size, locale, and clock difference to the runtime.   |
 
 Database activity covers the latest 24 hours for your account across its conversations and background work. Each database section includes at most 200 entries, or 400 for agent execution events. Connection and schedule sections show current state. Report-local labels preserve execution relationships without exporting their original IDs. Activity uses relative ages and durations. The report carries one absolute time: when it was prepared.
 

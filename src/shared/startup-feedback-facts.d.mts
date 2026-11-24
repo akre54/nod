@@ -158,7 +158,27 @@ export type StartupCode =
   | 'NOD_DATABASE_NOT_READY'
   | 'NOD_COMPUTER_PROTECTION_FAILED'
   | 'NOD_COMPUTER_STORAGE_FULL'
+  | 'NOD_COMPUTER_CONFIGURATION_INVALID'
+  | 'NOD_COMPUTER_CONFIGURATION_MISSING'
+  | 'NOD_COMPUTER_NOT_READY'
+  | 'NOD_COMPUTER_REGISTRATION_MISSING'
   | 'NOD_KVM_UNAVAILABLE';
+export type StartupWslCode =
+  | '0x80072747'
+  | '0x800705b4'
+  | 'HCS_E_SERVICE_NOT_AVAILABLE'
+  | 'HCS_E_HYPERV_NOT_INSTALLED'
+  | 'WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED'
+  | 'ERROR_SERVICE_DISABLED'
+  | 'ERROR_SERVICE_DOES_NOT_EXIST'
+  | 'ERROR_FILE_EXISTS'
+  | 'ERROR_ALREADY_EXISTS'
+  | 'E_ILLEGAL_STATE_CHANGE'
+  | 'E_ACCESSDENIED'
+  | 'ERROR_ACCESS_DENIED'
+  | 'ERROR_DISK_FULL'
+  | 'WSL_E_IMPORT_FAILED';
+export function startupWslCode(value: unknown): StartupWslCode | undefined;
 export type StartupErrorFacts = {
   detailsOmitted: true;
   class?: StartupErrorClass;
@@ -169,6 +189,7 @@ export type StartupErrorFacts = {
   signal?: StartupSignal;
   code?: StartupCode;
   step?: StartupStep;
+  wslCode?: StartupWslCode;
 };
 export type StartupEventFacts = {
   event: StartupEvent;
@@ -210,6 +231,7 @@ export class StartupFeedbackError extends Error {
   signal?: StartupSignal;
   code?: StartupCode;
   step?: StartupStep;
+  wslCode?: StartupWslCode;
   errors?: StartupErrorFacts[];
   constructor(reason: string, cause?: unknown);
 }

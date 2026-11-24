@@ -4874,7 +4874,9 @@ test(
   { skip: process.platform === 'win32' },
   async (t) => {
     const { gzipSync } = await import('node:zlib');
-    const { prepareWindowsRuntime, removeWindowsComputer } = await import('../runtime/windows.mjs');
+    const { prepareWindowsRuntime, removeWindowsComputer, stopWindowsRuntime } =
+      await import('../runtime/windows.mjs');
+    const { startupErrorFacts } = await import('../../src/shared/startup-feedback-facts.mjs');
     const root = await realpath(await mkdtemp(join(tmpdir(), 'nod-windows-setup-')));
     const system = join(root, 'Windows');
     const resources = join(root, 'engine');
@@ -4898,22 +4900,31 @@ test(
       join(system, 'System32', 'wsl.exe'),
       `#!${process.execPath}
 const { readFileSync, writeFileSync } = require('node:fs');
+const { join } = require('node:path');
 const path = ${JSON.stringify(statePath)};
 const state = JSON.parse(readFileSync(path, 'utf8'));
 const args = process.argv.slice(2);
 state.calls.push(args.slice(0, 2).join(' '));
 let code = 0;
-if (args[0] === '--list' && state.offline) code = 1;
+if (args[0] === '--list' && state.offline) {
+  process.stderr.write('Synthetic WSL service failure.');
+  code = 1;
+}
 else if (args[0] === '--list')
   process.stdout.write(Buffer.from('\\uFEFF' + (args.includes('--all') ? state.registered : state.ready).join('\\r\\n') + '\\r\\n', 'utf16le'));
 if (args[0] === '--unregister') state.registered = state.ready = [];
 if (args[0] === '--import') {
   if (state.broken) {
-    process.stdout.write(Buffer.from("La machine virtuelle n’a pas pu être démarrée car une fonctionnalité requise n’est pas installée.\\r\\nCode d’erreur : Wsl/Service/RegisterDistro/CreateVm/HCS/HCS_E_SERVICE_NOT_AVAILABLE\\r\\n", 'utf16le'));
+    writeFileSync(join(args[2], 'ext4.vhdx'), 'synthetic incomplete disk');
+    const reason = state.broken === true
+      ? "La machine virtuelle n’a pas pu être démarrée car une fonctionnalité requise n’est pas installée.\\r\\nCode d’erreur : Wsl/Service/RegisterDistro/CreateVm/HCS/HCS_E_SERVICE_NOT_AVAILABLE\\r\\n"
+      : 'Synthetic WSL failure.\\r\\nError code: Wsl/Service/RegisterDistro/' + state.broken + '\\r\\n';
+    process.stdout.write(Buffer.from(reason, 'utf16le'));
     code = 1;
   } else {
     state.registered = state.ready = [args[1]];
     state.imported = args[2];
+    writeFileSync(join(args[2], 'ext4.vhdx'), 'synthetic computer disk');
   }
 }
 if (args[0] === '--distribution') {
@@ -4956,12 +4967,13 @@ process.exit(code);
       return state.calls;
     };
     let downloads = 0;
-    const prepare = (computerDirectory) =>
+    const prepare = (computerDirectory, inspectDisk) =>
       prepareWindowsRuntime(
         {
           dataRoot: profile,
           resourcesPath: resources,
           computerDirectory,
+          inspectDisk,
           resolveDownloadUrl: async () => 'https://runtime.example.invalid/guest.tar.gz',
           fetch: async () => {
             downloads++;
@@ -4970,15 +4982,27 @@ process.exit(code);
         },
         () => {},
       );
-    const saved = async () =>
-      JSON.parse(await readFile(join(profile, 'desktop-runtime', 'state.json'), 'utf8'));
+    const configPath = join(profile, 'desktop-runtime', 'state.json');
+    const saved = async () => JSON.parse(await readFile(configPath, 'utf8'));
     const kept = join(profile, 'desktop-runtime', `guest-${sha256(archive).slice(0, 12)}.tar.gz`);
 
+    await mkdir(dirname(configPath), { recursive: true });
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        version: 1,
+        distribution,
+        password: '1'.repeat(64),
+        guest: sha256(archive),
+        initializing: true,
+      }),
+    );
     await wsl({ ready: [], registered: [distribution], broken: true });
     await assert.rejects(prepare(), (error) => {
       assert.equal(error.code, 'NOD_WSL_REQUIRED');
       assert.equal(error.step, 'import');
       assert.equal(error.exitCode, 1);
+      assert.equal(error.wslCode, 'HCS_E_SERVICE_NOT_AVAILABLE');
       assert.match(error.message, /HCS_E_SERVICE_NOT_AVAILABLE/);
       assert.match(error.message, /une fonctionnalité requise n’est pas installée/);
       assert.equal(error.message.includes('\0'), false);
@@ -4992,18 +5016,41 @@ process.exit(code);
       `--import ${distribution}`,
     ]);
     assert.equal((await saved()).initializing, true);
+    const failedComputer = (await saved()).computerPath;
+    assert.equal(
+      await readFile(join(failedComputer, 'ext4.vhdx'), 'utf8'),
+      'synthetic incomplete disk',
+    );
     assert.equal(sha256(await readFile(kept)), sha256(archive));
 
     const elsewhere = join(root, 'another drive');
-    await mkdir(elsewhere);
+    const occupied = join(elsewhere, distribution);
+    await mkdir(occupied, { recursive: true });
+    await writeFile(join(occupied, 'ext4.vhdx'), 'synthetic existing computer');
+    await wsl({ ready: [], registered: [], broken: false });
+    const space = 2 * 1024 ** 3 + expanded.length + 4;
+    await assert.rejects(
+      prepare(elsewhere, async () => ({ bavail: space, bsize: 1, dev: 1 })),
+      { code: 'NOD_COMPUTER_STORAGE_FULL', step: 'assets' },
+    );
+    assert.equal(downloads, 1);
+    assert.ok(!(await wsl()).some((call) => call.startsWith('--import')));
+    assert.equal(sha256(await readFile(kept)), sha256(archive));
     await wsl({ ready: [distribution], registered: [distribution], broken: false });
-    await assert.rejects(prepare(elsewhere), (error) => {
-      assert.equal(error.code, undefined);
-      assert.equal(error.step, 'start');
-      assert.equal(error.exitCode, 7);
-      assert.match(error.message, /synthetic guest stop/);
-      return true;
-    });
+    await assert.rejects(
+      prepare(elsewhere, async (path) => ({
+        bavail: space,
+        bsize: 1,
+        dev: path === dirname(configPath) ? 1 : 2,
+      })),
+      (error) => {
+        assert.equal(error.code, undefined);
+        assert.equal(error.step, 'start');
+        assert.equal(error.exitCode, 7);
+        assert.match(error.message, /synthetic guest stop/);
+        return true;
+      },
+    );
     assert.deepEqual(await wsl(), [
       '--status',
       '--list --quiet',
@@ -5013,18 +5060,144 @@ process.exit(code);
       `--distribution ${distribution}`,
     ]);
     assert.equal(downloads, 1);
-    assert.equal((await saved()).initializing, undefined);
+    assert.equal((await saved()).initializing, false);
+    await assert.rejects(stat(failedComputer), { code: 'ENOENT' });
     await assert.rejects(stat(kept), { code: 'ENOENT' });
-    const computer = join(elsewhere, distribution);
-    assert.equal(JSON.parse(await readFile(statePath, 'utf8')).imported, computer);
+    const computer = JSON.parse(await readFile(statePath, 'utf8')).imported;
+    assert.notEqual(computer, occupied);
+    assert.equal(dirname(computer), elsewhere);
+    assert.equal(
+      await readFile(join(occupied, 'ext4.vhdx'), 'utf8'),
+      'synthetic existing computer',
+    );
     assert.equal((await saved()).computerPath, computer);
+    await wsl({});
+    await assert.rejects(prepare(join(root, 'unused folder')), { step: 'start', exitCode: 7 });
+    assert.deepEqual(await wsl(), [
+      '--status',
+      '--list --quiet',
+      '--list --quiet',
+      `--distribution ${distribution}`,
+    ]);
+    assert.equal((await saved()).computerPath, computer);
+    assert.equal(await readFile(join(computer, 'ext4.vhdx'), 'utf8'), 'synthetic computer disk');
+    const original = await readFile(configPath, 'utf8');
+    const { initializing, ...legacy } = JSON.parse(original);
+    for (const scenario of [
+      { name: 'missing configuration', code: 'NOD_COMPUTER_CONFIGURATION_MISSING' },
+      { name: 'null configuration', value: null, code: 'NOD_COMPUTER_CONFIGURATION_INVALID' },
+      {
+        name: 'relative computer path',
+        value: { ...JSON.parse(original), computerPath: 'relative', initializing: true },
+        code: 'NOD_COMPUTER_CONFIGURATION_INVALID',
+      },
+      {
+        name: 'invalid version',
+        code: 'NOD_COMPUTER_CONFIGURATION_INVALID',
+        value: { ...JSON.parse(original), version: 2, initializing: true },
+      },
+      {
+        name: 'invalid password',
+        code: 'NOD_COMPUTER_CONFIGURATION_INVALID',
+        value: { ...JSON.parse(original), password: 'invalid', initializing: true },
+      },
+      {
+        name: 'invalid marker',
+        value: { ...JSON.parse(original), initializing: 'false' },
+        code: 'NOD_COMPUTER_CONFIGURATION_INVALID',
+      },
+      {
+        name: 'completed computer is not ready',
+        value: JSON.parse(original),
+        hidden: true,
+        code: 'NOD_COMPUTER_NOT_READY',
+      },
+      {
+        name: 'completed computer is not registered',
+        code: 'NOD_COMPUTER_REGISTRATION_MISSING',
+        value: JSON.parse(original),
+        hidden: true,
+        absent: true,
+      },
+      {
+        name: 'conflicting WSL status reads',
+        code: 'NOD_COMPUTER_NOT_READY',
+        value: { ...JSON.parse(original), initializing: true },
+        absent: true,
+      },
+      {
+        name: 'older computer is not ready',
+        value: legacy,
+        hidden: true,
+        code: 'NOD_COMPUTER_NOT_READY',
+      },
+    ]) {
+      const bytes = scenario.value === undefined ? undefined : JSON.stringify(scenario.value);
+      if (bytes === undefined) await rm(configPath);
+      else await writeFile(configPath, bytes);
+      await wsl({
+        ready: scenario.hidden ? [] : [distribution],
+        registered: scenario.absent ? [] : [distribution],
+      });
+      await assert.rejects(prepare(), (error) => {
+        assert.equal(error.code, scenario.code, scenario.name);
+        assert.equal(startupErrorFacts(error).code, scenario.code, scenario.name);
+        return true;
+      });
+      if (scenario.code === 'NOD_COMPUTER_CONFIGURATION_INVALID')
+        await assert.rejects(removeWindowsComputer(profile));
+      assert.ok(
+        (await wsl()).every((call) => !/^--(?:unregister|import) /.test(call)),
+        scenario.name,
+      );
+      assert.equal(
+        await readFile(configPath, 'utf8').catch((error) => {
+          if (error.code !== 'ENOENT') throw error;
+        }),
+        bytes,
+        scenario.name,
+      );
+      assert.equal(await readFile(join(computer, 'ext4.vhdx'), 'utf8'), 'synthetic computer disk');
+    }
+    await writeFile(configPath, original);
+    await wsl({ ready: [distribution], registered: [distribution] });
     await writeFile(join(elsewhere, 'keep.txt'), 'synthetic owner file');
     await wsl({ offline: true });
-    await removeWindowsComputer(profile);
-    assert.deepEqual((await readdir(elsewhere)).sort(), [distribution, 'keep.txt'].sort());
+    await assert.rejects(stopWindowsRuntime({ dataRoot: profile }), (error) => {
+      assert.equal(error.code, 'NOD_RUNTIME_STOP_FAILED');
+      assert.equal(error.cause.exitCode, 1);
+      assert.match(error.cause.details, /Synthetic WSL service failure/);
+      return true;
+    });
+    await assert.rejects(removeWindowsComputer(profile));
+    assert.deepEqual(
+      (await readdir(elsewhere)).sort(),
+      [distribution, relative(elsewhere, computer), 'keep.txt'].sort(),
+    );
     await wsl({ offline: false });
     await removeWindowsComputer(profile);
-    assert.deepEqual(await readdir(elsewhere), ['keep.txt']);
+    assert.deepEqual((await readdir(elsewhere)).sort(), [distribution, 'keep.txt'].sort());
+    assert.deepEqual(await readdir(occupied), ['ext4.vhdx']);
+    assert.equal(
+      await readFile(join(occupied, 'ext4.vhdx'), 'utf8'),
+      'synthetic existing computer',
+    );
+    await rm(configPath);
+    let failedPath;
+    for (const code of ['ERROR_FILE_EXISTS', 'E_ACCESSDENIED', '0x80072747', '0x800705b4']) {
+      await wsl({ ready: [], registered: [], broken: code });
+      await assert.rejects(prepare(elsewhere), (error) => {
+        assert.equal(error.code, undefined);
+        assert.equal(error.wslCode, code);
+        assert.equal(startupErrorFacts(error).wslCode, code);
+        assert.equal(error.step, 'import');
+        assert.equal(error.exitCode, 1);
+        assert.match(error.message, new RegExp(code));
+        return true;
+      });
+      if (failedPath) await assert.rejects(stat(failedPath), { code: 'ENOENT' });
+      failedPath = (await saved()).computerPath;
+    }
   },
 );
 
