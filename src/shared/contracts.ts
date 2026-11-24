@@ -54,6 +54,7 @@ export interface MessageApproval {
   fields?: Array<{ label: string; value: string }>;
   body?: string;
   bodyCut?: true;
+  cardQuestion?: string;
 }
 export interface SubmitMessageResponse {
   threadId: string;
@@ -388,6 +389,7 @@ export interface ScheduleRun {
   messageId: string | null;
   messagePreview: string | null;
   messageText: string | null;
+  attachmentMessageId: string | null;
   costUsd?: number | null;
 }
 export interface ScheduleHistory {

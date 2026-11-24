@@ -88,7 +88,7 @@ Flight cards group each journey's date, flight number, route, and times. A diffe
 
 Seat plans group the supplied rows by cabin and deck, preserving different layouts, aisles and empty positions. The coverage states whether the source shows the whole aircraft, a cabin or selected rows. Each plan refers to one flight or aircraft configuration. The view is schematic; nod can show the original image when exact geometry matters. Inspecting a seat doesn't reserve it or confirm its availability.
 
-Venue cards can include photos, review summaries with their source rating and review count, and notes such as access or cancellation conditions. Comparisons keep each venue's details together. A proposed booking stays an option until nod has evidence of confirmation.
+Venue cards can include photos, review summaries with their source rating and review count, and notes such as access or cancellation conditions. A card shows its first two facts and, when one is listed beyond them, the price; **See details** opens the rest, the rating and the notes. For a proposed booking with a source link, **Check on** followed by the website's name opens the option there; confirmed, pending or cancelled bookings with a source link show **View booking** instead. Comparisons keep each venue's details together. A proposed booking stays an option until nod has evidence of confirmation.
 
 Diagrams show each step with its details and label the connections between steps. Select a step to read its details and connections in full.
 
@@ -130,7 +130,7 @@ After an operation finishes, the line keeps up to four recent operations, with t
 
 ![Expanded recent activity below the current step and above the message box.](../../../assets/screens/chat-recent-activity.png)
 
-The line follows only the work on your messages. A task shows its progress on its own card, and a question from a task or schedule shows it on the small line above that question. When your message goes to a task, the line's place shows that task's dot, title and current step under your message. This happens when you reply to one of the task's messages or answer its question, or when Nod sends your message to the task. The task's progress stays there until it posts a message, finishes or needs you. Select it to open the task. Meanwhile, the line above an earlier question from that task shows only the task's name. While anything works, the message box says **Send another message to Nod…**. While a task works, a small dot pulses just above the top-right corner of the message box. A task that needs your answer shows a slightly larger pink dot with a question mark. Hover over a dot or focus it to see which task it is. Select it to open the task's card with a soft highlight: if the card is already on screen, the chat stays where it is; otherwise the chat scrolls to it.
+The line follows only the work on your messages. A task started in chat shows its progress on its own card, which opens from the tasks line at the end of the chat, and a question from a task or schedule shows it on the small line above that question. When your message goes to a task, the line's place shows that task's title and current step under your message. This happens when you reply to one of the task's messages or answer its question, or when Nod sends your message to the task. The task's progress stays there until it posts a message, finishes or needs you. Select it to open the task. Meanwhile, the line above an earlier question from that task shows only the task's name. While anything works, the message box says **Send another message to Nod…**. While tasks started in chat run, one line at the end of the chat counts them and says how many need you, such as "2 tasks running · 1 needs you". Select it to open a task's card. See [Tasks](/use/tasks/).
 
 ### Send more while Nod works
 
@@ -213,7 +213,7 @@ Nod has one main chat. `/clear` does not create a second conversation or delete 
 
 ## Stop Nod
 
-While Nod works, the status line under the chat shows its work on your messages, and each task shows its progress on its card and as a dot above the message box.
+While Nod works, the status line under the chat shows its work on your messages, and each task started in chat shows its progress on its card, which opens from the tasks line at the end of the chat.
 
 While the message box is empty, **Stop** appears beside the send button while Nod is working. Select it to stop Nod. The send button stays in place and becomes available when you type a message.
 
@@ -287,7 +287,7 @@ After first-time setup, a short invitation points to **Report bug**. Dismiss it 
 
 When something in Nod itself fails, or you tell Nod that something in Nod isn't working, Nod drafts a bug report once with a short summary of what happened. In the app, the draft appears in chat as a card with the summary, **Include diagnostic report**, **Review** and **Send report**. One click on **Send report** sends it to the same recipient as the dialog. Nod skips this for errors from outside services, such as a missing connection, credits, an app outage or a website's own error, and in background checks.
 
-A request, task or schedule run that stops on an unexpected error outside the model connection ends with the same card, with a short fixed summary. The error itself goes in the diagnostic report, not the summary. A model connection failure links to **Settings > Models** instead. A reply the model cut off at its output limit offers no bug report either: say continue to pick up where it stopped, or choose a model with a larger output limit in **Settings > Models**.
+A request, task or schedule run that stops on an unexpected error outside the model connection ends with the same card. Its short summary names the error's code or type when it has one, such as `EADDRINUSE`. The full error goes in the diagnostic report, not the summary. When the computer runs out of disk space, Nod says so and asks you to free up space, without a card. When Nod loses the connection to a service it runs on your computer, it says so and asks you to restart Nod. A model connection failure links to **Settings > Models** instead. A reply the model cut off at its output limit offers no bug report either: say continue to pick up where it stopped, or choose a model with a larger output limit in **Settings > Models**.
 
 In Telegram and WhatsApp, the draft arrives as text. Reply "send" to share the summary, without a diagnostic report, since you can't review one there. To add the report, send the same draft from its card in Nod on your computer. Nod sends it only when your reply clearly asks for that, and otherwise asks you to confirm first. Nothing is sent until you click **Send report** or reply to send it.
 

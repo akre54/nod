@@ -1,6 +1,7 @@
 import {
   InMemoryCredentialStore,
   getSupportedThinkingLevels,
+  isRetryableAssistantError,
   type Api,
   type AssistantMessage,
   type Context,
@@ -8,7 +9,8 @@ import {
 } from '@earendil-works/pi-ai';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { retryAssistantCall } from '@earendil-works/pi-ai/utils/retry';
-import { createPiModelRuntime, localModelSilenceMs } from './models.ts';
+import { createPiModelRuntime } from './models.ts';
+import { failedBeforeAnswer } from './fallback.ts';
 import type { ModelAccess } from '../../ports/models.ts';
 import { lightestEffort, modelPricingSignature } from '../../shared/models.ts';
 import type { MemoryCurator } from '../../ports/memory-curator.ts';
@@ -27,6 +29,7 @@ const untraced = new Set([
   'review',
   'style',
   'skill',
+  'ideas',
   'classify',
   'check',
 ]);
@@ -79,7 +82,8 @@ function json(text: string) {
 
 export function createPiMemoryCurator(options: {
   provider: string;
-  resolve?: () => Promise<ModelAccess | undefined>;
+  resolve?: () => Promise<ModelAccess | ModelAccess[] | undefined>;
+  retry?: boolean;
   configured?: () => boolean;
   model?: string;
   lightest?: boolean;
@@ -89,8 +93,8 @@ export function createPiMemoryCurator(options: {
   estimateAnthropicRequestUsd?: (model: Model<Api>, body: RequestInit['body']) => number | null;
 }): MemoryCurator {
   let loaded: ReturnType<typeof load> | undefined;
-  async function load(automatic: boolean) {
-    const access = await options.resolve?.();
+  async function load(automatic: boolean, resolved: ModelAccess | ModelAccess[] | undefined) {
+    const access = [resolved ?? []].flat()[0];
     if (options.resolve && !access) throw new Error('The selected model is unavailable.');
     if (access)
       await access.prepareRequest?.(
@@ -142,13 +146,32 @@ export function createPiMemoryCurator(options: {
       report,
     ) {
       signal?.throwIfAborted();
+      const candidates = await options.resolve?.();
+      if (Array.isArray(candidates) && candidates.length > 1)
+        for (const [index, access] of candidates.entries()) {
+          const last = index === candidates.length - 1;
+          try {
+            return await createPiMemoryCurator({
+              ...options,
+              resolve: async () => access,
+              retry: last,
+            }).curate(
+              { task, instructions, input, responseSchema, images, automatic },
+              signal,
+              report,
+            );
+          } catch (error) {
+            if (last || signal?.aborted || (error as { movesOn?: boolean }).movesOn === false)
+              throw error;
+          }
+        }
       const traceTurnId = crypto.randomUUID();
       const bounded =
         task === 'classify' || task === 'attention' || task === 'check' || task === 'activity';
       const turnBound =
         signal !== undefined && ['review', 'access', 'skill', 'remember'].includes(task);
       if (options.resolve) loaded = undefined;
-      loaded ??= load(automatic).catch((error) => {
+      loaded ??= load(automatic, candidates).catch((error) => {
         loaded = undefined;
         throw error;
       });
@@ -235,12 +258,9 @@ export function createPiMemoryCurator(options: {
                   AbortSignal.timeout(bounded ? 10_000 : 45_000),
                   ...(signal ? [signal] : []),
                 ]),
-            maxTokens: bounded ? 512 : 8192,
+            maxTokens: bounded ? 512 : task === 'ideas' ? 2048 : 8192,
             ...(sessionId ? { sessionId } : {}),
             ...(bounded ? { maxRetries: 0, timeoutMs: 10_000 } : {}),
-            ...(turnBound && model.provider === 'compatible'
-              ? { timeoutMs: localModelSilenceMs }
-              : {}),
             reasoning: effort === 'off' ? undefined : effort,
           });
         } finally {
@@ -292,7 +312,11 @@ export function createPiMemoryCurator(options: {
       };
       const reply = await retryAssistantCall(
         complete,
-        { enabled: task !== 'vision' && !bounded, maxRetries: 2, baseDelayMs: 250 },
+        {
+          enabled: options.retry !== false && task !== 'vision' && task !== 'ideas' && !bounded,
+          maxRetries: 2,
+          baseDelayMs: 250,
+        },
         signal,
       );
       if (
@@ -319,7 +343,13 @@ export function createPiMemoryCurator(options: {
         const status = [...(reply.errorMessage ?? '').matchAll(/\(HTTP (\d{3})\)/g)].at(-1)?.[1];
         throw Object.assign(
           new Error(`${label} Task: ${task}. Model: ${model.provider}/${model.id}.${detail}`),
-          status ? { providerStatus: Number(status) } : {},
+          { movesOn: failedBeforeAnswer(reply, requestFacts?.(reply)?.requestPhase) },
+          status
+            ? {
+                providerStatus: Number(status),
+                providerRetryable: isRetryableAssistantError(reply),
+              }
+            : {},
         );
       }
       return json(

@@ -48,7 +48,8 @@ export const analyticsTool = z.enum([
   'files',
   'flights',
   'manage_apps',
-  'manage_personal_context',
+  'memory',
+  'nod',
   'pay',
   'react_to_message',
   'send_message',
@@ -392,6 +393,12 @@ export const analyticsEvent = z.discriminatedUnion('event', [
             connected_app_type_count === connected_app_types.length &&
             new Set(connected_app_types).size === connected_app_types.length,
         ),
+    })
+    .strict(),
+  z
+    .object({
+      event: z.literal('runtime_active'),
+      properties: z.object({ started_today: z.boolean() }).strict(),
     })
     .strict(),
   z

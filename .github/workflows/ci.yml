@@ -64,9 +64,11 @@ jobs:
           POSTGRES_USER: nod
           POSTGRES_PASSWORD: nod-ci
           POSTGRES_DB: nod_ci
+          POSTGRES_INITDB_ARGS: --set fsync=off --set synchronous_commit=off --set full_page_writes=off --set max_connections=300
         ports:
           - 5432:5432
         options: >-
+          --tmpfs /var/lib/postgresql/data
           --health-cmd "pg_isready -h 127.0.0.1 -U nod -d nod_ci"
           --health-interval 1s
           --health-timeout 5s
@@ -82,7 +84,7 @@ jobs:
           persist-credentials: false
       - name: Install tooling and dependencies once
         uses: ./.github/actions/setup-node
-      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: .local/ci-test-timings
           key: ci-test-timings-v2-${{ github.run_id }}-${{ github.run_attempt }}
@@ -113,16 +115,16 @@ jobs:
         shell: bash
         run: |
           missing=()
-          for program in Xvfb xauth xdotool ffmpeg; do
+          for program in Xvfb xauth; do
             command -v "$program" >/dev/null || missing+=("${program,,}")
           done
           if (( ${#missing[@]} )); then
             sudo apt-get update -qq
             sudo apt-get install --yes --no-install-recommends "${missing[@]}"
           fi
-          if ! command -v chromium >/dev/null; then
-            chrome="$(command -v google-chrome || command -v google-chrome-stable)"
-            sudo ln -s "$chrome" /usr/bin/chromium
+          chrome="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium)"
+          if [[ "$chrome" != /usr/bin/chromium ]]; then
+            sudo ln -sf "$chrome" /usr/bin/chromium
           fi
           sudo ln -s "$PWD" /app
           mkdir -p "$RUNNER_TEMP/integration-timings"
@@ -221,7 +223,7 @@ jobs:
         run: node .github/scripts/ci-tests.mjs
       - name: Cache test times for later runs
         if: success() && steps.scope.outputs.integration == 'true'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: .local/ci-test-timings
           key: ci-test-timings-v2-${{ github.run_id }}-${{ github.run_attempt }}
@@ -240,7 +242,7 @@ jobs:
       - name: Install tooling and dependencies
         uses: ./.github/actions/setup-node
       - name: Set up the Docker layer cache
-        uses: useblacksmith/setup-docker-builder@06dd9c83a5d541274d2e3ac67625560979275267
+        uses: useblacksmith/setup-docker-builder@9657a6e02ca6445e6d6ce5ffaf370f4828dea50d
         with:
           cache-key: n8n-io/nod/ci
       - name: Build the browser, workspace and server images
@@ -331,7 +333,7 @@ jobs:
         run: node desktop/scripts/prepare-windows-electron.mjs
       - name: Install NSIS for native update acceptance
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-        run: choco install nsis --yes --no-progress
+        run: ./.github/scripts/setup-windows-nsis.ps1
       - name: Check Windows credential storage across Electron restarts
         shell: pwsh
         run: |
@@ -392,7 +394,74 @@ jobs:
           path: |
             .local/windows-setup/*.xml
             .local/windows-update-acceptance/*.json
+            .local/windows-update-acceptance/*.png
           include-hidden-files: true
+          if-no-files-found: ignore
+
+  windows-startup:
+    name: Windows first setup, update and next start
+    needs: checks
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: windows-2025
+    timeout-minutes: 75
+    env:
+      CI: 'true'
+      NOD_DESKTOP_VERSION: 999.0.0
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install tooling and dependencies
+        uses: ./.github/actions/setup-node
+        with:
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            desktop/pnpm-lock.yaml
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - name: Install Electron and desktop tooling
+        run: pnpm --dir desktop install --frozen-lockfile
+      - name: Install NSIS
+        run: ./.github/scripts/setup-windows-nsis.ps1
+      - name: Download the Electron binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node desktop/scripts/prepare-windows-electron.mjs
+      - name: Build the web app
+        run: pnpm run build
+      - name: Find the published Windows runtime for this source, or the latest one
+        id: runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/scripts/desktop-release.mjs windows-runtime
+      - name: Reuse the published Windows runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOD_WINDOWS_RUNTIME_TAG: ${{ steps.runtime.outputs.windows_runtime_tag }}
+          NOD_WINDOWS_RUNTIME_FINGERPRINT: ${{ steps.runtime.outputs.windows_runtime_fingerprint }}
+        run: node .github/scripts/desktop-release.mjs reuse-windows-runtime
+      - name: Package the Windows installer
+        run: node desktop/scripts/build-windows.mjs
+      - name: Check WSL recovery and occupied install locations
+        run: node desktop/scripts/check-windows.mjs
+      - name: Set up on the latest release, update to this build and start again
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOD_PREVIOUS_RELEASE=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName) \
+            node desktop/scripts/check-windows-startup.mjs
+      - name: Preserve the startup log and receipt
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: windows-startup
+          path: |
+            dist/windows/windows-startup.json
+            dist/windows/windows-startup.log
           if-no-files-found: ignore
 
   secrets:

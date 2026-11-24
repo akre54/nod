@@ -267,13 +267,13 @@ export interface RuntimeContext {
     action: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
-    admit?: (asks: boolean) => Promise<void>,
+    admit?: (asks: boolean, read?: boolean) => Promise<void>,
   ): Promise<unknown>;
 
   manage(
     action: string,
     args: Record<string, unknown>,
-    admit?: (asks: boolean) => Promise<void>,
+    admit?: (asks: boolean, read?: boolean) => Promise<void>,
   ): Promise<unknown>;
   task?(input: unknown): Promise<unknown>;
   takeMessages?(): Promise<
@@ -314,7 +314,7 @@ export interface AgentToolMetadata {
   parameters: Record<string, unknown>;
   eager?: boolean;
   companions?: readonly string[] | ((args: Record<string, unknown>) => readonly string[]);
-  deferred?: { namespace: string; description: string };
+  deferred?: { namespace: string; description: string; guide?: string };
 }
 export interface AgentTool extends AgentToolMetadata {
   parallel?: boolean;
@@ -351,6 +351,7 @@ export type AgentEvent =
   | { type: 'text_delta'; text: string }
   | { type: 'thinking'; title: string }
   | { type: 'retry'; model: string; attempt: number; attempts: number }
+  | { type: 'fallback'; from: string; to: string }
   | { type: 'final'; text: string }
   | ModelUsageObservation
   | { type: 'error'; message: string; contextExhausted?: boolean };

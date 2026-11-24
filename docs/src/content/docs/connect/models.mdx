@@ -11,7 +11,9 @@ Nod needs a model connection to think and reply. Connect one or more services in
 
 Your requests go to the service you connect. Paid providers bill you for use. To run a model on your own computer instead, see [Local models](/connect/local-models/).
 
-Nod checks the selected model in the background. You can continue setup as soon as Nod saves the connection and selects a model. Chat shows a small status while the check runs. It disappears when the check succeeds. If the check fails, chat shows the service's reason and a link to **Models**.
+Nod checks the selected model in the background. You can continue setup as soon as Nod saves the connection and selects a model. Chat shows a small status while the check runs. It disappears when the check succeeds. If the check fails, chat shows the service's reason and a link to **Models**. A check the service turns away only because it's busy for now, such as a rate limit or a model at capacity (HTTP 429), doesn't count as a failure; a 429 for a used-up quota or billing limit does.
+
+A model discovery failure shows the service name, HTTP status and service reason when available, including Mistral's reason when it rejects a key. Nod removes the connection key.
 
 ## Supported connections
 
@@ -23,6 +25,7 @@ Select **Add connection** (or **Add** when you already have a connection), then 
 | OpenAI / ChatGPT                   | API key or existing ChatGPT sign-in                       | GPT-6.2 Sol, high effort                 |
 | Anthropic                          | API key                                                   | Claude Opus 5.5, high effort             |
 | OpenRouter                         | API key or browser sign-in                                | GPT-6.1 Sol, high effort                 |
+| Hostinger AI Router                | [hPanel API key](https://hpanel.hostinger.com/ai-router/) | Default Hostinger Model, high effort     |
 | Google Vertex AI                   | Vertex API key                                            | Gemini 4 Argon, medium effort            |
 | Amazon Bedrock                     | API key and Region                                        | You choose the model and routing profile |
 | Azure OpenAI                       | Endpoint, deployment, model, and API key                  | The deployment's model                   |
@@ -66,7 +69,7 @@ If a model request stops your task, the failure message links to **Settings > Mo
 
 Nod checks your selected model with a tiny request when you choose it, including choosing it again, and when you start Nod. While a model's last request failed, **Settings > Models** shows the provider's reason beside its connection and chat shows it above the message box, before you send anything.
 
-After a model fails a request, automatic work stops using that model on that connection. This includes background checks, background helpers and cache warming, and recurring schedules skip their runs. A one-time schedule still runs and reports the failure. Errors Nod retries on its own, such as an overload, and a conversation too long for the model's context don't count. Nod tries automatic work again after 2 minutes, and each further failure waits longer: 6, 18, 54 and 162 minutes, then 6 hours at most. A request that succeeds clears that model's failure. When a failing model works again, the connection's other paused models try again too. Requests you start always go through, and so does work that continues after you approve, sign in, pay, hand back the browser or connect an app. The failure survives a restart, and other connections stay available.
+After a model fails a request, automatic work stops using that model on that connection. This includes background checks, background helpers and cache warming, and recurring schedules skip their runs. A one-time schedule still runs and reports the failure. Errors Nod retries on its own, such as an overload, and a conversation too long for the model's context don't count. Nod tries automatic work again after 2 minutes, and each further failure waits longer: 6, 18, 54 and 162 minutes, then 6 hours at most. A request that succeeds clears that model's failure. When a failing model works again, the connection's other paused models try again too. Requests you start always go through, and so does work that continues after you approve, sign in, pay, hand back the browser or connect an app. The failure survives a restart, and other connections stay available. With [backup models](#backup-models), an automatic turn starts on the first backup that isn't paused instead. A recurring schedule then skips its run only when its model is paused and its connection needs attention, or no connected backup that can stand in is unpaused.
 
 The exception is a key or sign-in the service rejects with HTTP 401, for example because it expired or was revoked. The connection then shows **Needs attention** and Nod stops sending requests through it, including yours. If it's your selected connection, chat asks you to reconnect. Add the key again or reconnect in **Manage**. A connection set in the server settings doesn't show **Needs attention**: change its key there and [apply the change](/deploy/configuration/#apply-configuration-changes).
 
@@ -132,6 +135,20 @@ If the connection fails because workspace discovery isn't available, **Enter wor
 Nod lists the OpenRouter models that support text and tools.
 
 The `openrouter/free` and `openrouter/auto` routers can select different models for each request. Nod keeps your router choice and uses an 8,192-token working limit. This leaves room for routes with a small context window. Provider limits and free-model availability still apply.
+
+</TabItem>
+<TabItem label="Hostinger AI Router">
+
+<Steps>
+
+1. Create an API key in [hPanel's AI Router page](https://hpanel.hostinger.com/ai-router/).
+2. Choose **Hostinger AI Router**, paste the key, then select **Connect**.
+
+</Steps>
+
+Nod lists the router's models that support text, tools and chat completions. Models that generate images or speech, embedding models and decision models aren't listed. Models that read images stay in the list.
+
+Nod uses each model's output limit, up to 32,768 tokens per response.
 
 </TabItem>
 <TabItem label="Google Gemini">
@@ -231,7 +248,7 @@ Use this for Ollama, LM Studio, vLLM, llama.cpp and hosted services with an Open
 
 All the models from your connections appear in one searchable list, grouped by connection. Choosing a model also chooses the connection that pays for it.
 
-OpenRouter models show input and output token prices beside each model name, in USD per million tokens. Prices can wrap to the next line on small screens. The list identifies free tokens and prices that vary by model. These are the rates from the last model list update. Actual charges can vary with routing, caching, context length, and extra services. See [OpenRouter's model pricing](https://openrouter.ai/docs/guides/overview/models#pricing-object).
+OpenRouter and Hostinger AI Router models show input and output token prices beside each model name, in USD per million tokens. Prices can wrap to the next line on small screens. The list identifies free tokens and prices that vary by model. These are the rates from the last model list update. Actual charges can vary with routing, caching, context length, and extra services. See [OpenRouter's model pricing](https://openrouter.ai/docs/guides/overview/models#pricing-object) or Hostinger's rates in [hPanel's AI Router page](https://hpanel.hostinger.com/ai-router/).
 
 You can connect several accounts of one service, such as two ChatGPT accounts or a personal and a work API key. A ChatGPT connection shows the account's email. A key connection, including one an OpenRouter sign-in created, shows only the last four characters of a key longer than four characters. Shorter keys stay hidden. The model never sees this display value. Signing in again with an account you already connected, or adding the same key or server address to the same service again, updates that connection instead of adding another.
 
@@ -254,15 +271,25 @@ Nod uses your model when you talk to it, in the app, Telegram and WhatsApp, and 
 
 A lighter model costs much less, but in Nod's evals it read less and flagged fewer time-sensitive things for you than your main model.
 
-A schedule or task can have its own model too: in **Scheduled**, open it and select **Change** beside **Model**. **Settings > Models** lists the ones that differ from their default. When that work has priced usage in the last 30 days, each list shows what it cost, repriced on each model; otherwise it shows each model's token prices. Different models use different numbers of tokens for the same work, so the price is an estimate.
+A schedule or task can have its own model too: in **Scheduled**, select the model on a schedule's row, or open a task and select **Change** beside **Model**. **Settings > Models** lists the ones that differ from their default. When that work has priced usage in the last 30 days, each list shows what it cost, repriced on each model; otherwise it shows each model's token prices. Different models use different numbers of tokens for the same work, so the price is an estimate.
 
 You can also tell Nod, for example "Run my schedules on the light model" or "Use Opus for the weekly report", in Nod, Telegram or WhatsApp. Nod replies with the cost change.
 
 A change applies from the next turn; work that's already running keeps its model until then. Checking what Nod may do, writing the questions it asks you and reading your answers always use your model. If a model you chose for some work is no longer available, that work fails with the reason instead of switching models, and **Settings > Models** shows it as unavailable so you can choose another. Removing a connection returns the work that used it to its default: the model for its kind of work, else your model. An audio model's **Text support** label names its companion from the same connection. Requests without recordings use that companion; follow-ups that still include recordings use the audio model. Both use the smaller context and output limits of the pair. Your saved model choice stays unchanged.
 
-If a model request fails, Nod doesn't switch to another connection on its own; the notice above the chat box offers one when you have it. Nod retries a temporary provider error up to three times, waiting 4, 8 and 16 seconds. Temporary errors include an overload, a rate limit, and, for hosted providers, a request that gets no response within 90 seconds of being sent, cache warming included. Requests to a model server you run have no such limit, because local models can take minutes to start answering.
+Without [backup models](#backup-models), a failed model request doesn't move to another connection; the notice above the chat box offers one when you have it. Nod retries a temporary provider error up to three times, waiting 4, 8 and 16 seconds, or once when you have backups. Temporary errors include an overload, a rate limit, and, for hosted providers, a request that gets no response within 90 seconds of being sent, cache warming included. Requests to a model server you run have no such limit, because local models can take minutes to start answering.
 
 Background work, such as memory upkeep, uses a smaller model from the same connection when it has one, such as `gpt-6-luna` or `claude-haiku-5-5`. Otherwise it uses your model or, for an audio model, its text companion. The short line about your request in the app's chat status line uses only that smaller model. Without one, or without a known price for it, Nod skips the line. Background work and checks use the lightest reasoning their model offers: off, minimal, low or medium in that order, or the model's first effort level if it offers none of these.
+
+## Backup models
+
+Chat, tasks, schedules and work Nod starts on its own can continue on up to three backup models when their model can't answer. In **Settings > Models**, the sentence **If it's busy or unavailable, Nod tries …** lists them. Select a backup to replace it or choose **No backup** to remove it, and select **Add a backup model** to add one. The list starts empty, and Nod never adds a backup on its own, so your conversations only reach providers you chose.
+
+When a request fails before the model starts answering, it continues on the next backup. An error Nod retries on its own, such as an overload, a rate limit or a timeout, moves on after one retry. An error the provider returns before it starts answering, such as a used-up quota or an invalid request, moves on at once. A refusal from the model and a conversation too long for your model, which Nod compacts as usual, don't move, and your **Stop** ends the turn. A backup that can't read the conversation's images or hold all of it is skipped, and so is a paused one in automatic work. When your model's connection needs attention, for example after a rejected key, Nod asks you to fix it rather than switching.
+
+The rest of the turn, including its helpers, continues on the backup, and the next turn starts on your model again. The status line names the backup that took over, such as "Gemini 3.8 Flash failed, so this used GPT-6 Luna". Usage shows each attempt with the model that ran and its cost, and backups count toward the same check-in and monthly limit. A backup billed through a plan counts at its API price estimate. When every model fails, the error names each one and the provider's reason. Audio requests that include a recording stay on the audio model. Recalling memory for your message uses the same backups and moves on after one failed request. Checks, such as the action checker, and other memory upkeep keep their own model.
+
+A backup that is the model a kind of work already uses is skipped for that work. **Settings > Models** marks a backup that is your chat model; it can still stand in for schedules or work Nod starts on its own when they use another model.
 
 ## Models with a small context window
 
@@ -364,6 +391,7 @@ Every service below supports environment setup. You can add several provider key
 | `anthropic`                  | Anthropic                   | `ANTHROPIC_API_KEY`                  |
 | `google`                     | Google Gemini               | `GEMINI_API_KEY`                     |
 | `openrouter`                 | OpenRouter                  | `OPENROUTER_API_KEY`                 |
+| `hostinger`                  | Hostinger AI Router         | `HOSTINGER_AI_ROUTER_API_KEY`        |
 | `amazon-bedrock`             | Amazon Bedrock              | `AWS_BEARER_TOKEN_BEDROCK`           |
 | `google-vertex`              | Google Vertex AI            | `GOOGLE_CLOUD_API_KEY`               |
 | `azure`                      | Azure OpenAI                | `AZURE_OPENAI_API_KEY`               |
@@ -442,6 +470,7 @@ flowchart LR
 - Keys from `.env` stay in server memory and aren't copied into the database.
 - Each key goes only to its own service: Amazon Bedrock in the Region you entered, Google Vertex AI, the Azure OpenAI endpoint you entered, or the OpenAI-compatible server address you entered.
 - Your browser doesn't store the key, and Nod removes it from provider errors.
+- Requests to model, speech and decision services identify the app as `nod`. OpenRouter and Vercel AI Gateway show Nod's usage under that name.
 
 ## Related resources
 

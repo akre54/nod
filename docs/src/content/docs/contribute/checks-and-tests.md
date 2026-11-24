@@ -84,6 +84,8 @@ CI also runs Gitleaks on all fetched Git refs and the checkout. It downloads the
 
 Windows CI downloads Electron through the authenticated GitHub API. The download, cached archives, native fixtures and release build use the checksums shipped with the pinned Electron package. The download token is scoped to its preparation step and is not passed to the test apps.
 
+Windows CI downloads NSIS 3.13 from its publisher and checks the pinned SHA-256 before installation. Both Windows jobs use this compiler. They do not need the Chocolatey package feed.
+
 Native Mac update fixtures also use the checksums shipped with the pinned Electron package. They verify the archive without a separate checksum download.
 
 Check dependency advisories in each package:
@@ -120,11 +122,19 @@ The network has no internet access, and your source folders are mounted read-onl
 
 Keep independent browser cases in the matching test files so they can run in separate processes. Use short retry intervals in fixtures that check retry results, not the delay. Keep the same request count and failure checks.
 
+Don't let a test sleep through a real-time window, such as a timeout, a backoff, a rate limit or a refresh interval. Pass a short value through an option, move the stored deadline, or use the test runner's mock timers. A test that only waits makes every run slower for everyone.
+
+The approval application cases share one app and run in order, so they can't run in parallel inside one process. [`tests/approvals-application-cases.ts`](https://github.com/n8n-io/nod/blob/main/tests/approvals-application-cases.ts) holds the cases in three sections, and three small test files each run one section in their own process. Add a case to the section it belongs with. To run them all:
+
+```sh title="Terminal"
+pnpm exec tsx --test tests/approvals-application-*.test.ts
+```
+
 Wait for a controlled frame to finish loading before checking an old control binding. A reload can still show the previous document while navigation is pending.
 
 ## End-to-end tests
 
-[`tests/e2e.test.ts`](https://github.com/n8n-io/nod/blob/main/tests/e2e.test.ts) checks what a user feels when they send several messages, steer and stop work, or Nod restarts. It starts the real Nod in a child process: the server, the thread worker, the Pi runtime, task sessions, schedules and the trust check, on a disposable schema in the PostgreSQL database at `TEST_DATABASE_URL`. Only the model is scripted, and there is no memory or trust model, so an outside action always asks. The run needs no key and gives the same result every time. The test talks to Nod over its HTTP API, like the web app, and restarts it after a real `SIGKILL`.
+[`tests/e2e.test.ts`](https://github.com/n8n-io/nod/blob/main/tests/e2e.test.ts) checks what a user feels when they send several messages, steer and stop work, or Nod restarts. It starts the real Nod in a child process: the server, the thread worker, the Pi runtime, task sessions, schedules and the trust check, on a disposable schema in the PostgreSQL database at `TEST_DATABASE_URL`. Only the model is scripted. There is no memory or trust model, so an outside action asks, except in the approval scenarios: they add a scripted checker that allows a schedule pause only when an earlier owner message asks to pause the synthetic schedules, to check that the request still reaches the trust check in a task started from a short reply, and that a step nobody asked for still waits for the approval card. The run needs no key and gives the same result every time. The test talks to Nod over its HTTP API, like the web app, and restarts it after a real `SIGKILL`.
 
 ```mermaid
 flowchart LR
@@ -142,6 +152,8 @@ The scripted model behaves like a real one in the ways that matter for the harne
 | `task:`             | Starts a task for that message. The task finishes with `Done:` and its instruction      |
 | `hold:`             | Waits until the scenario calls `release` with the same text, or the turn stops          |
 | Anything else       | Answers `Answer:` and the message. A scheduled run sends the answer with `send_message` |
+
+A `task:` message that also contains `linger:` keeps the chat turn working after it starts the task, until the scenario calls `release` with the same text. Add `hold:` to keep the task working too, as in `task: linger: hold: book the venue`. Use both to interrupt Nod while the chat and its new task run.
 
 After each scenario, `nod.violations()` checks the invariants a user relies on:
 
@@ -217,7 +229,7 @@ CI reads the changed files on pull requests, merge queue checks and pushes to `m
 
 The required **Checks, tests and build** result keeps its existing name. One Linux runner installs dependencies once. It runs formatting, Oxlint, type checks, desktop contracts, eval contracts and application tests in parallel. A failed command fails the result. Failed or incomplete check selection also fails the result. No branch protection change is needed.
 
-The runner builds the clients before application tests. It uses the runner's Chromium and a disposable PostgreSQL service. Each test file has its own process. Up to eight files run at once. Independent native browser control cases also run in parallel, with separate profiles and servers. Recorded file times put the slowest files first. Without recorded times, file size sets the order. Successful runs cache file paths and times. Test results and private content do not enter this cache.
+The runner builds the clients before application tests. It uses the runner's Google Chrome and a disposable PostgreSQL service that keeps its data in memory. CI uses Chromium only when Google Chrome is missing. Each test file has its own process. Half the runner's processors set how many files run at once, which is eight on CI. Independent native browser control cases and interface cases also run in parallel inside their file, with separate profiles, servers and processes. Recorded file times put the slowest files first. Without recorded times, file size sets the order. Successful runs cache file paths and times. Test results and private content do not enter this cache.
 
 Pull requests and merge queue checks run the selected Linux checks and security scans. Native Mac, Windows installer and container deployment acceptance run on `main` when their inputs change. Daily and manual runs use every check. The desktop publication rehearsal also runs outside pull requests and the merge queue. Other selected desktop contracts stay on the PR path. Release packaging requires successful CI for the exact source revision. Release workflows also check the packaged apps before publication.
 
@@ -251,6 +263,8 @@ flowchart TD
 | Root package files, dependency patches, CI selection code or unknown inputs | Every check for the current stage.                                                                                                                                                                                                                                                                                                                                       |
 
 A daily CI run at 03:17 UTC uses every check, including both Mac architectures and full Windows update acceptance. A manual CI run also uses every check, except a run on `release/desktop`, which compares that branch with `main`. The shared runner fetches two commits to read the merge base. A manual run on `release/desktop` fetches full history. If that base is unavailable, CI runs every check. New pull request commits cancel older runs for that pull request. Main runs stay bound to each commit because releases require CI to pass on their exact source. Daily runs have a separate group so a push cannot cancel them.
+
+The daily and manual Windows startup job also tests WSL errors, unfinished registrations, and occupied disk folders.
 
 The **Self-host bundle** workflow builds and checks both Linux architectures on `main` when package, container, deployment, or bundled documentation inputs change. Pull requests do not export these release bundles. It also runs each Sunday at 04:47 UTC and on request. Ordinary web and server changes do not create both bundles. To get a bundle for a specific revision, run that workflow on the revision. Draft release creation still needs its separate manual input.
 

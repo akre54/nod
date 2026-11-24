@@ -11,9 +11,12 @@ function poolSize(value: string | undefined, fallback: number) {
   return size;
 }
 
-function createPool(config: pg.PoolConfig) {
+export function createPool(config: pg.PoolConfig) {
   const created = new pg.Pool({
     connectionTimeoutMillis: 10_000,
+    query_timeout: 30_000,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10_000,
     ...config,
   });
   created.on('error', (error) => logFailure('database_idle_error', error));
@@ -130,6 +133,7 @@ export async function initializeDatabase() {
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS display_text text;
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS audio_caption text;
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS suggestions jsonb;
+    CREATE INDEX IF NOT EXISTS messages_task_suggestions ON messages(thread_id) WHERE suggestions IS NOT NULL;
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS presentation jsonb;
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS answer_choices jsonb;
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS question_answer jsonb;
@@ -155,7 +159,8 @@ export async function initializeDatabase() {
       ADD COLUMN IF NOT EXISTS expected_revision integer,
       ADD COLUMN IF NOT EXISTS details jsonb,
       ADD COLUMN IF NOT EXISTS title text,
-      ADD COLUMN IF NOT EXISTS decline text;
+      ADD COLUMN IF NOT EXISTS decline text,
+      ADD COLUMN IF NOT EXISTS card_question text;
     CREATE INDEX IF NOT EXISTS approvals_turn ON approvals(turn_id);
     CREATE INDEX IF NOT EXISTS approvals_execution_turn ON approvals(execution_turn_id);
     CREATE INDEX IF NOT EXISTS approvals_confirmation_message ON approvals(confirmation_message_id);

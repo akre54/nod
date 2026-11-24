@@ -18,6 +18,8 @@ import { logFailure } from './failure-log.ts';
 import { cancelTurnOperations } from './turn-cancellation.ts';
 import { modelFailureReason, modelQuotaFailure } from '../shared/model-quota.ts';
 import { appPages } from '../shared/app-links.ts';
+import { errorCode } from '../shared/error-code.ts';
+import { loopbackHost } from '../shared/loopback.ts';
 import { pendingAnswerChoicesSql } from './answer-choices.ts';
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
@@ -259,7 +261,7 @@ export interface ThreadDependencies {
     turn: TurnRef,
     action: string,
     args: Record<string, unknown>,
-    options: { signal: AbortSignal; admit?: (asks: boolean) => Promise<void> },
+    options: { signal: AbortSignal; admit?: (asks: boolean, read?: boolean) => Promise<void> },
   ) => Promise<unknown>;
   connections?: (
     action: 'list' | 'discover' | 'connect' | 'propose',
@@ -292,7 +294,7 @@ export interface ThreadDependencies {
     provenance: {
       sourceMessageId: string | null;
       signal: AbortSignal;
-      admit?: (asks: boolean) => Promise<void>;
+      admit?: (asks: boolean, read?: boolean) => Promise<void>;
     },
   ) => Promise<unknown>;
 }
@@ -1556,6 +1558,38 @@ function failureText(error: unknown) {
   return `${safe} ${advice}`;
 }
 
+function hostFailure(error: unknown) {
+  for (const value of [error, (error as { cause?: unknown } | null | undefined)?.cause]) {
+    const { code, address, syscall } = (value ?? {}) as {
+      code?: unknown;
+      address?: unknown;
+      syscall?: unknown;
+    };
+    if (code === 'ENOSPC' || code === 'EDQUOT')
+      return {
+        expected: true,
+        text: `This computer is out of disk space, so Nod couldn't save its work (${failureText(error)}). Free up some space, then reply to continue.`,
+      };
+    if (syscall === 'connect' && typeof address === 'string' && loopbackHost(address))
+      return {
+        expected: false,
+        text: `Nod lost the connection to a service it runs on this computer (${failureText(error)}). Restart Nod, then reply to continue. If it keeps happening, restart this computer.`,
+      };
+  }
+}
+
+function errorType(error: unknown) {
+  const name = !(error instanceof Error)
+    ? undefined
+    : error.name === 'Error'
+      ? error.constructor.name
+      : error.name;
+  return (
+    errorCode(error) ??
+    (name && name !== 'Error' && /^[A-Z][A-Za-z]{0,39}Error$/.test(name) ? name : undefined)
+  );
+}
+
 async function failTurn(
   turnId: string,
   present: ThreadDependencies['present'],
@@ -1566,12 +1600,14 @@ async function failTurn(
     contextExhausted,
     cause,
     expected = false,
+    type,
   }: {
     next?: string;
     failure?: 'model' | 'offline' | 'unknown';
     contextExhausted?: boolean;
     cause?: Pick<ScheduleRunPresentation, 'reason' | 'code' | 'link'>;
     expected?: boolean;
+    type?: string;
   } = {},
 ) {
   const modelFailure = failure === 'model' || failure === 'offline';
@@ -1592,6 +1628,7 @@ async function failTurn(
         work: string | null;
         latest_user_message_id: string | null;
         outside_action: boolean;
+        handed_off: boolean;
       }>(
         `${turnChainSql()}, origin AS (
           SELECT u.created_at,u.id FROM turns u JOIN chain c ON c.id=u.id
@@ -1608,6 +1645,11 @@ async function failTurn(
          ,(EXISTS (SELECT 1 FROM turns x JOIN chain c ON c.id=x.id WHERE x.outside_action_at IS NOT NULL)
            OR EXISTS (SELECT 1 FROM approvals a JOIN chain c ON c.id IN (a.turn_id,a.execution_turn_id)
              WHERE a.owner_id=u.owner_id AND a.status IN ('executing','uncertain','completed'))) AS outside_action
+         ,(to_jsonb(u)->>'task_id' IS NULL
+           AND EXISTS (SELECT 1 FROM messages m JOIN chain c ON c.id=m.turn_id WHERE m.owner_id=$2 AND m.role='user')
+           AND NOT EXISTS (SELECT 1 FROM messages m JOIN chain c ON c.id=m.turn_id
+             WHERE m.owner_id=$2 AND m.role='user'
+               AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.owner_id=$2 AND t.source_message_id=m.id AND t.state='open'))) AS handed_off
          FROM turns u WHERE u.id=$1 AND u.owner_id=$2 AND u.status='running' FOR UPDATE`,
         [turnId, ownerId, thread.id],
       )
@@ -1627,7 +1669,8 @@ async function failTurn(
   }, pool);
   if (!turn) return false;
   if (!turn.owner_started && !turn.work) return true;
-  const work = turn.owner_started ? undefined : turn.work!;
+  if (error === interrupted && turn.handed_off) return true;
+  const work = turn.owner_started && !turn.task_id ? undefined : (turn.work ?? undefined);
   const presented = modelFailure
     ? undefined
     : await present?.(
@@ -1673,7 +1716,7 @@ async function failTurn(
         client,
         ref,
         message.trim(),
-        'Nod stopped on an unexpected error while working on a request.',
+        `Nod stopped on an unexpected error${type ? ` (${type})` : ''} while working on a request.`,
         streamId,
       );
     else
@@ -2801,23 +2844,36 @@ async function executeTurn(turn: any, dependencies: ThreadDependencies) {
     } else {
       const offline = offlineFailure(error, selectedModel?.provider);
       failure = offline ? 'offline' : error instanceof ModelRequestError ? 'model' : 'unknown';
-      const text = offline ? `${offline.reason} (${offline.code}).` : failureText(error);
+      const host = failure === 'unknown' ? hostFailure(error) : undefined;
+      const text = offline
+        ? `${offline.reason} (${offline.code}).`
+        : (host?.text ?? failureText(error));
       const alternative = failure === 'model' ? dependencies.modelAlternative?.() : undefined;
       const server = Boolean(offline && dependencies.desktopRuntime);
-      if (
-        await failTurn(turnId, dependencies.present, text, {
-          failure,
-          expected: error instanceof ToolFailureError || error instanceof OutputLimitError,
-          next: alternative ?? (server ? offlineHint : undefined),
-          contextExhausted: error instanceof ContextLimitError,
-          cause: offline
-            ? { ...offline, ...(server ? { link: 'server' as const } : {}) }
-            : failure === 'model'
-              ? { reason: [text, alternative].filter(Boolean).join(' '), link: 'models' }
-              : undefined,
-        })
-      )
-        logFailure('turn_failed', error, { threadId, turnId, sessionId: turn.session_id });
+      logFailure('turn_failed', error, {
+        threadId,
+        turnId,
+        sessionId: turn.session_id,
+        databasePool: {
+          max: pool.options.max,
+          total: pool.totalCount,
+          idle: pool.idleCount,
+          waiting: pool.waitingCount,
+        },
+      });
+      await failTurn(turnId, dependencies.present, text, {
+        failure,
+        expected:
+          error instanceof ToolFailureError || error instanceof OutputLimitError || host?.expected,
+        type: errorType(error),
+        next: alternative ?? (server ? offlineHint : undefined),
+        contextExhausted: error instanceof ContextLimitError,
+        cause: offline
+          ? { ...offline, ...(server ? { link: 'server' as const } : {}) }
+          : failure === 'model'
+            ? { reason: [text, alternative].filter(Boolean).join(' '), link: 'models' }
+            : undefined,
+      });
     }
   } finally {
     if (signal.aborted && !stopping)

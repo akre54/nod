@@ -14,7 +14,7 @@ import type {
 } from '../src/shared/contracts.ts';
 import { modelPricingSignature, type ModelPricing } from '../src/shared/models.ts';
 import {
-  captureOwnerInstructions,
+  recentOwnerWords,
   mergeOwnerInstructions,
   validateOwnerInstructions,
 } from '../src/server/owner-instructions.ts';
@@ -211,22 +211,14 @@ test(
       ).rows[0];
       const captured =
         turn && provenance.sourceMessageId
-          ? await captureOwnerInstructions(
-              db.pool,
-              ownerId,
-              turn.thread_id,
-              [provenance.sourceMessageId],
-              turn.task_id,
-              new Date(Date.now() - 86_400_000),
-              provenance.turnId,
-            )
+          ? await recentOwnerWords(db.pool, ownerId, turn.thread_id, [provenance.sourceMessageId])
           : undefined;
       const prepared = await personal.prepareScheduleChange(action, args);
       return personal.manage(action, args, {
         ...provenance,
         instructionChange: {
           ...prepared,
-          evidence: captured?.evidence ?? { messages: [] },
+          evidence: captured?.evidence(provenance.sourceMessageId ?? undefined) ?? { messages: [] },
           previousEvidence: 'evidence' in prepared ? prepared.evidence : undefined,
         },
       });
@@ -1431,8 +1423,36 @@ test(
           await expectRunCost(0.15);
         },
       );
+      await t.test('run history returns the finished reply and the shared files', async () => {
+        const before = clock;
+        const schedule = await create({ cron: '*/15 * * * *' });
+        const job = await jobFor(schedule.id);
+        clock = new Date(job.data.scheduledFor);
+        await deliver([job]);
+        const [run] = await runs(schedule.id);
+        await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [run!.turnId]);
+        const [reportId, fileId] = [randomUUID(), randomUUID()];
+        const file = { id: randomUUID(), name: 'fixture.csv', mimeType: 'text/csv', size: 13 };
+        for (const [id, text, seconds, attachments] of [
+          [randomUUID(), 'Checking the synthetic report.', 0, []],
+          [reportId, 'The synthetic report is complete.', 1, []],
+          [fileId, '', 2, [{ ...file, url: `/api/artifacts/${file.id}` }]],
+        ] as const)
+          await db.pool.query(
+            `INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text,created_at,attachments)
+             SELECT $1,owner_id,thread_id,id,'assistant',$3,now()+$4 * interval '1 second',$5::jsonb
+             FROM turns WHERE id=$2`,
+            [id, run!.turnId, text, seconds, JSON.stringify(attachments)],
+          );
+        const [result] = await runs(schedule.id);
+        assert.equal(result!.messageId, reportId);
+        assert.equal(result!.messageText, 'The synthetic report is complete.');
+        assert.equal(result!.attachmentMessageId, fileId);
+        await request('DELETE', `/api/schedules/${schedule.id}`);
+        clock = before;
+      });
       await t.test(
-        'a recurring schedule starts no run while its last run is busy or waiting on the owner',
+        'a recurring schedule skips while its run works, and a waiting run gives way to the next run',
         async () => {
           const before = clock;
           const schedule = await create({ cron: '*/15 * * * *' });
@@ -1466,7 +1486,7 @@ test(
               first,
               status,
             ]);
-            assert.deepEqual(await fire(), [first]);
+            if (status === 'running') assert.deepEqual(await fire(), [first]);
             assert.equal((await runNow(schedule)).statusCode, 409);
             assert.deepEqual(await active(), {
               turnId: first,
@@ -1530,10 +1550,56 @@ test(
           assert.ok([200, 409].includes(manual.statusCode), manual.body);
           assert.equal((await runs(schedule.id)).length, beforeRace + 1);
           assert.notEqual((await jobFor(schedule.id)).id, due.id);
+          await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=ANY($1::uuid[])", [
+            (await runs(schedule.id)).map((run) => run.turnId),
+          ]);
+          const wait = (turnId: string) =>
+            db.pool.query(
+              "UPDATE turns SET status='waiting',waiting_reason='approval',started_at=now() WHERE id=$1",
+              [turnId],
+            );
+          const status = async (turnId: string) =>
+            (await db.pool.query('SELECT status FROM turns WHERE id=$1', [turnId])).rows[0].status;
+          const started = async () => {
+            const before = new Set((await runs(schedule.id)).map((run) => run.turnId));
+            const fresh = (await fire()).filter((turnId) => !before.has(turnId));
+            assert.equal(fresh.length, 1);
+            return fresh[0]!;
+          };
+          const stuck = await started();
+          await wait(stuck);
+          assert.equal((await active())?.status, 'waiting');
+          const next = await started();
+          assert.equal(await status(stuck), 'cancelled');
+          await wait(next);
+          const renamed = await request('PATCH', `/api/schedules/${schedule.id}`, {
+            title: 'Synthetic renamed check',
+          });
+          assert.equal(renamed.statusCode, 200, renamed.body);
+          const deadline = Date.now() + 5000;
+          while ((await status(next)) !== 'cancelled' && Date.now() < deadline)
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          assert.equal(await status(next), 'cancelled');
+          assert.equal(await active(), null);
           await request('DELETE', `/api/schedules/${schedule.id}`);
           clock = before;
         },
       );
+      await t.test('changing a watched schedule to one-time drops its watch', async () => {
+        const account = randomUUID();
+        watched.set(account, 'constant');
+        const schedule = await create({ cron: '*/15 * * * *', watch: [account] });
+        const patch = async (body: Record<string, unknown>) => {
+          const response = await request('PATCH', `/api/schedules/${schedule.id}`, body);
+          assert.equal(response.statusCode, 200, response.body);
+        };
+        await patch({ title: 'Still watched' });
+        assert.deepEqual((await saved(schedule.id)).watch, [account]);
+        await patch({ kind: 'once', runAt: new Date(clock.getTime() + 60_000).toISOString() });
+        await patch({ kind: 'recurring', cron: '*/15 * * * *' });
+        assert.equal((await saved(schedule.id)).watch, null);
+        await request('DELETE', `/api/schedules/${schedule.id}`);
+      });
       await t.test('stale watched jobs do not poll accounts or start runs', async () => {
         const before = clock;
         const account = randomUUID();
@@ -1721,6 +1787,83 @@ test(
           }
           assert.equal(await fire(), 2);
           await request('DELETE', `/api/schedules/${schedule.id}`);
+          clock = before;
+        },
+      );
+      await t.test('renaming a schedule keeps the skips recorded for its next run', async () => {
+        const before = clock;
+        const schedule = await create({ cron: '*/15 * * * *' });
+        modelPaused = true;
+        for (let i = 0; i < 2; i++) {
+          const job = await jobFor(schedule.id);
+          clock = new Date(job.data.scheduledFor);
+          await deliver([job]);
+        }
+        modelPaused = false;
+        const next = (await jobFor(schedule.id)).data.scheduledFor;
+        const renamed = await request('PATCH', `/api/schedules/${schedule.id}`, {
+          title: 'Renamed schedule',
+        });
+        assert.equal(renamed.statusCode, 200, renamed.body);
+        const job = await jobFor(schedule.id);
+        assert.equal(job.data.scheduledFor, next);
+        clock = new Date(next);
+        await deliver([job]);
+        const [run] = await runs(schedule.id);
+        const { skipped } = (
+          await db.pool.query('SELECT skipped FROM schedule_runs WHERE turn_id=$1', [run!.turnId])
+        ).rows[0];
+        assert.equal(skipped.length, 2);
+        await request('DELETE', `/api/schedules/${schedule.id}`);
+        clock = before;
+      });
+      await t.test(
+        'a resumed scheduled run records its observation on the original run',
+        async () => {
+          const before = clock;
+          const schedule = await create({ cron: '0 9 * * 1' });
+          clock = new Date(schedule.nextRun!);
+          await deliver([await jobFor(schedule.id)]);
+          const [run] = await runs(schedule.id);
+          const observation = {
+            status: 'verified',
+            sourceUrl: 'https://watch.example.test/pricing',
+            value: 'Pro 39 EUR',
+            summary: 'Synthetic pricing observation.',
+          };
+          const record = (turnId: string, service = personal) =>
+            thread.withTurnLock(turnId, (client) =>
+              service.manage(
+                'schedule_record_observation',
+                observation,
+                { sourceMessageId: null, turnId },
+                { client },
+              ),
+            );
+          const [continuation, unrelated] = [randomUUID(), randomUUID()];
+          await db.pool.query("UPDATE turns SET status='waiting' WHERE id=$1", [run!.turnId]);
+          await db.pool.query(
+            `INSERT INTO turns(id,owner_id,thread_id,session_id,parent_turn_id,source,status,prompt)
+           SELECT v.id,u.owner_id,u.thread_id,COALESCE(v.session,u.session_id),v.parent,v.source,'running','Synthetic work'
+           FROM turns u,(VALUES($2::uuid,NULL::uuid,$1::uuid,'resume'),($3::uuid,$3::uuid,NULL::uuid,'user'))
+             AS v(id,session,parent,source)
+           WHERE u.id=$1`,
+            [run!.turnId, continuation, unrelated],
+          );
+          await assert.rejects(record(unrelated), /no active scheduled run/);
+          const other = createPersonalService({
+            pool: db.pool,
+            ownerId: 'another-owner',
+            scheduler: thread.boss,
+            enqueueTurn: thread.enqueueTurn,
+            refresh() {},
+          });
+          await assert.rejects(record(continuation, other), /no active scheduled run/);
+          await record(continuation);
+          assert.equal((await runs(schedule.id))[0]!.observation?.value, 'Pro 39 EUR');
+          await db.pool.query("UPDATE turns SET status='cancelled' WHERE id=ANY($1::uuid[])", [
+            [run!.turnId, continuation, unrelated],
+          ]);
           clock = before;
         },
       );
@@ -2013,10 +2156,10 @@ test(
               ?.text,
             'Check it every morning.',
           );
-          assert.equal(
-            first.messages.find((message: { id: string }) => message.id === context.sourceMessageId)
-              ?.canAuthorize,
-            false,
+          assert.ok(
+            !first.messages.some(
+              (message: { id: string }) => message.id === context.sourceMessageId,
+            ),
           );
           assert.ok(
             !first.messages.some(
@@ -2130,17 +2273,16 @@ test(
           const authority = (
             await db.pool.query('SELECT authority FROM schedules WHERE id=$1', [schedule.id])
           ).rows[0].authority;
-          assert.equal(
-            authority.messages.find(
+          assert.ok(
+            !authority.messages.some(
               (message: { id: string }) => message.id === background.sourceMessageId,
-            )?.canAuthorize,
-            false,
+            ),
           );
           assert.equal(
             authority.messages.find(
               (message: { id: string }) => message.id === asked.sourceMessageId,
-            )?.canAuthorize,
-            true,
+            )?.text,
+            'Check it every morning.',
           );
           assert.ok(
             !authority.messages.some(
@@ -2329,8 +2471,14 @@ test('scheduled controls reconcile pause and delete after a client timeout', asy
   );
   for (const [key, value] of Object.entries(globals))
     Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
-  const nativeTimeout = AbortSignal.timeout.bind(AbortSignal);
-  t.mock.method(AbortSignal, 'timeout', (duration: number) => nativeTimeout(duration / 50));
+  t.mock.method(AbortSignal, 'timeout', (duration: number) => {
+    const controller = new AbortController();
+    setTimeout(
+      () => controller.abort(new DOMException('The operation timed out.', 'TimeoutError')),
+      duration / 50,
+    );
+    return controller.signal;
+  });
   const schedule: Schedule = {
     id: randomUUID(),
     title: 'Delayed schedule',
@@ -2414,6 +2562,7 @@ test('scheduled controls reconcile pause and delete after a client timeout', asy
   const { PauseSwitch, PlanToast, ScheduleEditor, useDirectChange } =
     await import('../src/web/components/plan-controls.tsx');
   const { DeletePlan } = await import('../src/web/components/delete-plan.tsx');
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   pageDataCache.clear();
   pageDataCache.update('/api/schedules', () => [schedule]);
   const root = createRoot(dom.window.document.getElementById('root')!);
@@ -2465,10 +2614,12 @@ test('scheduled controls reconcile pause and delete after a client timeout', asy
     await act(async () => commit());
   };
   const waitFor = async (ready: () => boolean, name: string, timeoutMs = 5000) => {
-    const deadline = Date.now() + timeoutMs;
-    while (!ready()) {
-      if (Date.now() >= deadline) assert.fail(`Timed out waiting for ${name}`);
-      await act(async () => new Promise((resolve) => setTimeout(resolve, 50)));
+    for (let waited = 0; !ready(); waited += 50) {
+      if (waited >= timeoutMs) assert.fail(`Timed out waiting for ${name}`);
+      await act(async () => {
+        t.mock.timers.tick(50);
+        await new Promise((resolve) => setImmediate(resolve));
+      });
     }
   };
   await click('[role="switch"]');
@@ -2717,6 +2868,7 @@ test('waiting scheduled runs open their pending question without starting anothe
     messageId: randomUUID(),
     messagePreview: 'Synthetic report ready.',
     messageText: 'Synthetic report ready.',
+    attachmentMessageId: null,
   };
   const queued: ScheduleRun = {
     ...completed,
@@ -3003,3 +3155,154 @@ test('waiting scheduled runs open their pending question without starting anothe
   await act(async () => pageDataCache.refresh('/api/schedules', true));
   assert.equal(inactive.open, true);
 });
+
+test(
+  'schedule ideas read only the owner’s eligible messages and refresh at most once a day',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    const schema = `test_schedule_ideas_${randomUUID().replaceAll('-', '').slice(0, 16)}`;
+    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const url = new URL(process.env.TEST_DATABASE_URL!);
+    url.searchParams.set('options', `-c search_path=${schema}`);
+    const pool = new pg.Pool({ connectionString: url.href });
+    t.after(async () => {
+      await pool.end();
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    });
+    await pool.query(`CREATE TABLE messages(id uuid PRIMARY KEY,owner_id text,thread_id uuid,turn_id uuid,role text,text text,
+        attachments jsonb NOT NULL DEFAULT '[]',approval_answer text,suggestions jsonb,created_at timestamptz);
+      CREATE TABLE turns(id uuid PRIMARY KEY,owner_id text,message_id uuid,withdrawn boolean NOT NULL DEFAULT false);
+      CREATE TABLE approvals(owner_id text,source_message_id uuid,action text);
+      CREATE TABLE preferences(owner_id text,time_zone text);
+      CREATE TABLE schedules(owner_id text,title text);`);
+    const thread = randomUUID();
+    const say = async (
+      owner: string,
+      role: string,
+      text: string,
+      minutes: number,
+      extra: { turn?: string; attachments?: unknown[]; suggestions?: unknown } = {},
+    ) => {
+      const id = randomUUID();
+      await pool.query(
+        `INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text,attachments,suggestions,created_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,now()-make_interval(mins=>$9))`,
+        [
+          id,
+          owner,
+          thread,
+          extra.turn ?? null,
+          role,
+          text,
+          JSON.stringify(extra.attachments ?? []),
+          extra.suggestions ? JSON.stringify(extra.suggestions) : null,
+          minutes,
+        ],
+      );
+      return id;
+    };
+    const withdrawn = randomUUID();
+    await pool.query("INSERT INTO turns(id,owner_id,withdrawn) VALUES($1,'owner-a',true)", [
+      withdrawn,
+    ]);
+    await say('owner-a', 'user', 'I send synthetic invoices every Friday.', 90);
+    await say('owner-a', 'user', 'Withdrawn synthetic plan.', 80, { turn: withdrawn });
+    await say('owner-a', 'assistant', 'Assistant synthetic reply.', 70, {
+      suggestions: { tasks: [{ title: 'Plan my synthetic fortnight' }] },
+    });
+    await say('owner-a', 'user', 'Plan my synthetic fortnight', 60);
+    await say('owner-a', 'user', 'Synthetic photo caption.', 55, { attachments: [{ id: 'a' }] });
+    const saved = await say('owner-a', 'user', 'Remember my synthetic gym day.', 50);
+    await pool.query(
+      "INSERT INTO approvals(owner_id,source_message_id,action) VALUES('owner-a',$1,'NOD_memory_save')",
+      [saved],
+    );
+    await say('owner-a', 'user', 'Fresh synthetic message.', 1);
+    await say('owner-b', 'user', 'Other owner synthetic detail.', 40);
+    await pool.query("INSERT INTO schedules VALUES('owner-a','Recap my week'),('owner-b','Other')");
+    const inputs: Array<{ messages: string[]; schedules: string[]; apps: string[] }> = [];
+    const { createScheduleIdeas } = await import('../src/server/schedule-ideas.ts');
+    const ideas = createScheduleIdeas({
+      pool,
+      ownerId: 'owner-a',
+      curator: {
+        id: 'fixture',
+        configured: true,
+        async curate({ task, input }) {
+          assert.equal(task, 'ideas');
+          inputs.push(input as (typeof inputs)[number]);
+          return {
+            ideas: [
+              { title: 'Remind me to take my synthetic pills', when: 'Daily', sensitive: true },
+              { title: 'Remind me to send my invoices', when: 'Fridays', sensitive: false },
+              {
+                title: 'Brief me on my day',
+                when: 'Weekday mornings',
+                app: 'googlecalendar',
+                sensitive: false,
+              },
+              { title: 'Recap my week', when: 'Fridays', sensitive: false },
+              {
+                title: 'Sum up my Slack threads',
+                when: 'Every evening',
+                app: 'slack',
+                sensitive: false,
+              },
+            ],
+          };
+        },
+      },
+      memory: async () => ({ enabled: true, sensitive: false }),
+      limitReached: async () => false,
+      apps: async () => ['googlecalendar'],
+      run: (work) => work(),
+    });
+    await ideas.initialize();
+    const app = Fastify();
+    ideas.registerRoutes(app);
+    t.after(() => app.close());
+    const shown = async () => {
+      const response = await app.inject({ method: 'GET', url: '/api/schedules/ideas' });
+      await ideas.refresh();
+      return response.json().ideas;
+    };
+    assert.deepEqual(await shown(), []);
+    assert.deepEqual(inputs, [
+      {
+        messages: ['I send synthetic invoices every Friday.'],
+        schedules: ['Recap my week'],
+        apps: ['googlecalendar'],
+      },
+    ]);
+    const expected = [
+      { title: 'Remind me to send my invoices', when: 'Fridays' },
+      { title: 'Brief me on my day', when: 'Weekday mornings', app: 'googlecalendar' },
+    ];
+    assert.deepEqual(await shown(), expected);
+    assert.deepEqual(
+      (await pool.query('SELECT ideas FROM schedule_ideas')).rows[0].ideas,
+      expected,
+    );
+    await say('owner-a', 'user', 'I plan my synthetic week on Mondays.', 20);
+    await shown();
+    assert.equal(inputs.length, 1);
+    await pool.query("UPDATE schedule_ideas SET checked_at=now()-interval '25 hours'");
+    await shown();
+    assert.deepEqual(inputs[1]?.messages, [
+      'I send synthetic invoices every Friday.',
+      'I plan my synthetic week on Mondays.',
+    ]);
+    await pool.query("UPDATE schedule_ideas SET checked_at=now()-interval '25 hours'");
+    assert.deepEqual(await shown(), expected);
+    assert.equal(inputs.length, 2);
+    await say(
+      'owner-a',
+      'user',
+      'Help me schedule this: Remind me to send my invoices, fridays. Ask me one question at a time for anything you need.',
+      0,
+    );
+    assert.deepEqual(await shown(), expected.slice(1));
+  },
+);

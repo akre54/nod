@@ -1,3 +1,25 @@
+export function modelErrorText(value: string, secrets: string[] = []) {
+  const values = [
+    ...new Set(
+      secrets.filter(Boolean).flatMap((value) => {
+        const variants = [value, JSON.stringify(value).slice(1, -1)];
+        try {
+          variants.push(encodeURIComponent(value));
+        } catch {}
+        return variants;
+      }),
+    ),
+  ].sort((left, right) => right.length - left.length);
+  if (!values.length) return value;
+  let result = '';
+  for (let at = 0; at < value.length;) {
+    const secret = values.find((secret) => value.startsWith(secret, at));
+    result += secret ? '[redacted]' : value[at];
+    at += secret?.length ?? 1;
+  }
+  return result;
+}
+
 export class ModelServiceError extends Error {
   constructor(
     message: string,
@@ -15,19 +37,6 @@ export async function modelServiceError(
   secrets: string[] = [],
   detailFields = ['message', 'type', 'code', 'status', 'param'],
 ) {
-  const values = [...new Set(secrets.filter(Boolean))].sort(
-    (left, right) => right.length - left.length,
-  );
-  const redact = (value: string) => {
-    if (!values.length) return value;
-    let result = '';
-    for (let at = 0; at < value.length;) {
-      const secret = values.find((secret) => value.startsWith(secret, at));
-      result += secret ? '[redacted]' : value[at];
-      at += secret?.length ?? 1;
-    }
-    return result;
-  };
   let reason = response.statusText;
   let serviceReason: string | undefined;
   const reader = response.body?.getReader();
@@ -51,14 +60,16 @@ export async function modelServiceError(
       const error = body.error ?? body;
       if (typeof error === 'string') reason = serviceReason = error;
       else if (error && typeof error === 'object') {
-        if (typeof error.message === 'string') serviceReason = error.message;
+        const message = typeof error.message === 'string' ? error.message : error.detail;
+        if (typeof message === 'string') serviceReason = message;
         else if (detailFields.includes('description') && typeof error.description === 'string')
           serviceReason = error.description;
-        const fields = detailFields.flatMap((name) =>
-          typeof error[name] === 'string' || typeof error[name] === 'number'
-            ? [`${name}: ${error[name]}`]
-            : [],
-        );
+        const fields = detailFields.flatMap((name) => {
+          const value = name === 'message' && typeof message === 'string' ? message : error[name];
+          return typeof value === 'string' || typeof value === 'number'
+            ? [`${name}: ${value}`]
+            : [];
+        });
         if (fields.length) reason = fields.join('; ');
       }
     }
@@ -67,10 +78,10 @@ export async function modelServiceError(
     await reader?.cancel().catch(() => {});
     reader?.releaseLock();
   }
-  const details = redact(reason).slice(0, 2000);
+  const details = modelErrorText(reason, secrets).slice(0, 2000);
   return new ModelServiceError(
     `${service} failed (HTTP ${response.status})${reason ? `: ${details}` : '.'}`,
-    serviceReason ? redact(serviceReason) : undefined,
+    serviceReason ? modelErrorText(serviceReason, secrets) : undefined,
     Number.isInteger(response.status) && response.status >= 100 && response.status <= 599
       ? response.status
       : undefined,

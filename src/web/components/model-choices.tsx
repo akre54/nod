@@ -1,3 +1,4 @@
+import { Fragment } from 'react';
 import type { Schedule, Task } from '../../shared/contracts';
 import {
   canReuseWorkCost,
@@ -73,6 +74,23 @@ function laneTarget(
       saved<ModelsResponse>('/api/models/routes', { lane, route }, (result) =>
         pageDataCache.update('/api/models', () => result),
       ),
+  };
+}
+
+function backupTarget(data: ModelsResponse, index: number): ModelTarget {
+  const list = data.backups ?? [];
+  return {
+    title: index < list.length ? `Backup model ${index + 1}` : 'Add a backup model',
+    value: list[index] ?? null,
+    defaults: index < list.length ? [{ value: null, label: 'No backup', model: null }] : [],
+    save: (choice) => {
+      const next = [...list];
+      if (choice && choice !== 'light') next[index] = choice;
+      else next.splice(index, 1);
+      return saved<ModelsResponse>('/api/models/backups', { backups: next }, (result) =>
+        pageDataCache.update('/api/models', () => result),
+      );
+    },
   };
 }
 
@@ -162,6 +180,7 @@ export function ModelSentences() {
   const data = models.data;
   if (!data) return null;
   const chat = modelOf(data, data.selection);
+  const backups = data.backups ?? [];
   const lane = (kind: ModelLane) => {
     const value = data.routes?.[kind];
     const light = value === 'light' && data.light && modelOf(data, data.light);
@@ -223,6 +242,30 @@ export function ModelSentences() {
           />
           .
         </p>
+        {chat && (
+          <p>
+            If it’s busy or unavailable, Nod tries{' '}
+            {backups.length
+              ? backups.map((choice, index) => (
+                  <Fragment key={index}>
+                    {index ? ', then ' : ''}
+                    <ModelPicker
+                      appearance="statement"
+                      manageConnections={false}
+                      target={backupTarget(data, index)}
+                      label={`${modelOf(data, choice)?.name ?? unavailableLabel}${
+                        choice.connectionId === data.selection?.connectionId &&
+                        choice.modelId === data.selection?.modelId
+                          ? ' (already your chat model)'
+                          : ''
+                      }`}
+                    />
+                  </Fragment>
+                ))
+              : 'no other model'}
+            .
+          </p>
+        )}
         <p>Schedules use {lane('schedule')}.</p>
         <p>Work Nod starts on its own uses {lane('background')}.</p>
         {ownSchedules.map((schedule) => (
@@ -250,6 +293,16 @@ export function ModelSentences() {
           </p>
         ))}
       </div>
+      {chat && backups.length < 3 && (
+        <p className="model-sentences-note">
+          <ModelPicker
+            appearance="statement"
+            manageConnections={false}
+            target={backupTarget(data, backups.length)}
+            label="Add a backup model"
+          />
+        </p>
+      )}
       {chat?.audio && (
         <p className="model-sentences-note">
           {chat.textModelName ? `Text support: ${chat.textModelName}` : 'Text model unavailable'}
@@ -268,29 +321,17 @@ export function ModelSentences() {
   );
 }
 
-export function WorkModel({
-  schedule,
-  task,
-}: { schedule: Schedule; task?: undefined } | { task: Task; schedule?: undefined }) {
+export function WorkModel({ task }: { task: Task }) {
   const models = useModels();
   const usage = usePageData<WorkUsageResponse>(workUsagePath);
   const data = models.data;
-  if (!data) return null;
-  const kind = schedule ? 'schedule' : task.work;
-  if (!kind) return null;
-  const own = schedule ? schedule.model : task.model;
-  const current = routeModel(
-    data,
-    kind,
-    schedule ? { schedule: own } : { task: own, schedule: task.scheduleModel },
-  );
+  const kind = task.work;
+  if (!data || !kind) return null;
+  const current = routeModel(data, kind, { task: task.model, schedule: task.scheduleModel });
   if (!current) return null;
   const chosen = modelOf(data, current.selection);
-  const target = schedule
-    ? scheduleTarget(data, schedule, usage.data?.schedules[schedule.id])
-    : taskTarget(data, task as Task & { work: WorkKind }, usage.data?.tasks[task.id]);
   const follows =
-    current.follows === 'task' || (schedule && current.follows === 'schedule')
+    current.follows === 'task'
       ? 'its own choice'
       : current.follows === 'schedule'
         ? 'same as its schedule'
@@ -303,15 +344,62 @@ export function WorkModel({
       <span className="work-model-value">
         <strong>{chosen?.name ?? 'Model unavailable'}</strong> · {follows}
       </span>
-      <ModelPicker manageConnections={false} target={target} label="Change" appearance="quiet" />
+      <ModelPicker
+        manageConnections={false}
+        target={taskTarget(data, { ...task, work: kind }, usage.data?.tasks[task.id])}
+        label="Change"
+        appearance="quiet"
+      />
     </div>
   );
 }
 
-export function useOwnModel(model: ModelSelection | null | undefined, kind: WorkKind | undefined) {
+export function ScheduleCost({ schedule }: { schedule: Schedule }) {
   const models = useModels();
+  const usage = usePageData<WorkUsageResponse>(workUsagePath);
   const data = models.data;
-  if (!data || !kind || !model) return undefined;
-  if (!kept(data, model) || same(model, routeModel(data, kind)?.selection)) return undefined;
-  return modelOf(data, model)?.name ?? 'Model unavailable';
+  const current = data && routeModel(data, 'schedule', { schedule: schedule.model });
+  const name = data && current ? modelOf(data, current.selection)?.name : undefined;
+  const spent = usage.data?.schedules[schedule.id];
+  const recent = spent ? spent.agentUsd + spent.otherUsd : 0;
+  if (schedule.kind !== 'recurring' && recent <= 0) return null;
+  return (
+    <div className="work-model">
+      <span className="work-model-label">Expected cost</span>
+      <span className="work-model-value">
+        {schedule.monthlyUsd !== null ? (
+          <>
+            <strong>≈{money(schedule.monthlyUsd)} a month</strong>
+            {name && ` on ${name}`}
+            {recent > 0 && ` · ${money(recent)} in the last 30 days`}
+          </>
+        ) : schedule.kind === 'recurring' ? (
+          <>
+            <strong>No estimate yet</strong>
+            {recent > 0 && ` · ${money(recent)} in the last 30 days`}
+          </>
+        ) : (
+          <>
+            <strong>{money(recent)}</strong> in the last 30 days
+          </>
+        )}
+      </span>
+    </div>
+  );
+}
+
+export function ScheduleModel({ schedule }: { schedule: Schedule }) {
+  const models = useModels();
+  const usage = usePageData<WorkUsageResponse>(workUsagePath);
+  const data = models.data;
+  if (!data) return null;
+  const current = routeModel(data, 'schedule', { schedule: schedule.model });
+  if (!data.connections.some((item) => item.status === 'connected')) return null;
+  return (
+    <ModelPicker
+      manageConnections={false}
+      target={scheduleTarget(data, schedule, usage.data?.schedules[schedule.id])}
+      label={current && !modelOf(data, current.selection) ? 'Model unavailable' : undefined}
+    />
+  );
 }

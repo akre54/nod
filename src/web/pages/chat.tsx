@@ -30,7 +30,6 @@ import { classifyVerificationReply, securityCodeIn } from '../../shared/verifica
 import { ChatTools } from '../components/chat-tools';
 import { ServiceLogo } from '../components/service-logo';
 import { Composer, type ComposerHandle, type ComposerSendResult } from '../components/composer';
-import { TaskCard } from './tasks';
 import { MessageBubble, WorkLabel, type MessageWork } from '../components/message';
 import { conversationFiles } from '../components/attachment-card';
 import { ArtifactWorkspace } from '../components/artifact-drawer';
@@ -53,7 +52,7 @@ import {
 import { formatDayLabel, isSameDay, useDateFormat } from '../lib/date-format';
 import { NodGlyph, Rise, prefersReducedMotion } from '../components/motion';
 import { LiveLine } from '../components/live-line';
-import { TaskDots } from '../components/task-dots';
+import { TaskChip, TaskLine, TaskStackCard } from '../components/task-stack';
 import { recordingSource } from '../lib/recording';
 import { money } from '../lib/money';
 import type { ImagePreview } from '../components/attachment-images';
@@ -164,7 +163,7 @@ function Working({
       <div className="working-details">
         <div className="working-text">
           <div hidden={!thinking}>
-            <LiveLine item={chat} quiet={quiet && thinking} />
+            <LiveLine item={chat} quiet={quiet && thinking} clipped />
           </div>
           {!thinking && (
             <span className="live-line-current" role="status">
@@ -810,6 +809,28 @@ export function Chat({
       moved ? undefined : item,
     );
   };
+  const startedTask = (message: Message) =>
+    message.role === 'assistant'
+      ? state.tasks?.find((task) => task.messageId === message.id)
+      : undefined;
+  const approvalTask = (message: Message) =>
+    message.approval && message.work?.kind === 'task'
+      ? state.tasks?.find((task) => task.id === message.work!.id)
+      : undefined;
+  const chipOf = (message: Message) => {
+    const task = startedTask(message);
+    if (!task) return undefined;
+    const answer = allMessages.findLast(
+      (item) => item.role === 'assistant' && item.replyToMessageId === message.id,
+    );
+    return (
+      <TaskChip
+        task={task}
+        running={live.some((item) => item.taskId === task.id)}
+        answerId={answer?.id}
+      />
+    );
+  };
   const labelOf = (
     work: NonNullable<Message['work']>,
     status: MessageWork['status'],
@@ -820,6 +841,7 @@ export function Chat({
     return {
       title: work.title,
       status,
+      ...(task?.status === 'done' ? { done: true } : {}),
       live: item,
       ...(task?.messageId
         ? {
@@ -1194,26 +1216,6 @@ export function Chat({
     return () => window.removeEventListener('nod:focus-message', focusMessage);
   }, []);
   useEffect(() => {
-    const openTask = (event: Event) => {
-      const id = (event as CustomEvent<{ taskId?: unknown }>).detail?.taskId;
-      const element = scroll.current;
-      const card = Array.from(element?.querySelectorAll<HTMLElement>('[data-task-id]') ?? []).find(
-        (item) => item.dataset.taskId === id,
-      );
-      if (!element || !card?.getClientRects().length) return;
-      const view = element.getBoundingClientRect();
-      const box = card.getBoundingClientRect();
-      if (box.top >= view.top && box.bottom <= view.bottom) return;
-      stickToBottom.current = false;
-      card.scrollIntoView({
-        block: 'center',
-        behavior: prefersReducedMotion() ? 'auto' : 'smooth',
-      });
-    };
-    window.addEventListener('nod:open-task', openTask);
-    return () => window.removeEventListener('nod:open-task', openTask);
-  }, []);
-  useEffect(() => {
     if (!visible || !focusTarget || loadingHistory) return;
     if (hiddenIds.has(focusTarget.id)) {
       setFocusTarget(null);
@@ -1257,7 +1259,6 @@ export function Chat({
   }, [focusTarget, loadingHistory, historyPage, hasEarlier, historyError, visible]);
   async function recover(selection?: ModelSelection) {
     setRecovering(true);
-    setRecovered(lastMessage?.id);
     try {
       if (selection)
         await api('/api/models/selection', {
@@ -1269,6 +1270,7 @@ export function Chat({
           }),
         });
       if (failedRequest) await send(failedRequest, [], null);
+      else setRecovered(lastMessage?.id);
     } catch (error) {
       setError(errorMessage(error));
     } finally {
@@ -2367,28 +2369,20 @@ export function Chat({
                         void send(task.title, [], null, 'task_card');
                       }}
                     />
-                  ) : state.tasks?.some((task) => task.messageId === message.id) ? (
-                    state.tasks
-                      ?.filter((task) => task.messageId === message.id)
-                      .map((task) => (
-                        <TaskCard
-                          key={task.id}
-                          task={task}
-                          live={live.find((item) => item.taskId === task.id)}
-                          onReply={() => {
-                            const target =
-                              allMessages.find((item) => item.id === task.questionMessageId) ??
-                              message;
-                            taskReply.current = target.id;
-                            setReplyTo(target);
-                            composer.current?.focus();
-                          }}
-                        />
-                      ))
                   ) : (
                     <MessageBubble
                       message={message}
-                      work={workOf(message)}
+                      work={startedTask(message) ? undefined : workOf(message)}
+                      task={chipOf(message)}
+                      onStopTask={
+                        approvalTask(message)
+                          ? async () => {
+                              captureAnalytics('task_action', { action: 'stop' });
+                              await post(`/api/tasks/${approvalTask(message)!.id}/stop`);
+                            }
+                          : undefined
+                      }
+                      taskStopped={approvalTask(message)?.status === 'cancelled'}
                       answersDisabled={sending || !state.configuration.llmReady || welcoming}
                       onAnswer={async (value, answer) => {
                         if (replyTo?.id === message.id && composer.current?.hasDraft()) {
@@ -2499,12 +2493,40 @@ export function Chat({
                   routed={connected ? routed : undefined}
                 />
               )}
+              {connected && (
+                <TaskLine
+                  tasks={state.tasks ?? []}
+                  live={live}
+                  card={(task, close, back) => {
+                    const target =
+                      allMessages.find((item) => item.id === task.questionMessageId) ??
+                      allMessages.find((item) => item.id === task.messageId);
+                    return (
+                      <TaskStackCard
+                        key={task.id}
+                        task={task}
+                        live={live.find((item) => item.taskId === task.id)}
+                        onClose={close}
+                        onBack={back}
+                        onReply={
+                          target &&
+                          (() => {
+                            taskReply.current = target.id;
+                            setReplyTo(target);
+                            close();
+                            composer.current?.focus();
+                          })
+                        }
+                      />
+                    );
+                  }}
+                />
+              )}
             </div>
             <div ref={bottom} />
           </div>
         </div>
         <div className="chat-bottom conversation-column">
-          {connected && <TaskDots tasks={state.tasks ?? []} />}
           {(canReturn || away || onReturnToMemory) && (
             <div className="chat-jump-actions">
               {onReturnToMemory && (

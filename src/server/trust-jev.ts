@@ -289,7 +289,15 @@ export async function checkJevTrust(
   const quote =
     source?.run &&
     source.because !== 'read' &&
-    !(ownSettings && ['standing', 'rules', 'scheduleApproval'].includes(String(first.choice)))
+    !(ownSettings && ['standing', 'scheduleApproval'].includes(String(first.choice))) &&
+    !(
+      first.choice === 'rules' &&
+      (action?.name === 'NOD_bug_report_send' ||
+        (action?.name === 'NOD_notification_preferences_update' &&
+          ['rules', 'currentRules', 'notificationRule', 'currentNotificationRule'].some(
+            (key) => key in (action.arguments ?? {}),
+          )))
+    )
       ? source.because
       : undefined;
   const facts = trustFacts(input).serverDateFacts;
@@ -621,6 +629,10 @@ export async function checkJevTrust(
   );
   const run = !hard && (read ? privateAllowed : score >= model.threshold && Boolean(quote));
   return run
-    ? { run: true, because: read ? 'read' : quote, ...(!read ? { source: source?.source } : {}) }
+    ? {
+        run: true,
+        because: read ? 'read' : quote,
+        ...(!read ? { source: source?.source, terms: [] } : {}),
+      }
     : { run: false, ...(source?.rule ? { rule: true } : {}) };
 }

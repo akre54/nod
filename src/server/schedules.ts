@@ -113,7 +113,7 @@ export interface ScheduleDependencies {
   retireScheduleConfirmations?(client: PoolClient, id: string, waitForSend: boolean): Promise<void>;
   now?: () => Date;
   sessionCosts?(sessionIds: string[]): Promise<Record<string, number | null>>;
-  watchable?(connectionIds: string[]): Promise<boolean>;
+  watchable?(connectionIds: string[], client?: PoolClient): Promise<boolean>;
   watchState?(connectionIds: string[]): Promise<string | null>;
   modelPaused?(model: ModelSelection | null): boolean;
   recentTurnUsage?(
@@ -178,6 +178,7 @@ interface RunRow {
   error: string | null;
   messageId: string | null;
   messageText: string | null;
+  attachmentMessageId: string | null;
   cursorAt: string;
   observation: ScheduleObservation | null;
   observedAt: Date | null;
@@ -225,6 +226,7 @@ function runValue(row: RunRow): ScheduleRun {
     messageId: row.messageId,
     messagePreview: row.messageText && preview(row.messageText),
     messageText: row.messageText,
+    attachmentMessageId: row.attachmentMessageId,
   };
 }
 
@@ -241,9 +243,13 @@ export function createSchedules(dependencies: ScheduleDependencies) {
     shared?: PoolClient,
   ) => (shared ? operation(shared) : cancellationTransaction(operation, pool));
 
-  function validateTiming(input: z.infer<typeof timingSchema>, enabled: boolean) {
+  function validateTiming(
+    input: z.infer<typeof timingSchema> & { watch?: string[] | null },
+    enabled: boolean,
+  ) {
     if (!ianaTimeZone(input.timeZone)) throw invalid('Choose a valid time zone.');
     if (input.kind === 'once') {
+      if (input.watch) throw invalid('Only a recurring schedule can watch accounts.');
       if (!input.runAt || input.cron)
         throw invalid('A one-off schedule needs one exact date and time, with its UTC offset.');
       if (enabled && new Date(input.runAt).getTime() <= now().getTime())
@@ -382,7 +388,7 @@ export function createSchedules(dependencies: ScheduleDependencies) {
     missed: Date[] = [],
   ) {
     const turnId = await enqueueTurn(
-      `Scheduled task: ${row.title}\n${row.prompt}\nDeliver what this schedule asks for in this run, even when an earlier message covered the same ground. When it asks for nothing to be sent, message the owner only about a useful result, a problem or a necessary question.${note}`,
+      `Scheduled task: ${row.title}\n${row.prompt}\nDo this run now; the schedule already decided its timing. Deliver what this schedule asks for in this run, even when an earlier message covered the same ground. When it asks for nothing to be sent, message the owner only about a useful result, a problem or a necessary question.${note}`,
       {
         sourceId: `schedule:${row.id}:${jobId}`,
         source: 'schedule',
@@ -455,7 +461,13 @@ export function createSchedules(dependencies: ScheduleDependencies) {
           new Error('This schedule already has a run in progress or waiting for your answer.'),
           { statusCode: 409 },
         );
-      return startRun(client, row, input.requestId, now());
+      return startRun(
+        client,
+        row,
+        input.requestId,
+        now(),
+        '\nThe owner started this run with Run now.',
+      );
     });
     refresh();
     return { ...run, activeRun: await activeRun(pool, id) };
@@ -484,6 +496,35 @@ export function createSchedules(dependencies: ScheduleDependencies) {
     return { ok: true };
   }
 
+  async function cancelWaitingRun(id: string) {
+    const capture = snapshotAnalytics(dependencies.analytics);
+    const cancelled = await cancellationTransaction(async (client) => {
+      const thread = await lockThread(client, ownerId);
+      const run = await activeRun(client, id);
+      const session =
+        run?.status === 'waiting'
+          ? (
+              await client.query<{ sessionId: string }>(
+                `SELECT r.turn_id AS "sessionId" FROM schedule_runs r
+                 JOIN turns u ON u.session_id=r.turn_id AND u.owner_id=r.owner_id
+                 WHERE r.owner_id=$1 AND r.schedule_id=$2 AND u.id=$3 AND u.thread_id=$4`,
+                [ownerId, id, run.turnId, thread.id],
+              )
+            ).rows[0]?.sessionId
+          : undefined;
+      if (!session) return { ids: [], browsers: [] };
+      await client.query(
+        `UPDATE approvals a SET status='expired' FROM turns u
+         WHERE u.id=a.turn_id AND u.owner_id=a.owner_id AND a.owner_id=$1 AND u.session_id=$2 AND a.status='pending'`,
+        [ownerId, session],
+      );
+      return cancelTurns(client, thread.id, { sessionId: session }, capture, 'agent');
+    }, pool);
+    abortTurns(cancelled.ids);
+    await Promise.allSettled(cancelled.browsers.map((id) => dependencies.clearBrowser?.(id)));
+    if (cancelled.ids.length) refresh();
+  }
+
   async function dispatch(job: Job<ScheduleJob>) {
     job.signal.throwIfAborted();
     const watched = (
@@ -496,6 +537,8 @@ export function createSchedules(dependencies: ScheduleDependencies) {
       watched?.kind === 'recurring' && watched.watch?.length
         ? await dependencies.watchState?.(watched.watch).catch(() => null)
         : null;
+    job.signal.throwIfAborted();
+    if (watched?.kind === 'recurring') await cancelWaitingRun(job.data.scheduleId);
     job.signal.throwIfAborted();
     const accepted = await transaction(async (client) => {
       const row = (
@@ -672,15 +715,23 @@ export function createSchedules(dependencies: ScheduleDependencies) {
       await pool.query<RunRow>(
         `SELECT r.id,r.schedule_id AS "scheduleId",r.title,r.turn_id AS "turnId",
            r.scheduled_for AS "scheduledFor",r.time_zone AS "timeZone",r.created_at AS "createdAt",
-           u.status,u.error,r.observation,r.observed_at AS "observedAt",m.id AS "messageId",m.text AS "messageText",
+           u.status,u.error,r.observation,r.observed_at AS "observedAt",
+           m.id AS "messageId",m.text AS "messageText",files.id AS "attachmentMessageId",
            to_char(r.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "cursorAt"
          FROM schedule_runs r ${runTurn}
          LEFT JOIN LATERAL (
            SELECT m.id,left(m.text,4000) AS text FROM messages m
            WHERE m.turn_id=u.id AND m.owner_id=u.owner_id AND m.role='assistant'
              AND m.hidden_at IS NULL AND u.channel='web' AND ${activeThreadSql('m')}
-           ORDER BY date_trunc('milliseconds',m.created_at),m.id LIMIT 1
+           ORDER BY (m.text<>'') DESC,m.created_at DESC,m.id DESC LIMIT 1
          ) m ON true
+         LEFT JOIN LATERAL (
+           SELECT m.id FROM messages m
+           WHERE m.turn_id=u.id AND m.owner_id=u.owner_id AND m.role='assistant'
+             AND m.hidden_at IS NULL AND u.channel='web' AND ${activeThreadSql('m')}
+             AND jsonb_array_length(m.attachments)>0
+           ORDER BY m.created_at DESC,m.id DESC LIMIT 1
+         ) files ON true
          WHERE r.owner_id=$1 AND ($2::uuid IS NULL OR r.schedule_id=$2)
            AND ($3::timestamptz IS NULL OR (r.created_at,r.id)<($3::timestamptz,$4::uuid))
          ORDER BY r.created_at DESC,r.id DESC LIMIT $5`,
@@ -715,7 +766,7 @@ export function createSchedules(dependencies: ScheduleDependencies) {
     };
   }
 
-  async function recordObservation(turnId: string, raw: unknown) {
+  async function recordObservation(turnId: string, raw: unknown, shared?: PoolClient) {
     z.uuid().parse(turnId);
     const input = observationSchema.parse(raw);
     const result = await transaction(async (client) => {
@@ -728,9 +779,9 @@ export function createSchedules(dependencies: ScheduleDependencies) {
         }>(
           `SELECT r.id,r.schedule_id AS "scheduleId",r.baseline_observation AS "baselineObservation",
              r.observation
-           FROM schedule_runs r JOIN turns u ON u.id=r.turn_id AND u.owner_id=r.owner_id
-           JOIN threads th ON th.id=u.thread_id AND th.archived_at IS NULL
-           WHERE r.turn_id=$1 AND r.owner_id=$2 AND u.status='running'
+           FROM schedule_runs r JOIN turns u ON u.session_id=r.turn_id AND u.owner_id=r.owner_id
+           JOIN threads th ON th.id=u.thread_id AND th.owner_id=u.owner_id AND th.archived_at IS NULL
+           WHERE u.id=$1 AND r.owner_id=$2 AND u.status='running'
            FOR UPDATE OF r,u`,
           [turnId, ownerId],
         )
@@ -758,8 +809,8 @@ export function createSchedules(dependencies: ScheduleDependencies) {
         observation,
         previous: prior,
       };
-    });
-    refresh();
+    }, shared);
+    afterCommit(shared ?? pool, refresh);
     return result;
   }
 
@@ -884,10 +935,9 @@ export function createSchedules(dependencies: ScheduleDependencies) {
     return Promise.all(rows.map((row) => value(row, monthly)));
   }
 
-  async function validateWatch(watch: string[] | null | undefined, kind: string) {
+  async function validateWatch(watch: string[] | null | undefined, client?: PoolClient) {
     if (!watch) return;
-    if (kind !== 'recurring') throw invalid('Only a recurring schedule can watch accounts.');
-    if (!(await dependencies.watchable?.(watch)))
+    if (!(await dependencies.watchable?.(watch, client)))
       throw invalid(
         'One of these accounts has no change signal, so this schedule cannot skip unchanged runs. Save it without watch.',
       );
@@ -906,10 +956,13 @@ export function createSchedules(dependencies: ScheduleDependencies) {
   }
 
   function updateValue(previous: ScheduleRow, input: z.infer<typeof updateSchema>) {
+    const inheritedWatch =
+      previous.kind === 'once' || input.kind === 'once' ? null : previous.watch;
     const next = {
       ...previous,
       ...(input.kind && input.kind !== previous.kind ? { cron: null, runAt: null } : {}),
       ...input,
+      watch: input.watch === undefined ? inheritedWatch : input.watch,
       runAt:
         input.runAt === undefined
           ? input.kind === 'recurring'
@@ -1126,7 +1179,7 @@ export function createSchedules(dependencies: ScheduleDependencies) {
 
   async function create(raw: unknown, provenance?: ScheduleProvenance, shared?: PoolClient) {
     const input = validateCreate(raw);
-    await validateWatch(input.watch, input.kind);
+    await validateWatch(input.watch, shared);
     const created = await transaction(async (client) => {
       const source = await sourceProvenance(client, provenance);
       const route = await deliveryRoute(client, source);
@@ -1197,7 +1250,6 @@ export function createSchedules(dependencies: ScheduleDependencies) {
     z.uuid().parse(id);
     const input = updateSchema.parse(raw);
     if (!Object.keys(input).length) throw invalid('Choose a schedule detail to update.');
-    if (input.watch) await validateWatch(input.watch, input.kind ?? (await read(id)).kind);
     const mutate = input.enabled === false ? retirementTransaction : transaction;
     const row = await mutate(async (client) => {
       const previous = (
@@ -1211,6 +1263,7 @@ export function createSchedules(dependencies: ScheduleDependencies) {
       if (!previous.enabled && input.enabled === false && Object.keys(input).length === 1)
         return previous;
       const next = updateValue(previous, input);
+      await validateWatch(input.watch, client);
       if (provenance) await sourceProvenance(client, provenance);
       assertChange(provenance, next);
       const fresh = await authority(client, input, provenance);
@@ -1222,12 +1275,16 @@ export function createSchedules(dependencies: ScheduleDependencies) {
             ? mergeOwnerInstructions(previous.authority, fresh)
             : previous.authority;
       await cancelPending(client, previous);
+      const timingChanged = ['kind', 'cron', 'runAt', 'timeZone', 'enabled'].some(
+        (key) => key in input,
+      );
       const saved = (
         await client.query<ScheduleRow>(
           `UPDATE schedules SET title=$3,prompt=$4,kind=$5,cron=$6,run_at=$7,time_zone=$8,
              enabled=$9,authority=$10::jsonb,
              baseline_observation=COALESCE($11::jsonb,baseline_observation),
-             watch=CASE WHEN $12 THEN $13::jsonb ELSE watch END,skipped='[]'::jsonb,revision=revision+1 WHERE id=$1 AND owner_id=$2 RETURNING ${columns}`,
+             watch=$12::jsonb,skipped=CASE WHEN $13 THEN '[]'::jsonb ELSE skipped END,
+             revision=revision+1 WHERE id=$1 AND owner_id=$2 RETURNING ${columns}`,
           [
             id,
             ownerId,
@@ -1242,14 +1299,11 @@ export function createSchedules(dependencies: ScheduleDependencies) {
             input.baselineObservation
               ? JSON.stringify({ ...input.baselineObservation, checkedAt: now().toISOString() })
               : null,
-            'watch' in input,
-            input.watch ? JSON.stringify(input.watch) : null,
+            next.watch ? JSON.stringify(next.watch) : null,
+            timingChanged,
           ],
         )
       ).rows[0]!;
-      const timingChanged = ['kind', 'cron', 'runAt', 'timeZone', 'enabled'].some(
-        (key) => key in input,
-      );
       const updated = await enqueue(
         client,
         saved,
@@ -1263,6 +1317,9 @@ export function createSchedules(dependencies: ScheduleDependencies) {
     }, shared);
     afterCommit(shared ?? pool, () => {
       refresh();
+      void cancelWaitingRun(id).catch((error: unknown) =>
+        logFailure('schedule_run_cancel_failed', error),
+      );
       dependencies.analytics?.({
         event: 'schedule_changed',
         properties: {
@@ -1320,6 +1377,7 @@ export function createSchedules(dependencies: ScheduleDependencies) {
       await dependencies.retireScheduleConfirmations?.(client, id, true);
       return row;
     });
+    await cancelWaitingRun(id);
     refresh();
     dependencies.analytics?.({
       event: 'schedule_changed',

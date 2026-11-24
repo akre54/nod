@@ -222,6 +222,14 @@ export function redactBrowserUrl(value: string, secrets: Iterable<string>): stri
   return redactBrowserText(url.href, secrets);
 }
 
+function nativeBinary() {
+  if (process.platform === 'win32') return 'agent-browser-win32-x64.exe';
+  const report = process.report?.getReport() as
+    { header?: { glibcVersionRuntime?: string } } | undefined;
+  const musl = process.platform === 'linux' && !report?.header?.glibcVersionRuntime;
+  return `agent-browser-${process.platform}-${musl ? 'musl-' : ''}${process.arch}`;
+}
+
 export function createAgentBrowserComputer(options: {
   dataRoot: string;
   executable?: string;
@@ -230,6 +238,8 @@ export function createAgentBrowserComputer(options: {
   platform?: NodeJS.Platform;
   headless?: boolean;
   evictIdleMs?: number;
+  submitReadyMs?: number;
+  clickReceiptMs?: number;
   maxLiveSessions?: number;
   viewport?: { width: number; height: number };
   run?: typeof runProcess;
@@ -255,7 +265,7 @@ export function createAgentBrowserComputer(options: {
     'g',
   );
   const executable =
-    options.executable ?? resolve(process.cwd(), 'node_modules/.bin/agent-browser');
+    options.executable ?? resolve(process.cwd(), 'node_modules/agent-browser/bin', nativeBinary());
   const run = options.run ?? runProcess;
   const privateNetwork = options.privateNetwork;
   const requestDaemon = (...args: Parameters<typeof existingDaemonCommand>) =>
@@ -1376,7 +1386,7 @@ export function createAgentBrowserComputer(options: {
     state: BrowserState,
     submitSelector: string | undefined,
     operation: (devtools: Awaited<ReturnType<typeof openDevtools>>, document: string) => Promise<T>,
-    submitOrigins: string[] = [],
+    submitOrigins: string[] | undefined,
     signal?: AbortSignal,
   ): Promise<T> {
     if (state.injecting) throw new BrowserLockedError();
@@ -1403,7 +1413,7 @@ export function createAgentBrowserComputer(options: {
               const control = selector(submitSelector);
               assertOpen();
               await devtools.blur();
-              const readyBy = performance.now() + 30_000;
+              const readyBy = performance.now() + (options.submitReadyMs ?? 30_000);
               for (;;) {
                 assertOpen();
                 if ((await devtools.document()) !== document)
@@ -1430,13 +1440,15 @@ export function createAgentBrowserComputer(options: {
                   throw new BrowserActionError('browser_card_disabled');
                 await delay(100, undefined, { signal });
               }
-              const field = await focusField(state, devtools, control);
-              const origin = new URL(await currentUrl(state)).origin;
-              if (
-                (field.origin !== origin && !submitOrigins.includes(field.origin)) ||
-                (await devtools.document()) !== document
-              )
-                throw new Error('The submit control is not on this page.');
+              if (submitOrigins) {
+                const field = await focusField(state, devtools, control);
+                const origin = new URL(await currentUrl(state)).origin;
+                if (
+                  (field.origin !== origin && !submitOrigins.includes(field.origin)) ||
+                  (await devtools.document()) !== document
+                )
+                  throw new Error('The submit control is not on this page.');
+              }
               assertOpen();
               await command(
                 state,
@@ -1505,7 +1517,7 @@ export function createAgentBrowserComputer(options: {
         await saveState(state);
         return { status: 'submitted' as const };
       },
-      [],
+      undefined,
       signal,
     );
   }
@@ -1548,7 +1560,7 @@ export function createAgentBrowserComputer(options: {
       .parse((await command(state, { action: 'tab_list' }, { signal })).tabs)
       .find((item) => item.active);
     if (!tab) throw new Error('The checkout tab is no longer open.');
-    return openDevtools(cdpUrl, tab.targetId, signal);
+    return openDevtools(cdpUrl, tab.targetId, signal, options.clickReceiptMs);
   }
 
   async function focusField(
@@ -1966,6 +1978,8 @@ export function createAgentBrowserComputer(options: {
               `Choice ${index + 1} of ${methods.length}.`,
               guard,
             );
+          if (observed && observed.role !== 'button' && observed.role !== 'link')
+            throw refused('choice_ineligible');
           const control = await (async () =>
             devtools.signInControl(ref ? await pointOf(state, ref) : { selector: target }))().catch(
             (error: unknown) => {

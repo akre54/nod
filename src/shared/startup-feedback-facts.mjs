@@ -34,49 +34,6 @@ const events = new Set([
   'startup_failed',
   'update',
 ]);
-const classes = new Set([
-  'Error',
-  'TypeError',
-  'RangeError',
-  'SyntaxError',
-  'ReferenceError',
-  'AggregateError',
-  'AbortError',
-  'TimeoutError',
-  'ZodError',
-]);
-const errnos = new Set([
-  'EACCES',
-  'EPERM',
-  'EIO',
-  'ENOENT',
-  'ENOSPC',
-  'EDQUOT',
-  'EROFS',
-  'EEXIST',
-  'ENOTDIR',
-  'EISDIR',
-  'EINVAL',
-  'EMFILE',
-  'ENFILE',
-  'ELOOP',
-  'EBUSY',
-  'ENOTEMPTY',
-  'ENOSYS',
-  'ENOTSUP',
-  'EPIPE',
-  'ECONNREFUSED',
-  'ECONNRESET',
-  'ECONNABORTED',
-  'ETIMEDOUT',
-  'ENETUNREACH',
-  'EHOSTUNREACH',
-  'ENOTFOUND',
-  'EAI_AGAIN',
-  'EADDRINUSE',
-  'EADDRNOTAVAIL',
-  'ERR_CANCELED',
-]);
 const syscalls = new Set([
   'open',
   'read',
@@ -106,6 +63,29 @@ const signals = new Set([
   'SIGHUP',
   'SIGQUIT',
   'SIGPIPE',
+]);
+const steps = new Set([
+  'wsl',
+  'profile',
+  'assets',
+  'download',
+  'extract',
+  'import',
+  'update',
+  'start',
+  'storage',
+  'workspace',
+  'browser',
+  'ready',
+  'loading',
+  'loaded',
+  'database',
+  'threads',
+  'memory',
+  'apps',
+  'listening',
+  'check',
+  'create',
 ]);
 const reasons = {
   status_regular: 'The saved report status is not one regular file.',
@@ -146,14 +126,24 @@ function data(value, key) {
 }
 
 const choice = (set, value) => (typeof value === 'string' && set.has(value) ? value : undefined);
+const shaped = (pattern, value) =>
+  typeof value === 'string' && pattern.test(value) ? value : undefined;
+const errorClass = /^(?:[A-Z][A-Za-z0-9]{0,39})?Error$/;
+const errnoShape = /^(?:E[A-Z0-9]{1,15}|EAI_[A-Z]{1,12}|(?:UND_)?ERR_[A-Z0-9_]{1,60})$/;
+const codeShape = /^[A-Z][A-Z0-9_]{2,63}$/;
+const wslShape = /^(?:[A-Z][A-Z0-9_]{1,63}|0x[0-9A-Fa-f]{8})$/;
 const integer = (value, min, max) =>
   Number.isSafeInteger(value) && value >= min && value <= max ? value : undefined;
 
+export const startupWslCode = (value) => shaped(wslShape, value);
+
 export function startupErrorFacts(value) {
   const result = { detailsOmitted: true };
+  const errno = shaped(errnoShape, data(value, 'errno')) ?? shaped(errnoShape, data(value, 'code'));
+  const code = shaped(codeShape, data(value, 'code'));
   for (const [key, selected] of [
-    ['class', choice(classes, data(value, 'class')) ?? choice(classes, data(value, 'name'))],
-    ['errno', choice(errnos, data(value, 'errno')) ?? choice(errnos, data(value, 'code'))],
+    ['class', shaped(errorClass, data(value, 'class')) ?? shaped(errorClass, data(value, 'name'))],
+    ['errno', errno],
     ['syscall', choice(syscalls, data(value, 'syscall'))],
     [
       'httpStatus',
@@ -163,6 +153,9 @@ export function startupErrorFacts(value) {
     ],
     ['exitCode', integer(data(value, 'exitCode'), -2147483648, 4294967295)],
     ['signal', choice(signals, data(value, 'signal'))],
+    ['code', code === errno ? undefined : code],
+    ['step', choice(steps, data(value, 'step'))],
+    ['wslCode', startupWslCode(data(value, 'wslCode'))],
   ])
     if (selected !== undefined) result[key] = selected;
   return result;
@@ -193,6 +186,7 @@ export function startupEventFacts(event, details) {
   for (const [key, selected] of [
     ['phase', choice(phases, data(details, 'phase'))],
     ['stage', choice(stages, data(details, 'stage'))],
+    ['step', choice(steps, data(details, 'step'))],
     ['durationMs', integer(data(details, 'durationMs'), 0, 86400000)],
     ['count', integer(data(details, 'count'), 0, 1000000)],
     ['exitCode', integer(data(details, 'exitCode'), -2147483648, 4294967295)],
