@@ -23,6 +23,7 @@ import {
   telegramUpdateTypes,
 } from './telegram.ts';
 import { modelServiceError } from '../model-error.ts';
+import { errorCode } from '../../shared/error-code.ts';
 import {
   canDeliverWhatsAppLiteral,
   hasLiteralBlock,
@@ -149,7 +150,12 @@ class Telegram extends TelegramAdapter {
     );
   }
 
-  async postApproval(threadId: string, markdown: string, replyToMessageId?: string) {
+  async postApproval(
+    threadId: string,
+    markdown: string,
+    labels: { approve: string; decline: string },
+    replyToMessageId?: string,
+  ) {
     const thread = this.decodeThreadId(threadId);
     const { text, plainText } = this.renderMessageBodies({ markdown }, null, 'MarkdownV2');
     const sent = await this.sendRegularMessage(
@@ -160,8 +166,8 @@ class Telegram extends TelegramAdapter {
       {
         inline_keyboard: [
           [
-            { text: 'Approve', callback_data: approveData },
-            { text: 'Cancel', callback_data: declineData },
+            { text: labels.approve, callback_data: approveData },
+            { text: labels.decline, callback_data: declineData },
           ],
         ],
       },
@@ -603,12 +609,8 @@ export function createChatSdkTransport(
         }
       } catch (cause) {
         const channel = channels.find((channel) => channel.id === 'telegram')!;
-        const source = cause as { code?: unknown; cause?: { code?: unknown } } | undefined;
-        const code = source?.code ?? source?.cause?.code;
-        const detail =
-          typeof code === 'string' && /^(?:[0-9A-Z]{5}|[A-Z][A-Z0-9_]{0,31})$/.test(code)
-            ? ` (${code})`
-            : '';
+        const code = errorCode(cause);
+        const detail = code ? ` (${code})` : '';
         const failure =
           cause instanceof MessagingConnectionError
             ? cause
@@ -918,6 +920,7 @@ export function createChatSdkTransport(
           const id = await telegram.postApproval(
             input.threadId,
             telegramParts[0]!,
+            input.approval,
             input.replyToMessageId,
           );
           return { id, ids: [id], approvalButtons: true };

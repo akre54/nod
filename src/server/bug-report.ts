@@ -71,6 +71,7 @@ const tools = [
   'apps',
   'codemode',
   'files',
+  'flights',
   'history_search',
   'limits_update',
   'memory_learn',
@@ -90,6 +91,8 @@ const tools = [
   'follow_up',
   'manage_apps',
   'manage_personal_context',
+  'memory',
+  'nod',
   'pay',
   'react_to_message',
   'send_message',
@@ -114,6 +117,7 @@ const usageOperations = [
   'reflect',
   'style',
   'plan',
+  'ideas',
   'classify',
   'vision',
   'recall',
@@ -187,6 +191,12 @@ function tool(value: unknown) {
 
 export async function buildFeedbackReport(options: FeedbackReportOptions) {
   const now = Date.now();
+  const databasePool = {
+    max: amount(options.pool.options?.max),
+    total: amount(options.pool.totalCount),
+    idle: amount(options.pool.idleCount),
+    waiting: amount(options.pool.waitingCount),
+  };
   let redact: ReturnType<typeof createFeedbackRedactor> | undefined;
   let profileTimer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -328,6 +338,7 @@ export async function buildFeedbackReport(options: FeedbackReportOptions) {
           'steered',
           'step',
           'thought',
+          'intent',
           'final',
           'queued',
           'running',
@@ -804,6 +815,7 @@ export async function buildFeedbackReport(options: FeedbackReportOptions) {
       node: bounded(process.versions.node, /^[\w.+-]{1,40}$/),
       electron: bounded(environment.NOD_ELECTRON_VERSION, /^[\w.+-]{1,40}$/),
       database,
+      databasePool,
       container: existsSync('/.dockerenv'),
       uptimeSeconds: Math.round(process.uptime()),
       timeZone: bounded(Intl.DateTimeFormat().resolvedOptions().timeZone, /^[\w+/-]{1,64}$/),

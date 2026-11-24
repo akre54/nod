@@ -58,47 +58,6 @@ export type StartupEvent =
   | 'startup_failed'
   | 'update'
   | 'diagnostic_text_omitted';
-export type StartupErrorClass =
-  | 'Error'
-  | 'TypeError'
-  | 'RangeError'
-  | 'SyntaxError'
-  | 'ReferenceError'
-  | 'AggregateError'
-  | 'AbortError'
-  | 'TimeoutError'
-  | 'ZodError';
-export type StartupErrno =
-  | 'EACCES'
-  | 'EPERM'
-  | 'EIO'
-  | 'ENOENT'
-  | 'ENOSPC'
-  | 'EDQUOT'
-  | 'EROFS'
-  | 'EEXIST'
-  | 'ENOTDIR'
-  | 'EISDIR'
-  | 'EINVAL'
-  | 'EMFILE'
-  | 'ENFILE'
-  | 'ELOOP'
-  | 'EBUSY'
-  | 'ENOTEMPTY'
-  | 'ENOSYS'
-  | 'ENOTSUP'
-  | 'EPIPE'
-  | 'ECONNREFUSED'
-  | 'ECONNRESET'
-  | 'ECONNABORTED'
-  | 'ETIMEDOUT'
-  | 'ENETUNREACH'
-  | 'EHOSTUNREACH'
-  | 'ENOTFOUND'
-  | 'EAI_AGAIN'
-  | 'EADDRINUSE'
-  | 'EADDRNOTAVAIL'
-  | 'ERR_CANCELED';
 export type StartupSyscall =
   | 'open'
   | 'read'
@@ -127,14 +86,40 @@ export type StartupSignal =
   | 'SIGHUP'
   | 'SIGQUIT'
   | 'SIGPIPE';
+export type StartupStep =
+  | 'wsl'
+  | 'profile'
+  | 'assets'
+  | 'download'
+  | 'extract'
+  | 'import'
+  | 'update'
+  | 'start'
+  | 'storage'
+  | 'workspace'
+  | 'browser'
+  | 'ready'
+  | 'loading'
+  | 'loaded'
+  | 'database'
+  | 'threads'
+  | 'memory'
+  | 'apps'
+  | 'listening'
+  | 'check'
+  | 'create';
+export function startupWslCode(value: unknown): string | undefined;
 export type StartupErrorFacts = {
   detailsOmitted: true;
-  class?: StartupErrorClass;
-  errno?: StartupErrno;
+  class?: string;
+  errno?: string;
   syscall?: StartupSyscall;
   httpStatus?: number;
   exitCode?: number;
   signal?: StartupSignal;
+  code?: string;
+  step?: StartupStep;
+  wslCode?: string;
 };
 export type StartupEventFacts = {
   event: StartupEvent;
@@ -142,6 +127,7 @@ export type StartupEventFacts = {
   error?: StartupErrorFacts;
   phase?: StartupPhase;
   stage?: StartupStage;
+  step?: StartupStep;
   durationMs?: number;
   count?: number;
   exitCode?: number;
@@ -167,12 +153,15 @@ export function startupLogFacts(value: unknown): {
 export class StartupFeedbackError extends Error {
   startupReason?: StartupReason;
   detailsOmitted: true;
-  class?: StartupErrorClass;
-  errno?: StartupErrno;
+  class?: string;
+  errno?: string;
   syscall?: StartupSyscall;
   httpStatus?: number;
   exitCode?: number;
   signal?: StartupSignal;
+  code?: string;
+  step?: StartupStep;
+  wslCode?: string;
   errors?: StartupErrorFacts[];
   constructor(reason: string, cause?: unknown);
 }

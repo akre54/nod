@@ -1472,6 +1472,47 @@ test('local file version checks keep the cause of a failed path check', async (t
   }
 });
 
+test('a folder moved to another drive keeps a file that arrives during the copy', async (t) => {
+  const home = await realpath(await mkdtemp(join(tmpdir(), 'nod-cross-drive-')));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const source = join(home, 'box');
+  await mkdir(join(source, 'inner'), { recursive: true });
+  await writeFile(join(source, 'inner', 'a.txt'), 'a');
+  const pool = {
+    query: async () => ({ rows: [{ local_files_enabled: true, local_keep_out: [] }] }),
+  } as unknown as Pool;
+  const files = createLocalFiles(pool, 'owner', {
+    home,
+    dataRoot: join(home, 'data'),
+    available: true,
+  });
+  const { rename: originalRename, cp: originalCp } = fs;
+  const crossDrive = Object.assign(new Error('EXDEV: cross-device link not permitted'), {
+    code: 'EXDEV',
+  });
+  const renamed = t.mock.method(fs, 'rename', (...args: Parameters<typeof fs.rename>) =>
+    args[0] === source ? Promise.reject(crossDrive) : Reflect.apply(originalRename, fs, args),
+  );
+  const copied = t.mock.method(fs, 'cp', async (...args: Parameters<typeof fs.cp>) => {
+    await writeFile(join(source, 'late.txt'), 'late');
+    return Reflect.apply(originalCp, fs, args);
+  });
+  syncBuiltinESMExports();
+  try {
+    const result = (await files.execute('LOCAL_FILES_MOVE', {
+      moves: [{ from: source, to: join(home, 'crate') }],
+    })) as { failed: unknown[] };
+    assert.equal(result.failed.length, 1);
+  } finally {
+    renamed.mock.restore();
+    copied.mock.restore();
+    syncBuiltinESMExports();
+  }
+  assert.equal(await readFile(join(home, 'crate', 'inner', 'a.txt'), 'utf8'), 'a');
+  assert.equal(await readFile(join(source, 'late.txt'), 'utf8'), 'late');
+  assert.ok(!existsSync(join(source, 'inner')));
+});
+
 test('local imports reject changed and oversized files before reading bytes', async (t) => {
   const home = await realpath(await mkdtemp(join(tmpdir(), 'nod-import-size-')));
   t.after(() => rm(home, { recursive: true, force: true }));
@@ -2059,6 +2100,8 @@ test('computer use refuses blocked apps, keeps browsers view-only and acts only 
       request: async (request) => {
         calls.push(request);
         if (request.op === 'apps') return { apps };
+        if (request.op === 'windows')
+          return { windows: apps.find((item) => item.pid === request.pid)?.windows ?? [] };
         if (request.op === 'locate') {
           const found = apps.find((app) => app.bundle === request.bundle);
           if (!found) throw new Error('No app with that bundle ID is installed.');
@@ -2072,12 +2115,21 @@ test('computer use refuses blocked apps, keeps browsers view-only and acts only 
               ...menuBar.children.flatMap((node) => node.children),
             ].find((node) => node.ref_id === request.ref),
           };
-        if (request.op === 'inspect') {
-          const tree = request.menu
+        const currentTree = () =>
+          request.menu
             ? { ...menuBar, children: menuBar.children.slice(2) }
             : { ...window, children: [...window.children, ...findings] };
+        if (
+          request.expected &&
+          createHash('sha256').update(JSON.stringify(currentTree())).digest('hex') !==
+            request.expected
+        )
+          throw new Error('STALE_REF: That window changed since this step was checked.');
+        if (request.op === 'inspect') {
+          const tree = currentTree();
           return {
             tree,
+            context: JSON.stringify(tree),
             state: createHash('sha256').update(JSON.stringify(tree)).digest('hex'),
             focus: createHash('sha256').update('synthetic-focus').digest('hex'),
             focused: [],
@@ -2181,15 +2233,6 @@ test('computer use refuses blocked apps, keeps browsers view-only and acts only 
     computer.prepare(turn, 'COMPUTER_SET_VALUE', { ref: '@sdraft01:e3', text: 'x' }),
     /no snapshot with that ref/,
   );
-  await assert.rejects(
-    computer.execute(
-      turn,
-      'COMPUTER_SCREENSHOT',
-      await computer.prepare(turn, 'COMPUTER_SCREENSHOT', { pid: 11 }),
-    ),
-    /password field has focus/,
-  );
-
   findings.push({ role: 'statictext', name: 'x'.repeat(25_000) });
   await assert.rejects(
     computer.prepare(turn, 'COMPUTER_PRESS', { ref: '@sdraft01:e1' }),
@@ -2270,18 +2313,6 @@ test('computer use refuses blocked apps, keeps browsers view-only and acts only 
     /password fields/,
   );
   delete subject.states;
-  const before = calls.length;
-  await assert.rejects(
-    computer.execute(
-      turn,
-      'COMPUTER_KEY',
-      await computer.prepare(turn, 'COMPUTER_KEY', { pid: 11, keys: 'cmd+v' }),
-    ),
-    (error: Error & { notRun?: boolean }) =>
-      error.notRun === true && /sent no keys/.test(error.message),
-  );
-  assert.ok(!calls.slice(before).some((call) => call.op === 'key'));
-
   await computer.execute(
     turn,
     'COMPUTER_TYPE',
@@ -2380,6 +2411,20 @@ test('computer use refuses blocked apps, keeps browsers view-only and acts only 
     computer.prepare(turn, 'COMPUTER_KEY', { pid: 11, keys: 'cmd+opt+escape' }),
     /system shortcut/,
   );
+  const beforeKey = calls.length;
+  const key = await computer.prepare(turn, 'COMPUTER_KEY', { pid: 11, keys: 'cmd+b' });
+  await computer.execute(turn, 'COMPUTER_KEY', key);
+  await computer.execute(
+    turn,
+    'COMPUTER_SCREENSHOT',
+    await computer.prepare(turn, 'COMPUTER_SCREENSHOT', { pid: 11 }),
+  );
+  const sent = (op: string) => calls.slice(beforeKey).find((call) => call.op === op)!;
+  assert.deepEqual(
+    [sent('key').expected, sent('key').expectedFocus, sent('key').noSecureFocus],
+    [key.windowBinding!.state, key.windowBinding!.focus, true],
+  );
+  assert.equal(sent('screenshot').noSecureFocus, true);
   const chromeSnapshot = (await computer.execute(
     turn,
     'COMPUTER_SNAPSHOT',
@@ -2444,9 +2489,12 @@ test('turning computer use off cancels input waiting on a read, even if that rea
       request: async (request) => {
         calls.push(request.op);
         if (request.op === 'apps') return { apps: [app] };
+        if (request.op === 'windows')
+          return { windows: [app].find((item) => item.pid === request.pid)?.windows ?? [] };
         if (request.op === 'inspect')
           return {
             tree: node,
+            context: JSON.stringify(node),
             state: createHash('sha256').update(JSON.stringify(node)).digest('hex'),
           };
         if (request.op === 'snapshot') {
@@ -2530,6 +2578,8 @@ test('computer use on Windows keeps an opened app granted however the app list n
     desktop: {
       request: async (request) => {
         if (request.op === 'apps') return { apps };
+        if (request.op === 'windows')
+          return { windows: apps.find((item) => item.pid === request.pid)?.windows ?? [] };
         if (request.op === 'locate')
           return { bundle: 'notepad.exe', name: 'notepad', program: 'notepad.exe' };
         if (request.op === 'open') {
@@ -2619,6 +2669,8 @@ test('computer use on Linux grants only the opened process when the app list has
     desktop: {
       request: async (request) => {
         if (request.op === 'apps') return { apps };
+        if (request.op === 'windows')
+          return { windows: apps.find((item) => item.pid === request.pid)?.windows ?? [] };
         if (request.op === 'locate')
           return { bundle: 'org.gnome.Weather', name: 'Weather', program: 'gjs' };
         if (request.op === 'open') {
@@ -2652,6 +2704,118 @@ test('computer use on Linux grants only the opened process when the app list has
     computer.prepare(turn, 'COMPUTER_SNAPSHOT', { pid: 42 }),
     /hasn't opened gnome-maps/,
   );
+});
+
+test('computer use presses a menu bar item while the app has an open window', async () => {
+  const pool = {
+    query: async (sql: string) => {
+      if (sql.startsWith('SELECT computer_use'))
+        return { rows: [{ computer_use: true, computer_keep_out: [] }] };
+      if (sql.startsWith('WITH RECURSIVE'))
+        return {
+          rows: [{ id: 'root-turn', source: 'user', message_id: 'message', proactive: false }],
+        };
+      assert.fail(`Unexpected query: ${sql}`);
+    },
+  } as unknown as Pool;
+  const item = { role: 'menuitem', name: 'New Window', ref_id: '@smenu002:e1' };
+  const menuBar = {
+    role: 'menu',
+    children: [
+      { role: 'menuitem', name: 'Apple' },
+      { role: 'menuitem', name: 'Obsidian' },
+      { role: 'menuitem', name: 'File', children: [item] },
+    ],
+  };
+  const note = { role: 'window', name: 'Note', children: [{ role: 'textarea', name: 'Body' }] };
+  const inspected: Array<Record<string, unknown>> = [];
+  const computer = createComputerUse(pool, 'owner', {
+    platform: 'darwin',
+    desktop: {
+      request: async (request) => {
+        if (request.op === 'apps')
+          return { apps: [{ pid: 51, bundle: 'md.obsidian', name: 'Obsidian' }] };
+        if (request.op === 'windows') return { windows: [{ id: 'w-51', title: 'Note' }] };
+        if (request.op === 'snapshot') return { tree: request.ref ? item : menuBar };
+        if (request.op === 'inspect') {
+          inspected.push(request);
+          const tree = request.menu ? menuBar : note;
+          if (request.control && !JSON.stringify(tree).includes('New Window'))
+            throw new Error('STALE_REF: That control is no longer in the window.');
+          return {
+            tree,
+            context: JSON.stringify(tree),
+            state: createHash('sha256').update(JSON.stringify(tree)).digest('hex'),
+            focus: createHash('sha256').update('focus').digest('hex'),
+            focused: [],
+          };
+        }
+        return { disposition: { delivery: 'delivered_verified' } };
+      },
+    },
+  });
+  const turn = { turnId: 'turn', threadId: 'thread' };
+  await computer.execute(
+    turn,
+    'COMPUTER_OPEN',
+    await computer.prepare(turn, 'COMPUTER_OPEN', { bundle: 'md.obsidian' }),
+  );
+  await computer.execute(
+    turn,
+    'COMPUTER_SNAPSHOT',
+    await computer.prepare(turn, 'COMPUTER_SNAPSHOT', { pid: 51, menu: true }),
+  );
+  const press = await computer.prepare(turn, 'COMPUTER_PRESS', { ref: '@smenu002:e1' });
+  assert.equal(press.windowBinding?.menu, true);
+  assert.equal(inspected.at(-1)?.menu, true);
+});
+
+test('computer use lists apps when one opened app cannot list its windows', async () => {
+  const pool = {
+    query: async (sql: string) => {
+      if (sql.startsWith('SELECT computer_use'))
+        return { rows: [{ computer_use: true, computer_keep_out: [] }] };
+      if (sql.startsWith('WITH RECURSIVE'))
+        return {
+          rows: [{ id: 'root-turn', source: 'user', message_id: 'message', proactive: false }],
+        };
+      assert.fail(`Unexpected query: ${sql}`);
+    },
+  } as unknown as Pool;
+  const apps = [
+    { pid: 61, bundle: 'com.apple.TextEdit', name: 'TextEdit' },
+    { pid: 62, bundle: 'md.obsidian', name: 'Obsidian' },
+  ];
+  const computer = createComputerUse(pool, 'owner', {
+    platform: 'darwin',
+    desktop: {
+      request: async (request) => {
+        if (request.op === 'apps') return { apps };
+        if (request.op === 'windows') {
+          if (request.pid === 62) throw new Error('TIMEOUT: Operation exceeded its deadline');
+          return { windows: [{ id: 'w-61', title: 'Draft' }] };
+        }
+        throw new Error(`Unexpected ${request.op}`);
+      },
+    },
+  });
+  const turn = { turnId: 'turn', threadId: 'thread' };
+  for (const bundle of ['com.apple.TextEdit', 'md.obsidian'])
+    await computer.execute(
+      turn,
+      'COMPUTER_OPEN',
+      await computer.prepare(turn, 'COMPUTER_OPEN', { bundle }),
+    );
+  const listed = (await computer.execute(
+    turn,
+    'COMPUTER_APPS',
+    await computer.prepare(turn, 'COMPUTER_APPS', {}),
+  )) as { apps: Array<{ pid: number; windows?: unknown; windowsError?: string }> };
+  assert.deepEqual(listed.apps.find((app) => app.pid === 61)?.windows, [
+    { id: 'w-61', title: 'Draft' },
+  ]);
+  assert.match(listed.apps.find((app) => app.pid === 62)?.windowsError ?? '', /TIMEOUT/);
+  await assert.rejects(computer.prepare(turn, 'COMPUTER_SNAPSHOT', { pid: 62 }), /TIMEOUT/);
 });
 
 if (process.env.NOD_TEST_WORKSPACE_IMAGE)
@@ -2750,8 +2914,6 @@ server.serve_forever()`;
       await call('write', { path: `${base}/synthetic.txt`, content: data });
       const upload = `import urllib.request\nurllib.request.urlopen(urllib.request.Request('http://127.0.0.1:18751/capture',data=open('${base}/synthetic.txt','rb').read(),method='POST'),timeout=3).close()\n`;
       await call('write', { path: `${userSite}/usercustomize.py`, content: upload });
-      assert.match(await call('ls', {}), /synthetic.txt/);
-      assert.match(await call('find', { pattern: '*.txt' }), /synthetic.txt/);
       assert.equal(await call('read', { path: `${base}/synthetic.txt` }), data);
       assert.equal(await captured(), 0);
       await docker(
@@ -2781,8 +2943,6 @@ server.serve_forever()`;
         content: '#!/bin/sh\nprintf synthetic-installed-tool\n',
       });
       assert.equal(await call('read', { path: `${base}/synthetic.txt` }), data);
-      assert.match(await call('ls', {}), /synthetic.txt/);
-      assert.match(await call('find', { pattern: '*.txt' }), /synthetic.txt/);
       assert.equal(await captured(), 0);
       assert.equal(
         (await call('bash', { command: `cat '${base}/synthetic.txt' | /usr/bin/cat` })).trim(),

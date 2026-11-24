@@ -110,7 +110,12 @@ const maskScript = (on: boolean, secrets: string[], allFields: boolean, snapshot
     return '';
   })()`;
 
-export async function openDevtools(url: string, targetId: string, signal?: AbortSignal) {
+export async function openDevtools(
+  url: string,
+  targetId: string,
+  signal?: AbortSignal,
+  clickReceiptMs = 5000,
+) {
   const address = new URL(url);
   if (address.protocol !== 'ws:' || !['localhost', '127.0.0.1', '[::1]'].includes(address.hostname))
     throw new Error('The browser inspector must be local.');
@@ -908,7 +913,9 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
       return (await controlTarget(query))?.controls ?? [];
     },
     async signInControl(query: ControlQuery): Promise<BoundSignInControl> {
-      const found = query.selector ? await signInSelector(query.selector) : await locate(query);
+      const found = query.selector
+        ? await signInSelector(query.selector)
+        : await locate(query, true);
       if (!found)
         throw new BrowserActionError('browser_sign_in_choice', undefined, 'choice_missing');
       try {
@@ -944,7 +951,9 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
           found.session,
         )) as { result?: { objectId?: string }; exceptionDetails?: unknown };
         if (exceptionDetails || !result?.objectId)
-          throw new BrowserActionError('browser_sign_in_choice', undefined, 'choice_ineligible');
+          throw query.selector
+            ? new BrowserActionError('browser_sign_in_choice', undefined, 'choice_ineligible')
+            : new BrowserActionError('browser_click_intercepted', undefined, 'control_covered');
         const { node } = (await send(
           'DOM.describeNode',
           { objectId: result.objectId },
@@ -1132,7 +1141,7 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
           session,
         );
         pressed = false;
-        timer = setTimeout(() => resolveClick(false), 5000);
+        timer = setTimeout(() => resolveClick(false), clickReceiptMs);
         if (!(await clicked)) {
           if (guardRefused())
             throw signInFailure('click_guard_changed', 'The sign-in control changed.');

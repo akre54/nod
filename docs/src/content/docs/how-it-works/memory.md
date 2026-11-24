@@ -64,7 +64,7 @@ flowchart TD
   rank --> answer[Pi answers, streaming as it writes]:::go
 ```
 
-The memory model selects existing notes. It can connect an indirect question to a preference or possession. It expands search terms with related concepts and source names, then ranks the returned messages. The server accepts only note paths and message IDs from the supplied records. Model-written facts do not enter this evidence packet or memory.
+The memory model selects existing notes. It can connect an indirect question to a preference or possession. It expands search terms with related concepts and source names, then ranks the returned messages. The server accepts only note paths and message IDs from the supplied records. Model-written facts do not enter this evidence packet or memory. When the memory model fails a request and you have [backup models](/connect/models/#backup-models), this selection moves to the next one.
 
 For this selection, Nod sends at most 4,000 characters of the current request and 1,200 characters from each of up to six recent owner messages to the memory model. Long messages keep their beginning and end with an omission marker between them. Full messages remain available through conversation search when the task needs their contents.
 
@@ -88,7 +88,7 @@ Selection can make mistakes. If a call fails or returns invalid data, Nod keeps 
 
 ## How the model saves memory
 
-The memory tools are actions of Pi's `manage_personal_context` tool. Pi never writes a note. `memory_learn` names the owner's messages, and the memory model writes the notes from them:
+The memory tools are actions of Pi's `memory` tool. Pi never writes a note. `memory_learn` names the owner's messages, and the memory model writes the notes from them:
 
 ```mermaid
 flowchart LR
@@ -155,7 +155,7 @@ Completed events and other structured facts do not expire only because they were
 
 ### Reflect
 
-Reflection reads owner messages written since the last batch, 40 at a time, until it has caught up. It skips assistant text, tool results, attachments, messages over 4,000 characters, messages under 10 minutes old, messages with secrets, messages of a [withdrawn turn](/how-it-works/threads-and-turns/#stop-and-failures), and task-card titles the owner tapped, which are Nod's wording.
+Reflection reads owner messages written since the last batch, 40 at a time, until it has caught up. It skips assistant text, tool results, attachments, messages over 4,000 characters, messages under 10 minutes old, messages with secrets, messages of a [withdrawn turn](/how-it-works/threads-and-turns/#stop-and-failures), and task-card titles the owner tapped, which are Nod's wording. [Schedule ideas](/use/schedules/#ideas-from-your-messages) read their messages through the same filter.
 
 - A small model from the selected connection proposes operations: add an entry, or archive an inferred one that a newer message replaces or says is wrong. An add that would overflow the file is skipped.
 - It records what the owner says about their life, including what a request reveals: people, places, possessions, events, plans, numbers, interests and preferences, one fact per entry. Each message comes with the time it was sent, so an entry about an event starts with its date, with words like "yesterday" resolved.

@@ -887,7 +887,7 @@ test('an uncertain effect needs a strong separate check before it can become pri
   }
 });
 
-test('every checker must quote owner words for Nod settings, sign-in, uploads and opening apps or files', () => {
+test('every checker must cite owner words for Nod settings, sign-in, uploads and opening apps or files', () => {
   const words = {
     userMessages: [{ at: '2033-06-20T18:30:00Z', text: 'Perform the synthetic action now.' }],
   };
@@ -909,24 +909,32 @@ test('every checker must quote owner words for Nod settings, sign-in, uploads an
       action: { name, arguments: name === 'NOD_browser' ? { step: 'upload' } : {} },
     };
     assert.equal(
-      trustBasis({ run: true, because: 'read' }, withOwnerIds(input, ['owner-message'])),
+      trustBasis({ run: true, source: 'read' }, withOwnerIds(input, ['owner-message'])),
       undefined,
     );
     assert.equal(
       trustBasis(
-        { run: true, because: words.userMessages[0].text },
+        { run: true, source: 'message:0', terms: [] },
         withOwnerIds(input, ['owner-message']),
       )?.kind,
       'message',
     );
   }
-  for (const source of ['standingInstruction', 'userRules']) {
-    const input = {
-      action: { name: 'NOD_limits_update' },
-      [source]: 'Set the task check-in to USD 7.',
-    };
-    assert.equal(trustBasis({ run: true, because: input[source] }, input), undefined);
-  }
+  const action = { name: 'NOD_limits_update' };
+  assert.equal(
+    trustBasis(
+      { run: true, source: 'standing', terms: [] },
+      { action, standingInstruction: 'Set the task check-in to USD 7.' },
+    ),
+    undefined,
+  );
+  assert.equal(
+    trustBasis(
+      { run: true, source: 'rules', terms: [] },
+      { action, userRules: 'Set the task check-in to USD 7.' },
+    )?.kind,
+    'rule',
+  );
 });
 
 function withOwnerIds<

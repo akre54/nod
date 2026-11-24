@@ -1,4 +1,14 @@
-import { lazy, memo, Suspense, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import {
+  lazy,
+  memo,
+  Suspense,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
+import { TaskMark } from './task-mark';
 import { createPortal } from 'react-dom';
 import { Copy, Check, CornerUpLeft, Ellipsis, SmilePlus } from './icons';
 import Markdown from 'react-markdown';
@@ -240,12 +250,12 @@ export const MessageText = memo(function MessageText({
               if (href === telegramUrl) return <TelegramChatLink href={telegramUrl} />;
               const linkText = messageLinkText(node?.children ?? []);
               const setup = setupLink(link, linkText);
-              if (setup && actions.some((action) => action.href === setup.href))
-                return (
-                  <strong className="setup-phrase">
-                    {linkText.trim() && !linkText.includes(setup.href) ? children : setup.label}
-                  </strong>
-                );
+              if (setup && actions.some((action) => action.href === setup.href)) {
+                const phrase = linkText.trim().replace(/\s+/g, ' ');
+                const bare = !phrase || phrase.includes(setup.href);
+                if (!connected(setup.href) && (bare || phrase === setup.label)) return null;
+                return <strong className="setup-phrase">{bare ? setup.label : children}</strong>;
+              }
               return (
                 <a
                   href={link.kind === 'external' ? href : link.href}
@@ -296,14 +306,19 @@ type MessagePanel =
 export interface MessageWork {
   title: string;
   status: 'needs_you' | 'working' | 'idle';
+  done?: boolean;
   live?: Activity;
   onOpen?(): void;
 }
 
-function WorkLabel({ work }: { work: MessageWork }) {
+export function WorkLabel({ work }: { work: MessageWork }) {
   const content = (
     <>
-      {work.status !== 'idle' && <span className="message-work-dot" aria-hidden="true" />}
+      {work.status !== 'idle' ? (
+        <TaskMark status={work.status} size={22} />
+      ) : (
+        work.done && <TaskMark status="done" size={22} />
+      )}
       <span className="message-work-title">{work.title}</span>
       {work.status === 'working' && (
         <span className="message-work-step">
@@ -341,13 +356,17 @@ export function MessageBubble({
   onAnswer,
   answersDisabled,
   onApprove,
+  onStopTask,
+  taskStopped,
   codeRequest,
   handoff,
   handoffPaused,
   work,
+  task,
 }: {
   message: Message;
   work?: MessageWork;
+  task?: ReactNode;
   pendingAudio?: ImagePreview;
   connectedAppIds?: ReadonlySet<string>;
   grouped?: boolean;
@@ -357,6 +376,8 @@ export function MessageBubble({
   onAnswer?: AnswerChoicesProps['onAnswer'];
   answersDisabled?: boolean;
   onApprove?(approved: boolean, label: string): Promise<boolean | 'unavailable'>;
+  onStopTask?(): Promise<void>;
+  taskStopped?: boolean;
   codeRequest?: 'otp' | 'payment';
   handoff?: boolean;
   handoffPaused?: boolean;
@@ -385,6 +406,10 @@ export function MessageBubble({
               ? 'answered'
               : null;
   const cardText = card ? splitQuestion(visibleText) : null;
+  const shownText =
+    message.role === 'assistant' && message.approval?.fields && message.approval.cardQuestion
+      ? message.approval.cardQuestion
+      : visibleText;
   const cardTitle = cardText && (
     <MessageText text={cardText.question} connectedAppIds={connectedAppIds} />
   );
@@ -776,6 +801,8 @@ export function MessageBubble({
                   approval={message.approval!}
                   disabled={answersDisabled}
                   onAnswer={onApprove}
+                  onStopTask={onStopTask}
+                  taskStopped={taskStopped}
                 >
                   {cardTitle}
                 </ApprovalChoiceCard>
@@ -795,9 +822,9 @@ export function MessageBubble({
                   title={cardTitle}
                 />
               ) : (
-                visibleText && (
+                shownText && (
                   <MessageText
-                    text={visibleText}
+                    text={shownText}
                     connectedAppIds={connectedAppIds}
                     handoff={!streaming && handoff}
                     handoffPaused={handoffPaused}
@@ -953,6 +980,7 @@ export function MessageBubble({
             )}
           </div>
         </div>
+        {task && <div className="message-task">{task}</div>}
         {message.role === 'assistant' && !streaming && message.presentation?.type === 'apps' && (
           <MessagePresentation value={message.presentation} messageId={message.id} />
         )}

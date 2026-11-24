@@ -1,10 +1,10 @@
 {
-  "version": "0.9.1",
-  "previousTag": "nod-v0.9.0",
-  "source": "71a46bf5499efd6e24a5a8d33dd2d4b8a92f3079",
-  "highlights": "## ✋ Nod asks less\n\nNod now aims to ask only before steps that commit you to something. That means sending, posting, booking, paying, deleting or changing your account. Searching, comparing, picking dates or passengers and filling in forms go ahead without a question.\n\nTry telling Nod: “Find the cheapest flight from Berlin to Lisbon next Friday for two adults. Don’t book anything.” Nod searches and reports back. It asks before it books or pays.\n\nWant a check first? Say “ask me before you send it.” Nod shows you the exact action and waits for your yes.\n\n## 📅 See what your schedules are doing\n\nOpen a scheduled run to see its current activity and completed steps. Each completed step appears once.\n\n## Also in this release\n\n- **Telegram:** Approve or decline requests with buttons in Telegram.\n- **Models:** When a provider rejects your key, Nod asks you to reconnect. Failed connections keep the service’s reason.\n- **Connections:** Rename custom MCP connections.\n- **Chat:** Paste a link over selected text to turn it into a link.\n- **Startup help:** Send a startup report even when chat cannot open.\n- **Privacy:** Bug reports mask more personal details. Review the report before you send it.\n- **Mac updates:** Update checks wait until an update already in progress finishes.",
+  "version": "0.9.6",
+  "previousTag": "nod-v0.9.5",
+  "source": "6670bc233b6b7dddaa75b25b89b4a89f0e92bcac",
+  "highlights": "## One request covers every step\n\nWhen you ask Nod for something, that request now covers each step of it. Moving a batch of emails, renaming several files, or a task you started with a short \"go ahead\" no longer asks you again for every part. Approvals that could not be answered before can now be answered. Actions you didn't ask for still need your yes, and an approved action still runs only once.\n\n## Fixed in this release\n\n- **Full disk:** When your computer runs out of space, Nod now says so and asks you to free some up, instead of reporting an unexpected error.\n- **Lost connection:** When Nod loses one of the services it runs on your computer, it tells you and asks you to restart Nod.\n- **Bug reports:** Reports now name the kind of error, and startup reports name the step that failed. If Nod doesn't start, select **Report bug** and send the report so we can find the cause.\n- **Mistral:** When you connect Mistral with a key it rejects, Nod now shows Mistral's reason.\n- **Model providers:** Your requests now show up as Nod in your OpenRouter and Vercel AI Gateway activity.",
   "video": {
-    "url": "https://github.com/user-attachments/assets/18835c1c-118f-41a8-91c5-f93cac6cc871",
-    "releaseSha256": "c080d28500d1d3a8be116dd54383bf93adb8ebbad0d23df165743e1a59e18d55"
+    "url": "https://github.com/user-attachments/assets/17d63452-06ef-4930-a63f-6cf96f3e7c86",
+    "releaseSha256": "ee4ed1215e2d29251140ebe83041bab2d820e55618283faa3641d8f4f7f32df6"
   }
 }

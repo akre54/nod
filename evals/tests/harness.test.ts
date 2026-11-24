@@ -834,8 +834,7 @@ test('decision term protocols reject malformed refusals and fabricated anchors w
 test('decision stages preserve original input and primary output while charging each receipt once', async () => {
   const item = selectDecisionCases(['send-requested'])[0]!;
   const original = JSON.stringify(item.input);
-  const owner = (item.input as { userMessages: Array<{ text: string }> }).userMessages[0]!.text;
-  const primary = { run: true, because: owner };
+  const primary = { run: true, source: 'message:0', terms: [] };
   const secondary = {
     verdict: 'compatible',
     comparisons: [],
@@ -907,7 +906,7 @@ test('decision term refusals score only valid protocols and retain provider fail
     expected: false,
     holdout: false,
   };
-  const primary = { run: true, because: decisionTermsInput.userMessages[0]!.text };
+  const primary = { run: true, source: 'message:0', terms: [] };
   const unresolved = {
     ...changedDecisionTerms,
     verdict: 'unresolved',
@@ -961,18 +960,11 @@ test('decision term refusals score only valid protocols and retain provider fail
 
 test('decision routing skips terms for reads, preparation, denials and historical paths', async () => {
   const item = selectDecisionCases(['send-requested'])[0]!;
-  const owner = (item.input as { userMessages: Array<{ text: string }> }).userMessages[0]!.text;
   for (const [mode, output, expected, status, route] of [
     ['basis-and-terms', { run: true, because: 'read' }, true, 'scored', 'read'],
     ['basis-and-terms', { run: false }, false, 'scored', 'denied'],
-    [
-      'basis-and-terms',
-      { run: true, because: 'unseen permission' },
-      false,
-      'error',
-      'invalid-basis',
-    ],
-    ['basis', { run: true, because: owner }, true, 'scored', 'basis'],
+    ['basis-and-terms', { run: true, source: 'message:9' }, false, 'error', 'invalid-basis'],
+    ['basis', { run: true, source: 'message:0', terms: [] }, true, 'scored', 'basis'],
     ['raw', { run: true }, true, 'scored', 'raw'],
     ['raw', { run: 'read' }, true, 'scored', 'raw'],
     ['raw', { run: 'requested' }, true, 'scored', 'raw'],
@@ -1002,10 +994,7 @@ test('decision routing skips terms for reads, preparation, denials and historica
 
 test('decision budget and unknown usage stop between stages without scoring partial authorization', async () => {
   const item = selectDecisionCases(['send-requested'])[0]!;
-  const primary = {
-    run: true,
-    because: (item.input as { userMessages: Array<{ text: string }> }).userMessages[0]!.text,
-  };
+  const primary = { run: true, source: 'message:0', terms: [] };
   for (const reason of ['budget', 'unpriced'] as const) {
     let spent = 0;
     let calls = 0;
@@ -2954,7 +2943,7 @@ test('the stack records tool calls, model usage and the main prompts of every tu
           options.onEvent(usage('main'));
           await tool('apps').execute({ action: 'GMAIL_FETCH_EMAILS', args: {} });
           await tool('browser').execute({ action: 'fill', selector: '@e1', text: 'private' });
-          await tool('manage_personal_context').execute({
+          await tool('memory').execute({
             action: 'memory_find',
             args: { query: 'private' },
           });
@@ -2974,6 +2963,7 @@ test('the stack records tool calls, model usage and the main prompts of every tu
     sessionId: 'capture-fixture',
     turnId: 'capture-fixture',
     prompt: 'Inspect the synthetic receipt.',
+    background: true,
     history: [],
     workspacePath: directory,
     signal: t.signal,
@@ -3013,12 +3003,8 @@ test('the stack records tool calls, model usage and the main prompts of every tu
     ['tool_end', 'apps', 'succeeded', { messages: ['Receipt'] }],
     ['tool_start', 'browser', { action: 'fill', selector: '@e1', text: '[redacted]' }],
     ['tool_end', 'browser', 'succeeded', 'URL: https://example.com\nFixture page'],
-    [
-      'tool_start',
-      'manage_personal_context',
-      { action: 'memory_find', args: '[private memory omitted]' },
-    ],
-    ['tool_end', 'manage_personal_context', 'succeeded', '-'],
+    ['tool_start', 'memory', { action: 'memory_find', args: '[private memory omitted]' }],
+    ['tool_end', 'memory', 'succeeded', '-'],
     ['tool_start', 'delegate', { title: 'Part', instruction: 'Do one part.' }],
     ['model_usage', 'child'],
     ['tool_end', 'delegate', 'succeeded', 'The subagent finished without an answer.'],

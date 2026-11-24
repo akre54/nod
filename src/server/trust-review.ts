@@ -39,6 +39,19 @@ export function createTrustReview(options: {
     signal?.throwIfAborted();
     if (!decisions) return options.review(instructions, input, signal, llmQuestion);
     if (decisions.configured === false) return undefined;
+    const said = (input as TrustWords).userMessages;
+    if (!question && said?.some((message) => message.replyTo !== undefined)) {
+      const latest = said.at(-1)?.replyTo;
+      const entries: Array<[string, unknown]> = [];
+      for (const [key, value] of Object.entries(input)) {
+        if (key !== 'userMessages') entries.push([key, value]);
+        else {
+          entries.push([key, said.map(({ replyTo: _, ...message }) => message)]);
+          if (latest) entries.push(['assistantMessageBeforeLatestUserMessage', latest]);
+        }
+      }
+      input = Object.fromEntries(entries);
+    }
     const gate = question ? undefined : trustDecision(input as TrustWords);
     const policy = instructions.replace(/^Reply with only JSON\..*\n/m, '');
     let jev: DecisionSelection | undefined;

@@ -234,6 +234,7 @@ async function vaultFixture(emailCode?: Parameters<typeof createVault>[1]['email
     url: 'https://example.com/login',
   });
   let cancelAtCommit: string | undefined;
+  let absent: string | undefined;
   const database = new Proxy(pool, {
     get(target, member) {
       if (member === 'connect')
@@ -265,7 +266,10 @@ async function vaultFixture(emailCode?: Parameters<typeof createVault>[1]['email
     emailCode,
     requestKey: Buffer.alloc(32, 42),
     keyStore: { id: 'fixture', configured: true, getKey: async () => randomBytes(32) },
-    page: () => inspecting(),
+    page: async (_id, step) => ({
+      ...(await inspecting()),
+      ...(step?.selector && step.selector === absent ? { controls: [] } : {}),
+    }),
     inject: async () => {
       calls.injected++;
     },
@@ -305,6 +309,9 @@ async function vaultFixture(emailCode?: Parameters<typeof createVault>[1]['email
     calls,
     cancelBeforeEntry(turnId: string) {
       cancelAtCommit = turnId;
+    },
+    removeFromPage(selector?: string) {
+      absent = selector;
     },
     resumed: async () =>
       (
@@ -413,6 +420,57 @@ test(
         ).rows,
         [{ status: 'not_entered' }, { status: 'not_entered' }],
       );
+    } finally {
+      await f.close();
+    }
+  },
+);
+
+test(
+  'a sign-in step for a control that is not on the page is refused before a saved login is spent',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async () => {
+    const f = await vaultFixture();
+    try {
+      const step = {
+        origin: 'https://example.com',
+        label: 'Example',
+        kind: 'password' as const,
+        usernameSelector: '#username',
+        passwordSelector: '#password',
+        submitSelector: '#sign-in',
+      };
+      const entry = await f.vault.saveLogin({
+        label: 'Example',
+        origin: step.origin,
+        username: 'synthetic@example.com',
+        password: 'fixture-secret',
+      });
+      const missing = /not on the current page, so nothing was entered/;
+      const turn = await f.turn();
+      for (const selector of ['#username', '#password', '#sign-in']) {
+        f.removeFromPage(selector);
+        await assert.rejects(f.vault.request(turn, 'local-development', step), missing);
+        await assert.rejects(f.vault.fillSaved(turn, 'local-development', entry.id, step), missing);
+      }
+      assert.equal((await f.pool.query('SELECT 1 FROM credential_requests')).rowCount, 0);
+      assert.equal((await f.pool.query('SELECT 1 FROM vault_uses')).rowCount, 0);
+      f.removeFromPage();
+      assert.equal(await f.vault.fillSaved(turn, 'local-development', entry.id, step), true);
+      assert.equal(f.calls.injected, 1);
+
+      const later = await f.turn();
+      const url = await f.link(later);
+      await f.wait(later);
+      f.removeFromPage('#password');
+      const refused = await f.submit(url);
+      assert.equal(refused.statusCode, 409, refused.body);
+      assert.match(refused.json().error, missing);
+      assert.equal(await f.status(url), 'pending');
+      assert.equal(f.calls.injected, 1);
+      f.removeFromPage();
+      assert.equal((await f.submit(url)).statusCode, 200);
+      assert.equal(f.calls.injected, 2);
     } finally {
       await f.close();
     }
@@ -3683,6 +3741,7 @@ test(
       provider,
       baseUrl: 'http://localhost:4310',
       wake: async () => {},
+      emailCodePollMs: 50,
     });
     const connection = randomUUID();
     await pool.query(
@@ -4453,6 +4512,7 @@ import assert from 'node:assert/strict';
 import {mkdtemp,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {mock} from 'node:test';
 import {JSDOM} from 'jsdom';
 import {createSettingsStore} from './desktop/main/settings.mjs';
 const directory=await mkdtemp(join(tmpdir(),'nod-native-preferences-'));
@@ -4522,11 +4582,13 @@ globalThis.EventSource=class{
 };
 let root=createRoot(document.getElementById('root'));
 const render=()=>act(async()=>root.render(createElement(Onboarding,{user:session.user,onComplete:async()=>{completions++;assert.equal(preparationCompleted,true,'No completion before server preparation finishes')}})));
-const settle=()=>act(async()=>{await new Promise(resolve=>setTimeout(resolve,20))});
+const realTimeout=setTimeout;
+mock.timers.enable({apis:['setTimeout']});
+const settle=()=>act(async()=>{await new Promise(resolve=>realTimeout(resolve,20));mock.timers.tick(20)});
 const waitFor=async condition=>{for(let at=0;at<100&&!(await condition());at++)await settle();assert.ok(await condition())};
 const button=text=>[...document.querySelectorAll('button')].find(value=>value.textContent.trim()===text);
 const changed=()=>act(async()=>stream.onmessage(new dom.window.MessageEvent('message',{data:JSON.stringify({type:'refresh'})})));
-const waitForModel=async condition=>{for(let at=0;at<200&&!condition();at++)await settle();assert.ok(condition())};
+const waitForModel=async condition=>{for(let at=0;at<200&&!condition();at++)await act(async()=>{mock.timers.tick(20);await new Promise(resolve=>setImmediate(resolve))});assert.ok(condition())};
 await render();
 assert.equal(window.location.search,'');
 await waitFor(()=>button('Try again'));
@@ -4619,7 +4681,7 @@ const beforeAboutRefresh=modelReads;
 await changed();
 await waitForModel(()=>modelReads>beforeAboutRefresh);
 assert.ok(document.querySelector('[data-step="about"]'));
-for(let at=0;at<10&&!document.querySelector('[data-step="brain"]');at++){await act(async()=>{await new Promise(resolve=>setTimeout(resolve,1000))});if(button('Not now'))await act(async()=>button('Not now').click())}
+for(let at=0;at<10&&!document.querySelector('[data-step="brain"]');at++){await settle();if(button('Not now'))await act(async()=>button('Not now').click())}
 await waitFor(()=>document.querySelector('[data-step="brain"]'));
 await waitForModel(()=>document.querySelector('.ob-brain-connected details')?.textContent.includes(modelFailure));
 modelFailure=undefined;
@@ -4933,7 +4995,19 @@ test(
           assert.equal(rows[0].next_deadline.getTime(), rows[0].first_deadline.getTime());
           const waitMs = rows[0].first_deadline.getTime() - Date.now() + 100;
           assert.ok(waitMs > 0 && waitMs < 5_100);
-          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          await pool.query(
+            "UPDATE credential_requests SET flow_expires_at=flow_expires_at-$2::int*interval '1 millisecond' WHERE turn_id=ANY($1::uuid[])",
+            [[firstTurn.turnId, nextTurn.turnId], waitMs],
+          );
+          assert.equal(
+            (
+              await pool.query(
+                'SELECT 1 FROM credential_requests WHERE turn_id=ANY($1::uuid[]) AND flow_expires_at<clock_timestamp()',
+                [[firstTurn.turnId, nextTurn.turnId]],
+              )
+            ).rowCount,
+            2,
+          );
           assert.equal((await get(nextPath)).status, 'pending');
           assert.equal(
             (await app.inject({ method: 'GET', url: `${nextPath}/status` })).json().status,

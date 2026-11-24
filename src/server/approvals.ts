@@ -46,7 +46,6 @@ export interface ApprovalWork {
   kind: 'schedule' | 'task';
   title: string;
   ownerRequest?: string;
-  waitsForAnswer?: true;
 }
 
 export interface ApprovalDescription {
@@ -60,7 +59,9 @@ export interface ApprovalDescription {
 
 export interface ApprovalPresentation {
   question: string;
+  cardQuestion?: string;
   action: string;
+  decline?: string;
 }
 
 export interface ApprovalRepeat {
@@ -89,13 +90,23 @@ export type ChatConfirmationResult =
   | { waiting: { id: string; session_id: string; background: boolean } }
   | undefined;
 
-function chatConfirmationSql(match: string) {
+const deliveredSql = (message: string, owner: string, channel: string) =>
+  `EXISTS (SELECT 1 FROM channel_outbox o JOIN channel_inbox ci ON ci.source_id=o.source_id
+    WHERE o.message_id=${message} AND o.state='sent' AND ci.owner_id=${owner} AND ci.channel=${channel})`;
+
+async function channelsReady() {
+  return Boolean((await pool.query("SELECT to_regclass('channel_outbox') AS name")).rows[0]?.name);
+}
+
+function chatConfirmationSql(match: string, delivered = false) {
   return `SELECT a.*,u.source AS turn_source,u.status AS turn_status,u.background AS turn_background,u.session_id AS turn_session_id,u.prompt AS turn_prompt,to_jsonb(u)->>'task_id' AS turn_task_id
   FROM approvals a JOIN turns u ON u.id=a.turn_id
   WHERE ${match}
     AND a.owner_id=$2 AND u.owner_id=$2 AND a.thread_id=$3 AND u.thread_id=$3
     AND (u.channel=$4 OR a.confirmation_message_id=COALESCE((SELECT m.reply_to_message_id FROM messages m
-      WHERE m.id=$5::uuid AND m.owner_id=$2 AND m.thread_id=$3 AND m.role='assistant' AND m.turn_id IS NULL AND m.hidden_at IS NULL),$5::uuid))
+      WHERE m.id=$5::uuid AND m.owner_id=$2 AND m.thread_id=$3 AND m.role='assistant' AND m.turn_id IS NULL AND m.hidden_at IS NULL),$5::uuid)${
+        delivered ? ` OR ${deliveredSql('a.confirmation_message_id', '$2', '$4')}` : ''
+      })
     AND EXISTS (SELECT 1 FROM messages c WHERE c.id=a.confirmation_message_id AND c.owner_id=a.owner_id AND c.hidden_at IS NULL)
     AND (to_jsonb(u)->>'task_id' IS NULL OR NOT EXISTS (
       SELECT 1 FROM turns n WHERE n.owner_id=u.owner_id AND n.session_id=u.session_id AND n.id<>u.id
@@ -213,7 +224,6 @@ async function workOf(
       kind: 'schedule',
       title: schedule.title,
       ...(ownerRequest ? { ownerRequest } : {}),
-      ...(schedule.kind === 'recurring' ? { waitsForAnswer: true as const } : {}),
     };
   }
   if (!taskId) return undefined;
@@ -236,6 +246,7 @@ async function workOf(
 
 export async function turnOrigin(turnId: string) {
   const client = await pool.connect();
+  let failed = false;
   try {
     const current = await turnRow(client, turnId);
     const chain = current && (await turnChain(client, current));
@@ -273,8 +284,11 @@ export async function turnOrigin(turnId: string) {
           }
         : {}),
     };
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
-    client.release();
+    client.release(failed);
   }
 }
 
@@ -351,7 +365,7 @@ export async function createApprovals(
       prepareConfirmation?: () => Promise<Record<string, unknown>>;
       signal?: AbortSignal;
       sourceMessageId?: string | null;
-      admit?: (asks: boolean) => Promise<void>;
+      admit?: (asks: boolean, read?: boolean) => Promise<void>;
       validate?: (client: PoolClient) => Promise<void>;
       expectedRevision?: number;
       basis?: TrustBasis;
@@ -651,6 +665,8 @@ export async function createApprovals(
     };
     let question: string | undefined;
     let title: string | undefined;
+    let decline: string | undefined;
+    let cardQuestion: string | undefined;
     {
       let existing = await withTurnLock(turn.turnId, (client) => inspect(client, true));
       if ('repeat' in existing && existing.repeat && classifyRepeat) {
@@ -740,6 +756,8 @@ export async function createApprovals(
         );
         question = typeof presentation === 'string' ? presentation : presentation.question;
         title = typeof presentation === 'string' ? undefined : presentation.action;
+        decline = typeof presentation === 'string' ? undefined : presentation.decline;
+        cardQuestion = typeof presentation === 'string' ? undefined : presentation.cardQuestion;
         options.signal?.throwIfAborted();
         if (typeof question !== 'string' || !question.trim())
           throw new Error('The confirmation formatter did not produce a valid question.');
@@ -748,7 +766,7 @@ export async function createApprovals(
       }
     }
     if (!question) {
-      await options.admit?.(false);
+      await options.admit?.(false, options.basis?.kind === 'read');
       options.signal?.throwIfAborted();
     }
     const saveProposal = async (client: PoolClient) => {
@@ -785,7 +803,7 @@ export async function createApprovals(
       );
       const approval = (
         await client.query(
-          "INSERT INTO approvals(id,owner_id,thread_id,turn_id,action,args,status,source_message_id,confirmation_message_id,expected_revision,details,title,instruction_change) VALUES($1,$2,$3,$4,$5,$6,'pending',$7,$8,$9,$10::jsonb,$11,$12::jsonb) RETURNING *",
+          "INSERT INTO approvals(id,owner_id,thread_id,turn_id,action,args,status,source_message_id,confirmation_message_id,expected_revision,details,title,instruction_change,decline,card_question) VALUES($1,$2,$3,$4,$5,$6,'pending',$7,$8,$9,$10::jsonb,$11,$12::jsonb,$13,$14) RETURNING *",
           [
             randomUUID(),
             ownerId,
@@ -799,6 +817,8 @@ export async function createApprovals(
             details ?? null,
             title ?? null,
             instructionChange ? JSON.stringify(instructionChange) : null,
+            decline ?? null,
+            cardQuestion?.trim() || null,
           ],
         )
       ).rows[0];
@@ -834,11 +854,13 @@ export async function createApprovals(
   }
 
   async function confirmationFor(input: ChatConfirmationInput) {
+    const delivered = await channelsReady();
     const target =
       input.replyToMessageId ??
       (
         await pool.query(
-          `SELECT m.id FROM messages m JOIN turns u ON u.id=m.turn_id WHERE m.owner_id=$1 AND u.owner_id=$1 AND m.thread_id=$2 AND u.channel=$3 AND m.role='assistant' AND m.hidden_at IS NULL
+          `SELECT m.id FROM messages m JOIN turns u ON u.id=m.turn_id WHERE m.owner_id=$1 AND u.owner_id=$1 AND m.thread_id=$2 AND m.role='assistant' AND m.hidden_at IS NULL
+           AND (u.channel=$3${delivered ? ` OR ${deliveredSql('m.id', '$1', '$3')}` : ''})
            AND NOT EXISTS (SELECT 1 FROM messages s WHERE s.id=$4 AND s.owner_id=$1 AND s.thread_id=$2 AND date_trunc('milliseconds',s.created_at)<date_trunc('milliseconds',m.created_at))
            AND NOT EXISTS (SELECT 1 FROM messages n WHERE n.owner_id=$1 AND n.thread_id=$2 AND n.role='assistant' AND n.turn_id IS NULL AND n.delivered_channel=$3 AND n.hidden_at IS NULL
              AND (n.created_at,n.id)>(m.created_at,m.id)
@@ -850,8 +872,11 @@ export async function createApprovals(
     if (!target) return undefined;
     return (
       await pool.query(
-        chatConfirmationSql(`a.confirmation_message_id=COALESCE((SELECT m.reply_to_message_id FROM messages m
-         WHERE m.id=$1 AND m.owner_id=$2 AND m.thread_id=$3 AND m.role='assistant' AND m.turn_id IS NULL AND m.hidden_at IS NULL),$1)`),
+        chatConfirmationSql(
+          `a.confirmation_message_id=COALESCE((SELECT m.reply_to_message_id FROM messages m
+         WHERE m.id=$1 AND m.owner_id=$2 AND m.thread_id=$3 AND m.role='assistant' AND m.turn_id IS NULL AND m.hidden_at IS NULL),$1)`,
+          delivered,
+        ),
         [target, ownerId, input.threadId, input.channel, input.replyToMessageId ?? null],
       )
     ).rows[0];
@@ -879,7 +904,10 @@ export async function createApprovals(
     if (!input.answer) return undefined;
     const approval = (
       await client.query(
-        `${chatConfirmationSql(input.clicked ? 'a.id=$1 AND a.confirmation_message_id=$5' : 'a.id=$1')} FOR UPDATE OF a`,
+        `${chatConfirmationSql(
+          input.clicked ? 'a.id=$1 AND a.confirmation_message_id=$5' : 'a.id=$1',
+          await channelsReady(),
+        )} FOR UPDATE OF a`,
         [
           input.answer.approvalId,
           ownerId,
@@ -1208,9 +1236,26 @@ export async function createApprovals(
     return Boolean(result.rowCount);
   }
 
+  async function closeSessionQuestions(client: PoolClient, sessionId: string, turnId: string) {
+    const expired = await client.query<{ action: string; source: string }>(
+      `UPDATE approvals a SET status='expired' FROM turns u
+       WHERE u.id=a.turn_id AND u.owner_id=a.owner_id AND a.owner_id=$1 AND a.status='pending'
+         AND u.session_id=$2 AND u.id<>$3 AND u.status IN ('waiting','cancelled')
+       RETURNING a.action,u.source`,
+      [ownerId, sessionId, turnId],
+    );
+    await client.query(
+      "UPDATE turns SET status='cancelled',finished_at=now() WHERE owner_id=$1 AND session_id=$2 AND id<>$3 AND status='waiting'",
+      [ownerId, sessionId, turnId],
+    );
+    afterCommit(client, () => {
+      for (const row of expired.rows) changed('expired', row.action, row.source);
+    });
+  }
+
   return {
     request,
-    chat: { answer: answerChat, accept: acceptChat },
+    chat: { answer: answerChat, accept: acceptChat, close: closeSessionQuestions },
     executeConfirmed,
     stoppedOutcomes,
     retireScheduleConfirmations,

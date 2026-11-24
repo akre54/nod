@@ -27,7 +27,7 @@ import {
   type createDiscoveredConnections,
 } from './discovered-connections.ts';
 import { bundledApps } from './app-catalog.ts';
-import { transaction } from './transaction.ts';
+import { afterRollback, transaction } from './transaction.ts';
 import type { WorkAdmission } from './work-admission.ts';
 import type { SiteIcon } from '../ports/link-preview.ts';
 import { BrowserConnectionError } from './browser-connections.ts';
@@ -179,6 +179,7 @@ type IntegrationOptions = {
   browserConnections?: (client?: PoolClient) => Promise<Connection[]>;
   icon?: (origin: string) => Promise<SiteIcon | null>;
   mailCheck?: MailCheck;
+  emailCodePollMs?: number;
   paused?(): Promise<boolean>;
 };
 
@@ -993,10 +994,8 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
           'The connection provider did not return a valid sign-in link.',
           502,
         );
-      const client = await pool.connect();
       let discarded: ConnectionRow[] = [];
-      try {
-        await client.query('BEGIN');
+      await transaction(async (client) => {
         const pending = await client.query<ConnectionRow>(
           `SELECT *,callback_expires<=now() AS callback_expired FROM app_connections
            WHERE owner_id=$1 AND slug=$2 AND callback_hash IS NOT NULL FOR UPDATE`,
@@ -1060,13 +1059,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
             'Your app connection changed while this was starting. Try again.',
             409,
           );
-        await client.query('COMMIT');
-      } catch (error) {
-        await client.query('ROLLBACK');
-        throw error;
-      } finally {
-        client.release();
-      }
+      }, pool);
       for (const previous of discarded) await discardReconnect(previous);
       watchExpiry(slug, hash);
       return {
@@ -2075,7 +2068,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
         signal,
       );
       while (messages?.length === 0) {
-        await delay(5000, undefined, { signal });
+        await delay(options.emailCodePollMs ?? 5000, undefined, { signal });
         before = Date.now();
         messages = await provider.verificationEmails(
           row.account_id!,
@@ -2164,8 +2157,8 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     );
   }
 
-  async function watchable(connectionIds: string[]) {
-    const rows = await connectionRows(configuredOwner);
+  async function watchable(connectionIds: string[], client?: PoolClient) {
+    const rows = await connectionRows(configuredOwner, client);
     return connectionIds.every((id) => rows.some((row) => row.id === id && changeSignal(row)));
   }
 
@@ -2349,10 +2342,11 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
       );
       await Promise.all(
         rows.map(async (row) => {
-          let client: PoolClient | undefined;
           const pollDeadline = AbortSignal.timeout(30_000);
           const pollSignal = AbortSignal.any([stop.signal, pollDeadline]);
           let pollFinished = false;
+          let checkpointStarted = false;
+          let checkpointRolledBack = false;
           try {
             serviceWait('background');
             const result = await provider.pollInbox!(row.account_id!, row.inbox_cursor, pollSignal);
@@ -2376,55 +2370,59 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
               ),
             );
             stop.signal.throwIfAborted();
-            client = await pool.connect();
-            await client.query('BEGIN');
-            const saved = await client.query(
-              `UPDATE app_connections SET inbox_cursor=$1,inbox_checked_at=now(),inbox_failed=false,
+            const changed = await transaction(async (client) => {
+              checkpointStarted = true;
+              afterRollback(client, () => {
+                checkpointRolledBack = true;
+              });
+              const saved = await client.query(
+                `UPDATE app_connections SET inbox_cursor=$1,inbox_checked_at=now(),inbox_failed=false,
              inbox_poll_at=CASE WHEN $2 THEN now()+$10::integer * interval '1 millisecond' ELSE inbox_poll_at END
              WHERE id=$3 AND owner_id=$4 AND provider_id=$5 AND account_id=$6 AND watch_revision=$7 AND inbox_claim_id=$8
              AND watch_requested AND account_active AND NOT revoked
              AND ($9::text IS NULL OR configuration_id=$9) RETURNING id`,
-              [
-                result.cursor,
-                result.hasMore,
-                row.id,
-                configuredOwner,
-                providerId,
-                row.account_id,
-                row.watch_revision,
-                row.inbox_claim_id,
-                provider.configurationId ?? null,
-                Number.isSafeInteger(result.retryAfterMs) && (result.retryAfterMs ?? 0) > 0
-                  ? Math.min(result.retryAfterMs!, 300_000)
-                  : 0,
-              ],
-            );
-            if (saved.rowCount) {
-              for (const [index, message] of result.messages.entries()) {
-                const summary = `Source connectionId: ${row.id}.\n${overviews[index]}`;
-                await client.query(
-                  `INSERT INTO integration_events (id,owner_id,summary,slug,account_id,provider_id,poll_connection_id)
+                [
+                  result.cursor,
+                  result.hasMore,
+                  row.id,
+                  configuredOwner,
+                  providerId,
+                  row.account_id,
+                  row.watch_revision,
+                  row.inbox_claim_id,
+                  provider.configurationId ?? null,
+                  Number.isSafeInteger(result.retryAfterMs) && (result.retryAfterMs ?? 0) > 0
+                    ? Math.min(result.retryAfterMs!, 300_000)
+                    : 0,
+                ],
+              );
+              if (saved.rowCount) {
+                for (const [index, message] of result.messages.entries()) {
+                  const summary = `Source connectionId: ${row.id}.\n${overviews[index]}`;
+                  await client.query(
+                    `INSERT INTO integration_events (id,owner_id,summary,slug,account_id,provider_id,poll_connection_id)
                  VALUES ($1,$2,$3,'gmail',$4,$5,$6) ON CONFLICT(id) DO UPDATE SET poll_connection_id=EXCLUDED.poll_connection_id,
                  state=CASE WHEN integration_events.state='discarded' THEN 'queued' ELSE integration_events.state END
                  WHERE integration_events.owner_id=EXCLUDED.owner_id AND integration_events.provider_id=EXCLUDED.provider_id
                  AND integration_events.account_id=EXCLUDED.account_id AND integration_events.state<>'delivered'`,
-                  [
-                    `${providerId}:gmail:${row.account_id}:${message.id}`,
-                    configuredOwner,
-                    summary,
-                    row.account_id,
-                    providerId,
-                    row.id,
-                  ],
-                );
+                    [
+                      `${providerId}:gmail:${row.account_id}:${message.id}`,
+                      configuredOwner,
+                      summary,
+                      row.account_id,
+                      providerId,
+                      row.id,
+                    ],
+                  );
+                }
               }
-            }
-            await client.query('COMMIT');
-            if (saved.rowCount) options.refresh?.();
+              return saved.rowCount;
+            }, pool);
+            if (changed) options.refresh?.();
           } catch (error) {
-            if (client) await client.query('ROLLBACK');
+            if (checkpointStarted && !checkpointRolledBack) throw error;
             if (stop.signal.aborted) {
-              await (client ?? pool).query(
+              await pool.query(
                 `UPDATE app_connections SET inbox_poll_at=now(),inbox_claim_id=NULL
                  WHERE id=$1 AND owner_id=$2 AND provider_id=$3 AND account_id=$4 AND watch_revision=$5 AND inbox_claim_id=$6`,
                 [
@@ -2444,7 +2442,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
                 : !pollFinished && pollDeadline.aborted
                   ? 60_000
                   : null;
-            await (client ?? pool).query(
+            await pool.query(
               `WITH failed AS (UPDATE app_connections SET inbox_failed=true,inbox_reconnect_required=$7,
                inbox_poll_at=CASE WHEN $11::integer IS NULL THEN inbox_poll_at ELSE now()+$11::integer * interval '1 millisecond' END
                WHERE id=$1 AND owner_id=$2 AND provider_id=$3 AND account_id=$4 AND watch_revision=$5 AND inbox_claim_id=$6
@@ -2467,8 +2465,6 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
               ],
             );
             options.refresh?.();
-          } finally {
-            client?.release();
           }
         }),
       );

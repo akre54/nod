@@ -15,9 +15,11 @@ export interface MemoryCurator {
         | 'style'
         | 'skill'
         | 'plan'
+        | 'ideas'
         | 'brief'
         | 'vision'
         | 'classify'
+        | 'activity'
         | 'attention'
         | 'check';
       instructions: string;

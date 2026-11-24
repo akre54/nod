@@ -1,3 +1,4 @@
+import { laterSupersedingTurnSql } from './turn-chain.ts';
 import { presentationSchema, presentationText } from '../shared/presentation.ts';
 import { answerChoicesSchema, questionWithChoices } from '../shared/answer-choices.ts';
 import { createHash, randomUUID } from 'node:crypto';
@@ -106,6 +107,7 @@ interface ChannelOptions {
       approvalId: string;
       channel: string;
       approved: boolean;
+      label?: string;
       stopSignal?: AbortSignal;
     },
   ) => Promise<void>;
@@ -545,8 +547,14 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
   }
 
   async function pendingTelegramApproval(database: Pool | PoolClient, messageId: string) {
-    const { rows } = await database.query<{ approval_id: string; thread_id: string; text: string }>(
-      `SELECT a.id AS approval_id,m.thread_id,m.text FROM messages m
+    const { rows } = await database.query<{
+      approval_id: string;
+      thread_id: string;
+      text: string;
+      title: string | null;
+      decline: string | null;
+    }>(
+      `SELECT a.id AS approval_id,m.thread_id,m.text,a.title,a.decline FROM messages m
        JOIN approvals a ON a.confirmation_message_id=m.id AND a.owner_id=m.owner_id
          AND a.thread_id=m.thread_id AND a.turn_id=m.turn_id
        JOIN turns u ON u.id=m.turn_id AND u.owner_id=m.owner_id AND u.thread_id=m.thread_id
@@ -611,6 +619,12 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
             approvalId: approval.approval_id,
             channel: conversationChannel(identity),
             approved: input.approved,
+            label:
+              approval.title && approval.decline
+                ? input.approved
+                  ? approval.title
+                  : approval.decline
+                : undefined,
             stopSignal: stop,
           });
           return 'recorded';
@@ -1205,6 +1219,38 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
       ON CONFLICT(message_id) DO NOTHING`,
       [ownerId],
     );
+    const approvals = Boolean(
+      (await pool.query("SELECT to_regclass('approvals') AS name")).rows[0]?.name,
+    );
+    await pool.query(
+      `INSERT INTO channel_outbox(message_id,source_id)
+      SELECT DISTINCT ON (m.id) m.id,i.source_id FROM messages m
+      JOIN turns u ON u.id=m.turn_id AND u.owner_id=m.owner_id AND u.channel='web'
+      CROSS JOIN LATERAL (SELECT lu.channel FROM messages lm
+          JOIN turns lu ON lu.id=lm.turn_id AND lu.owner_id=lm.owner_id
+          WHERE lm.owner_id=m.owner_id AND lm.thread_id=m.thread_id AND lm.role='user'
+            AND lm.created_at<=m.created_at
+          ORDER BY lm.created_at DESC,lm.id DESC LIMIT 1) owner
+      JOIN channel_inbox i ON i.channel=owner.channel AND i.owner_id=m.owner_id AND i.created_at<=m.created_at
+      WHERE m.role='assistant' AND m.owner_id=$1 AND m.hidden_at IS NULL AND i.state='submitted'
+        AND owner.channel<>'web'
+        AND (m.id IN (SELECT q.id FROM turns u CROSS JOIN LATERAL (SELECT q.id FROM messages q
+              WHERE q.turn_id=u.id AND q.owner_id=u.owner_id AND q.role='assistant'
+              ORDER BY q.created_at DESC,q.id DESC LIMIT 1) q
+            WHERE u.owner_id=$1 AND u.thread_id IN (SELECT th.id FROM threads th
+                WHERE th.owner_id=$1 AND th.archived_at IS NULL)
+              AND u.status='waiting' AND u.waiting_reason='question' AND u.handoff_browser_id IS NULL
+              AND u.channel='web' AND NOT ${laterSupersedingTurnSql})${
+                approvals
+                  ? ` OR m.id IN (SELECT a.confirmation_message_id FROM approvals a
+              WHERE a.owner_id=$1 AND a.status='pending')`
+                  : ''
+              })
+        AND NOT EXISTS (SELECT 1 FROM channel_outbox q WHERE q.message_id=m.id)
+      ORDER BY m.id,i.received_at DESC,i.source_id
+      ON CONFLICT(message_id) DO NOTHING`,
+      [ownerId],
+    );
   }
 
   async function currentMessage(
@@ -1440,7 +1486,14 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
           accountId: row.account_id,
           threadId: row.thread_id,
           text,
-          ...(approval ? { approval: true as const } : {}),
+          ...(approval
+            ? {
+                approval:
+                  approval.title && approval.decline
+                    ? { approve: approval.title, decline: approval.decline }
+                    : { approve: 'Approve', decline: 'Cancel' },
+              }
+            : {}),
           ...(attachments
             ? {
                 attachments,

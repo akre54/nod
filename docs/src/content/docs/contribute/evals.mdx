@@ -14,7 +14,7 @@ The short version: each attempt boots its own Nod with a real model. The apps, w
 For the landing-page results, benchmark definitions, and measurement limits, read [How we evaluate Nod](/how-it-works/benchmarks/).
 
 :::caution[Evals cost money]
-They call live models. An attempt costs about $0.10 to $0.50. A full controlled run has 360 attempts before time-window skips. The unit tests never call them.
+They call live models. An attempt costs about $0.10 to $0.50. A full controlled run has 369 attempts before time-window skips. The unit tests never call them.
 :::
 
 The collector requires a captured prompt for each successful background turn that opened the agent or recorded an agent request. A recorded source-screen result with no agent start or request needs no agent prompt. Missing records alone do not prove that a source screen ran. Its source reads and model usage still count. Missing prompts from executed agent work are measurement errors.
@@ -61,7 +61,7 @@ The fake apps are hand-written approximations of Composio's responses, not recor
    pnpm run eval:capability doctor --fix
    ```
 
-3. Run all 120 controlled cases, three attempts each.
+3. Run all 123 controlled cases, three attempts each.
 
    ```sh title="Terminal"
    pnpm run eval:capability run
@@ -79,7 +79,7 @@ The release suite adds 254 cases: 207 of everyday work across every connected ap
 pnpm run eval:capability run --tier release --repeat 3 --concurrency 3 --budget 500
 ```
 
-`--tier release` runs the release cases together with every controlled case, 374 attempts per repeat before time-window skips. Each attempt starts its own workspace and browser containers; `--concurrency 6` fits in 8 GB of Docker memory. Database connections are a separate limit. Start with concurrency two when you use a standard disposable database. Each attempt starts several connection pools. Parallel campaigns add their load. Increase concurrency only when the database has spare connections. To run one area, add `--capability vault`, or name cases with `--scenario`.
+`--tier release` runs the release cases together with every controlled case, 377 attempts per repeat before time-window skips. Each attempt starts its own workspace and browser containers; `--concurrency 6` fits in 8 GB of Docker memory. Database connections are a separate limit. Start with concurrency two when you use a standard disposable database. Each attempt starts several connection pools. Parallel campaigns add their load. Increase concurrency only when the database has spare connections. To run one area, add `--capability vault`, or name cases with `--scenario`.
 
 Results go to `.local/capability-evals/<label>/`. Open `report.html` to read every transcript and check. A label never overwrites an earlier run. If a worker fails before it can save checks, its log records the phase: start, prepare, play, collect, or grade.
 
@@ -287,7 +287,7 @@ flowchart TD
 
 ## The suite
 
-The suite has 378 cases: 120 controlled cases, 254 release cases, three live web cases and the harness canary.
+The suite has 381 cases: 123 controlled cases, 254 release cases, three live web cases and the harness canary.
 
 | Status      | Meaning                                                                                                                    |
 | ----------- | -------------------------------------------------------------------------------------------------------------------------- |
@@ -329,6 +329,7 @@ Payment cases use a synthetic merchant and never a real card. They measure task 
 | `health-results-pdf`                    | Get my blood test PDF from email, explain it, remind me to re-test                | files, apps, memory, schedules           | scored                 |
 | `invoice-signin-blocker`                | Explain why an invoice needs sign-in and what to do next                          | browser, vault, progress                 | calibrating            |
 | `invoices-overdue`                      | Find who owes me money in my email, keep a sheet, draft reminders                 | apps, files, approvals                   | scored                 |
+| `language-follows-latest-message`       | Report a task started in German in English after the owner switches to English    | browser, progress                        | calibrating            |
 | `local-file-read-invoice-pdf`           | Read the total from an invoice PDF in Downloads without asking                    | files                                    | calibrating            |
 | `local-file-save-notes`                 | Save meeting notes as a Markdown file in Documents and change nothing else        | files                                    | calibrating            |
 | `local-file-show-screenshot`            | Show a Desktop screenshot as an attachment to the reply                           | files                                    | calibrating            |
